@@ -1,0 +1,109 @@
+defaults:
+  - default.yaml
+
+exp_name: pano_luna
+img_size: 518
+patch_size: 14
+max_img_per_gpu: 8
+
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    shuffle: True
+    pin_memory: False
+    common_config:
+      fix_img_num: -1
+      fix_aspect_ratio: 1.0
+      load_track: False
+      track_num: 1024
+      training: True
+      inside_random: True
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      rescale: False
+      rescale_aug: False
+      landscape_check: False
+      debug: False
+      get_nearby: False
+      load_depth: True
+      img_nums: [8, 8]
+      max_img_per_gpu: ${max_img_per_gpu}
+      allow_duplicate_img: False
+      repeat_batch: False
+      augs:
+        cojitter: False
+        cojitter_ratio: 0.5
+        scales: null
+        aspects: [1.0, 1.0]
+        color_jitter: null
+        gray_scale: False
+        gau_blur: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.pano_luna.PanoLunaDataset
+          split: train
+          Pano_DIR: /YOUR/PATH/TO/PANO_LUNA_NUMBERED
+          len_train: 100000
+          fov_degrees: 75.0
+          num_yaw: 8
+          pitch_degrees: [0.0]
+          depth_scale: 100.0
+          depth_is_range: True
+          depth_max: 80.0
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    shuffle: False
+    pin_memory: False
+    common_config:
+      fix_img_num: -1
+      fix_aspect_ratio: 1.0
+      load_track: False
+      track_num: 1024
+      training: False
+      inside_random: False
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      rescale: False
+      rescale_aug: False
+      landscape_check: False
+      debug: False
+      get_nearby: False
+      load_depth: True
+      img_nums: [8, 8]
+      allow_duplicate_img: False
+      repeat_batch: False
+      augs:
+        cojitter: False
+        cojitter_ratio: 0.5
+        scales: null
+        aspects: [1.0, 1.0]
+        color_jitter: null
+        gray_scale: False
+        gau_blur: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.pano_luna.PanoLunaDataset
+          split: test
+          Pano_DIR: /YOUR/PATH/TO/PANO_LUNA_NUMBERED
+          len_test: 10000
+          fov_degrees: 75.0
+          num_yaw: 8
+          pitch_degrees: [0.0]
+          depth_scale: 100.0
+          depth_is_range: True
+          depth_max: 80.0
+
+model:
+  sampler:
+    fov_degrees: 75.0
+    num_yaw: 8
+    pitch_degrees: [0.0]
+
+checkpoint:
+  resume_checkpoint_path: ckpt/model.pt

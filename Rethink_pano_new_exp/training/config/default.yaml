@@ -102,7 +102,7 @@ logging:
 checkpoint:
   save_dir: logs/${exp_name}/ckpts
   save_freq: 5
-  resume_checkpoint_path: /YOUR/PATH/TO/CKPT
+  resume_checkpoint_path: ckpt/model.pt
   strict: False
 
 

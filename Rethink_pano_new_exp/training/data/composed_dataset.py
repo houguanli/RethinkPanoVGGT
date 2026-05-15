@@ -144,6 +144,34 @@ class ComposedDataset(Dataset, ABC):
             "point_masks": point_masks,
         }
 
+        if "normals" in batch and batch["normals"] is not None:
+            normals = torch.from_numpy(np.stack(batch["normals"]).astype(np.float32)).contiguous()
+            sample["normals"] = normals.permute(0, 3, 1, 2).to(torch.get_default_dtype()).div(255)
+
+        if "pano_image" in batch and batch["pano_image"] is not None:
+            pano_image = torch.from_numpy(batch["pano_image"].astype(np.float32)).contiguous()
+            sample["pano_images"] = pano_image.permute(2, 0, 1).to(torch.get_default_dtype()).div(255)
+
+        if "pano_depth" in batch and batch["pano_depth"] is not None:
+            sample["pano_depths"] = torch.from_numpy(batch["pano_depth"].astype(np.float32))
+
+        if "pano_normal" in batch and batch["pano_normal"] is not None:
+            pano_normal = torch.from_numpy(batch["pano_normal"].astype(np.float32)).contiguous()
+            sample["pano_normals"] = pano_normal.permute(2, 0, 1).to(torch.get_default_dtype()).div(255)
+
+        for optional_key in (
+            "pano_view_params",
+            "pano_angles",
+            "pano_fov",
+            "pano_rotations",
+            "pano_valid_mask",
+            "is_pano",
+            "pano_camera_6dof",
+            "pano_token_meta",
+        ):
+            if optional_key in batch:
+                sample[optional_key] = _numpy_to_torch(batch[optional_key])
+
         # --- Track Processing (if enabled) ---
         if self.load_track:
             if batch["tracks"] is not None:
@@ -182,6 +210,20 @@ class ComposedDataset(Dataset, ABC):
             sample["track_positive_mask"] = track_positive_mask
 
         return sample
+
+
+def _numpy_to_torch(value):
+    if isinstance(value, dict):
+        return {key: _numpy_to_torch(val) for key, val in value.items()}
+    if isinstance(value, np.ndarray):
+        return torch.from_numpy(value)
+    if isinstance(value, (np.bool_, bool)):
+        return torch.tensor(bool(value))
+    if isinstance(value, (np.integer, int)):
+        return torch.tensor(int(value))
+    if isinstance(value, (np.floating, float)):
+        return torch.tensor(float(value))
+    return value
 
 
 class TupleConcatDataset(ConcatDataset):

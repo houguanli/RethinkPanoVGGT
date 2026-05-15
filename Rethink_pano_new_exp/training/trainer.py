@@ -25,6 +25,7 @@ import logging
 import math
 import time
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import torch
@@ -156,7 +157,7 @@ class Trainer:
 
         # Load checkpoint if available or specified
         if self.checkpoint_conf.resume_checkpoint_path is not None:
-            self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
+            self._load_resuming_checkpoint(self._resolve_checkpoint_path(self.checkpoint_conf.resume_checkpoint_path))
         else:   
             ckpt_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
             if ckpt_path is not None:
@@ -225,6 +226,22 @@ class Trainer:
         # Load AMP scaler state if available
         if self.optim_conf.amp.enabled and "scaler" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler"])
+
+    def _resolve_checkpoint_path(self, ckpt_path: str) -> str:
+        path = Path(str(ckpt_path)).expanduser()
+        if path.is_absolute() or path.exists():
+            return str(path)
+
+        project_root = Path(__file__).resolve().parents[1]
+        project_path = project_root / path
+        if project_path.exists():
+            return str(project_path)
+
+        training_path = Path(__file__).resolve().parent / path
+        if training_path.exists():
+            return str(training_path)
+
+        return str(path)
 
     def _setup_device(self, device: str):
         """Sets up the device for training (CPU or CUDA)."""
@@ -709,6 +726,8 @@ class Trainer:
             "images", "depths", "extrinsics", "intrinsics", 
             "cam_points", "world_points", "point_masks", 
         ]        
+        pano_view_keys = ["pano_view_params", "pano_angles", "pano_fov", "pano_rotations", "pano_valid_mask"]
+        pano_sample_keys = ["pano_images", "pano_depths", "pano_normals", "is_pano", "pano_camera_6dof"]
         string_keys = ["seq_name"]
         
         for key in tensor_keys:
@@ -721,6 +740,22 @@ class Trainer:
         for key in string_keys:
             if key in batch:
                 batch[key] = batch[key] * 2
+
+        for key in pano_view_keys:
+            if key in batch:
+                original_tensor = batch[key]
+                batch[key] = torch.concatenate([original_tensor, torch.flip(original_tensor, dims=[1])], dim=0)
+
+        for key in pano_sample_keys:
+            if key in batch:
+                original_tensor = batch[key]
+                batch[key] = torch.concatenate([original_tensor, original_tensor], dim=0)
+
+        if "pano_token_meta" in batch:
+            batch["pano_token_meta"] = {
+                key: torch.concatenate([value, torch.flip(value, dims=[1])], dim=0) if torch.is_tensor(value) else value
+                for key, value in batch["pano_token_meta"].items()
+            }
         
         return batch
 
@@ -754,10 +789,13 @@ class Trainer:
             A dictionary containing the computed losses.
         """
         # Forward pass
-        model_kwargs = {"images": batch["images"]}
-        for key in ("pano_view_params", "pano_angles", "pano_fov"):
-            if key in batch:
-                model_kwargs[key] = batch[key]
+        if "pano_images" in batch:
+            model_kwargs = {"pano_images": batch["pano_images"], "return_sampler_output": True}
+        else:
+            model_kwargs = {"images": batch["images"]}
+            for key in ("pano_view_params", "pano_angles", "pano_fov", "pano_token_meta", "pano_camera_meta"):
+                if key in batch:
+                    model_kwargs[key] = batch[key]
         y_hat = model(**model_kwargs)
         
         # Loss computation
