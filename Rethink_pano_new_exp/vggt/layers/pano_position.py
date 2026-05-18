@@ -93,8 +93,9 @@ def build_camera_encoding(
     fov_x: torch.Tensor,
     fov_y: torch.Tensor,
 ) -> torch.Tensor:
-    """Build [sin/cos yaw, sin/cos pitch, fovs, center/right/up rays]."""
+    """Build [sin/cos yaw, sin/cos pitch, fovs, aspect, center/right/up rays]."""
     center_ray, right_ray, up_ray = yaw_pitch_to_axes(yaw, pitch)
+    aspect = fov_x / fov_y.clamp_min(torch.finfo(fov_y.dtype).eps)
     return torch.cat(
         [
             torch.sin(yaw)[..., None],
@@ -103,6 +104,7 @@ def build_camera_encoding(
             torch.cos(pitch)[..., None],
             fov_x[..., None],
             fov_y[..., None],
+            aspect[..., None],
             center_ray,
             right_ray,
             up_ray,
