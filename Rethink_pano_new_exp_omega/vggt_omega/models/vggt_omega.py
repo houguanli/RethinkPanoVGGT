@@ -18,6 +18,7 @@ the omega backbone. Key changes vs the released `vggt_omega.VGGTOmega`:
     forward behaves exactly like the released omega.
 """
 
+import contextlib
 import warnings
 from typing import Dict, Optional
 
@@ -95,8 +96,13 @@ class VGGTOmega(nn.Module):
             device=images.device,
         )
 
-        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        with torch.autocast(device_type="cuda", dtype=amp_dtype):
+        if images.device.type == "cuda":
+            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            amp_context = torch.autocast(device_type="cuda", dtype=amp_dtype)
+        else:
+            amp_context = contextlib.nullcontext()
+
+        with amp_context:
             aggregated_tokens_list, patch_token_start = self.aggregator(
                 images,
                 pano_geometry=pano_geometry,
