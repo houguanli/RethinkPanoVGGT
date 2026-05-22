@@ -89,6 +89,7 @@ class PanoVKittiOmegaDataset(Dataset):
             "scene_name": item["scene_name"],
             "rgb_path": str(item["rgb_path"]),
             "depth_path": str(item["depth_path"]),
+            "pano_position_m": torch.tensor(item["pano_position_m"], dtype=torch.float32),
         }
 
     def _build_index(self, max_samples: Optional[int]) -> List[Dict]:
@@ -116,6 +117,7 @@ class PanoVKittiOmegaDataset(Dataset):
                         "rgb_path": rgb_path,
                         "depth_path": depth_path,
                         "output_depth_scale": _depth_scale_from_meta(meta),
+                        "pano_position_m": _pano_position_from_meta(meta),
                     }
                 )
                 if max_samples is not None and len(items) >= max_samples:
@@ -164,6 +166,16 @@ def _depth_scale_from_meta(meta: Dict) -> float:
     if scale <= 0:
         raise ValueError(f"Invalid output_depth_scale in pano_meta.json: {scale}")
     return scale
+
+
+def _pano_position_from_meta(meta: Dict) -> List[float]:
+    camera_alignment = meta.get("camera_alignment") or {}
+    position = camera_alignment.get("panorama_position_m_xyz", None)
+    if position is None:
+        return [0.0, 0.0, 0.0]
+    if len(position) != 3:
+        raise ValueError(f"Expected panorama_position_m_xyz with 3 values, got {position}")
+    return [float(value) for value in position]
 
 
 def _scene_name_from_rgb(rgb_path: Path) -> str:

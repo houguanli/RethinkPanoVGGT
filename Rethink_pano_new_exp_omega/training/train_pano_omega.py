@@ -25,6 +25,7 @@ from training.data import PanoVKittiOmegaDataset  # noqa: E402
 from vggt_omega.models.heads.dense_head import DenseHead  # noqa: E402
 from vggt_omega.models.layers import PatchEmbed  # noqa: E402
 from vggt_omega.models.vggt_omega_luna import VGGTOmega_LUNA  # noqa: E402
+from vggt_omega.utils.rotation import mat_to_quat  # noqa: E402
 
 
 DEFAULT_DATASET_ROOT = Path("whitehole/AOKI/datasets/PANO_LUNA_omega")
@@ -56,7 +57,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--trainable", choices=["luna", "heads", "luna_heads", "all"], default="luna_heads")
     parser.add_argument("--strict-checkpoint", action="store_true")
-    parser.add_argument("--enable-camera-head", action="store_true")
+    parser.add_argument("--enable-camera-head", dest="enable_camera_head", action="store_true", default=True)
+    parser.add_argument("--disable-camera-head", dest="enable_camera_head", action="store_false")
+    parser.add_argument("--camera-loss-weight", type=float, default=1.0)
+    parser.add_argument("--camera-translation-weight", type=float, default=1.0)
+    parser.add_argument("--camera-rotation-weight", type=float, default=1.0)
+    parser.add_argument("--camera-fov-weight", type=float, default=0.1)
+    parser.add_argument("--camera-position-mode", choices=["local_zero", "world"], default="local_zero")
     parser.add_argument("--save-last", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="Run a tiny generated-data training step.")
     return parser
@@ -123,10 +130,11 @@ def train(args: argparse.Namespace) -> None:
         for batch in loader:
             global_step += 1
             batch = move_batch_to_device(batch, device)
-            loss_dict = train_step(model, batch, optimizer, grad_clip=args.grad_clip)
+            loss_dict = train_step(model, batch, optimizer, args)
             print(
                 f"[TRAIN] epoch={epoch + 1} step={global_step} "
-                f"loss={loss_dict['loss'].item():.6f} depth={loss_dict['loss_depth'].item():.6f}"
+                f"loss={loss_dict['loss'].item():.6f} depth={loss_dict['loss_depth'].item():.6f} "
+                f"camera={loss_dict['loss_camera'].item():.6f}"
             )
             if global_step >= args.max_steps:
                 break
@@ -155,7 +163,7 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
         model = VGGTOmega_LUNA(
             patch_size=args.patch_size,
             embed_dim=embed_dim,
-            enable_camera=False,
+            enable_camera=True,
             enable_depth=True,
             enable_alignment=False,
             enable_pano_global_token=True,
@@ -203,27 +211,41 @@ def train_step(
     model: VGGTOmega_LUNA,
     batch: Dict,
     optimizer: torch.optim.Optimizer,
-    grad_clip: float,
+    args: argparse.Namespace,
 ) -> Dict[str, torch.Tensor]:
     optimizer.zero_grad(set_to_none=True)
     pano_images = batch["pano_image"]
     pano_depths = batch["pano_depth"]
 
     target_depth = sample_depth_windows(model, pano_depths)
-    predictions = model(pano_images=pano_images)
+    predictions = model(pano_images=pano_images, return_sampler_output=True)
     pred_depth = predictions["depth"]
 
     loss_depth = masked_log_l1_depth(pred_depth, target_depth)
-    loss = loss_depth
+    loss_camera_dict = camera_alignment_loss(
+        predictions=predictions,
+        batch=batch,
+        translation_weight=args.camera_translation_weight,
+        rotation_weight=args.camera_rotation_weight,
+        fov_weight=args.camera_fov_weight,
+        position_mode=args.camera_position_mode,
+    )
+    loss_camera = loss_camera_dict["loss_camera"]
+    loss = loss_depth + args.camera_loss_weight * loss_camera
     loss.backward()
 
-    if grad_clip > 0:
+    if args.grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(
             [param for param in model.parameters() if param.requires_grad],
-            max_norm=grad_clip,
+            max_norm=args.grad_clip,
         )
     optimizer.step()
-    return {"loss": loss.detach(), "loss_depth": loss_depth.detach()}
+    return {
+        "loss": loss.detach(),
+        "loss_depth": loss_depth.detach(),
+        "loss_camera": loss_camera.detach(),
+        **{key: value.detach() for key, value in loss_camera_dict.items() if key != "loss_camera"},
+    }
 
 
 @torch.no_grad()
@@ -243,6 +265,78 @@ def masked_log_l1_depth(pred_depth: torch.Tensor, target_depth: torch.Tensor) ->
     pred = pred_depth.clamp_min(1e-4)
     target = target_depth.clamp_min(1e-4)
     return (torch.log(pred[valid]) - torch.log(target[valid])).abs().mean()
+
+
+def camera_alignment_loss(
+    predictions: Dict,
+    batch: Dict,
+    translation_weight: float,
+    rotation_weight: float,
+    fov_weight: float,
+    position_mode: str,
+) -> Dict[str, torch.Tensor]:
+    pred_pose = predictions.get("pose_enc")
+    camera_meta = predictions.get("pano_camera_meta")
+    if pred_pose is None or camera_meta is None:
+        zero = predictions["depth"].new_zeros(())
+        return {
+            "loss_camera": zero,
+            "loss_camera_t": zero,
+            "loss_camera_r": zero,
+            "loss_camera_fov": zero,
+        }
+
+    pred_pose = torch.nan_to_num(pred_pose.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    rotations_c2w = camera_meta["rotations"].to(device=pred_pose.device, dtype=pred_pose.dtype)
+    rotations_w2c = rotations_c2w.transpose(-1, -2).contiguous()
+    target_quat = F.normalize(mat_to_quat(rotations_w2c), dim=-1)
+
+    pred_translation = pred_pose[..., :3]
+    target_translation = build_target_translation(
+        rotations_w2c=rotations_w2c,
+        batch=batch,
+        position_mode=position_mode,
+    ).to(device=pred_pose.device, dtype=pred_pose.dtype)
+
+    pred_quat = F.normalize(pred_pose[..., 3:7], dim=-1)
+    pred_fov = pred_pose[..., 7:9]
+    target_fov = torch.stack(
+        [
+            camera_meta["fov_y"].to(device=pred_pose.device, dtype=pred_pose.dtype),
+            camera_meta["fov_x"].to(device=pred_pose.device, dtype=pred_pose.dtype),
+        ],
+        dim=-1,
+    )
+
+    loss_t = (pred_translation - target_translation).abs().mean()
+    loss_r = torch.minimum(
+        (pred_quat - target_quat).abs().sum(dim=-1),
+        (pred_quat + target_quat).abs().sum(dim=-1),
+    ).mean()
+    loss_fov = (pred_fov - target_fov).abs().mean()
+    loss_camera = translation_weight * loss_t + rotation_weight * loss_r + fov_weight * loss_fov
+    return {
+        "loss_camera": loss_camera,
+        "loss_camera_t": loss_t,
+        "loss_camera_r": loss_r,
+        "loss_camera_fov": loss_fov,
+    }
+
+
+def build_target_translation(rotations_w2c: torch.Tensor, batch: Dict, position_mode: str) -> torch.Tensor:
+    if position_mode == "local_zero":
+        return rotations_w2c.new_zeros(*rotations_w2c.shape[:2], 3)
+    if position_mode != "world":
+        raise ValueError(f"Unknown camera-position-mode: {position_mode}")
+
+    pano_position = batch.get("pano_position_m", None)
+    if pano_position is None:
+        return rotations_w2c.new_zeros(*rotations_w2c.shape[:2], 3)
+    center_world = pano_position.to(device=rotations_w2c.device, dtype=rotations_w2c.dtype)
+    if center_world.ndim == 1:
+        center_world = center_world[None]
+    center_world = center_world[:, None, :, None]
+    return (-(rotations_w2c @ center_world)[..., 0]).contiguous()
 
 
 def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path, strict: bool) -> None:
@@ -355,6 +449,10 @@ def write_smoke_dataset(root: Path) -> None:
     meta = {
         "scene_name": "pano_smoke",
         "pano_shape_hw": [height, width],
+        "camera_alignment": {
+            "alignment_policy": "smoke sample uses pano-local zero translation",
+            "panorama_position_m_xyz": [0.0, 0.0, 0.0],
+        },
         "depth_policy": {
             "unit": "meters",
             "invalid_depth_value": 0,
