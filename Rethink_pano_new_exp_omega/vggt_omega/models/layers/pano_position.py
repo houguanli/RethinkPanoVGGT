@@ -120,6 +120,6 @@ def build_camera_encoding(
 
 
 def camera_rotation_from_yaw_pitch(yaw: torch.Tensor, pitch: torch.Tensor) -> torch.Tensor:
-    """Return camera-to-world rotation matrices with right/up/forward columns."""
+    """Return OpenCV camera-to-world rotations with right/down/forward columns."""
     forward, right, up = yaw_pitch_to_axes(yaw, pitch)
-    return torch.stack([right, up, forward], dim=-1)
+    return torch.stack([right, -up, forward], dim=-1)

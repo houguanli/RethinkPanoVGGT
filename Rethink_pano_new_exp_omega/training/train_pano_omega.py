@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, Iterable, Tuple
 
@@ -24,6 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from training.data import PanoVKittiOmegaDataset  # noqa: E402
 from vggt_omega.models.heads.dense_head import DenseHead  # noqa: E402
 from vggt_omega.models.layers import PatchEmbed  # noqa: E402
+from vggt_omega.models.layers.pano_position import pinhole_rays  # noqa: E402
 from vggt_omega.models.vggt_omega_luna import VGGTOmega_LUNA  # noqa: E402
 from vggt_omega.utils.rotation import mat_to_quat  # noqa: E402
 
@@ -64,7 +67,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-rotation-weight", type=float, default=1.0)
     parser.add_argument("--camera-fov-weight", type=float, default=0.1)
     parser.add_argument("--camera-position-mode", choices=["local_zero", "world"], default="local_zero")
+    parser.add_argument(
+        "--pred-depth-scale",
+        type=float,
+        default=1.0,
+        help="Fixed metric calibration applied to predicted Z-depth before loss/export.",
+    )
     parser.add_argument("--save-last", action="store_true")
+    parser.add_argument("--save-every-steps", type=int, default=0)
+    parser.add_argument("--max-duration-minutes", type=float, default=0.0)
+    parser.add_argument("--log-csv", type=Path, default=None)
+    parser.add_argument("--loss-plot", type=Path, default=None)
     parser.add_argument("--smoke", action="store_true", help="Run a tiny generated-data training step.")
     return parser
 
@@ -124,28 +137,68 @@ def train(args: argparse.Namespace) -> None:
     print(f"[INFO] device = {device}")
     print(f"[INFO] trainable_params = {trainable_count:,}; frozen_params = {frozen_count:,}")
 
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    log_csv = args.log_csv or (args.output_dir / "loss.csv")
+    loss_plot = args.loss_plot or (args.output_dir / "loss_curve.png")
+    max_duration_seconds = args.max_duration_minutes * 60.0 if args.max_duration_minutes > 0 else None
+    started_at = time.time()
+    metrics_history = []
+
     model.train()
     global_step = 0
-    for epoch in range(args.epochs):
-        for batch in loader:
-            global_step += 1
-            batch = move_batch_to_device(batch, device)
-            loss_dict = train_step(model, batch, optimizer, args)
-            print(
-                f"[TRAIN] epoch={epoch + 1} step={global_step} "
-                f"loss={loss_dict['loss'].item():.6f} depth={loss_dict['loss_depth'].item():.6f} "
-                f"camera={loss_dict['loss_camera'].item():.6f}"
-            )
-            if global_step >= args.max_steps:
-                break
-        if global_step >= args.max_steps:
-            break
+    stop_reason = "max_steps"
+    try:
+        for epoch in range(args.epochs):
+            for batch in loader:
+                if max_duration_seconds is not None and time.time() - started_at >= max_duration_seconds:
+                    stop_reason = "max_duration"
+                    break
 
-    if args.save_last and not args.smoke:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = args.output_dir / "last.pt"
-        torch.save({"model": model.state_dict(), "args": vars(args), "step": global_step}, ckpt_path)
-        print(f"[INFO] saved checkpoint = {ckpt_path}")
+                global_step += 1
+                batch = move_batch_to_device(batch, device)
+                loss_dict = train_step(model, batch, optimizer, args)
+                elapsed_seconds = time.time() - started_at
+                metrics = {
+                    "step": global_step,
+                    "epoch": epoch + 1,
+                    "elapsed_seconds": elapsed_seconds,
+                    "loss": float(loss_dict["loss"].item()),
+                    "loss_depth": float(loss_dict["loss_depth"].item()),
+                    "loss_camera": float(loss_dict["loss_camera"].item()),
+                    "loss_camera_t": float(loss_dict.get("loss_camera_t", torch.tensor(0.0)).item()),
+                    "loss_camera_r": float(loss_dict.get("loss_camera_r", torch.tensor(0.0)).item()),
+                    "loss_camera_fov": float(loss_dict.get("loss_camera_fov", torch.tensor(0.0)).item()),
+                    "lr": optimizer.param_groups[0]["lr"],
+                }
+                metrics_history.append(metrics)
+                append_loss_csv(log_csv, metrics)
+                print(
+                    f"[TRAIN] epoch={epoch + 1} step={global_step} "
+                    f"elapsed={elapsed_seconds / 60.0:.2f}m "
+                    f"loss={metrics['loss']:.6f} depth={metrics['loss_depth']:.6f} "
+                    f"camera={metrics['loss_camera']:.6f}",
+                    flush=True,
+                )
+
+                if args.save_every_steps > 0 and global_step % args.save_every_steps == 0 and not args.smoke:
+                    save_checkpoint(args.output_dir / f"step_{global_step:06d}.pt", model, args, global_step)
+
+                if global_step >= args.max_steps:
+                    stop_reason = "max_steps"
+                    break
+
+            if global_step >= args.max_steps or stop_reason == "max_duration":
+                break
+        else:
+            stop_reason = "epochs_complete"
+    finally:
+        if metrics_history:
+            save_loss_plot(loss_plot, metrics_history)
+        if args.save_last and not args.smoke:
+            ckpt_path = args.output_dir / "last.pt"
+            save_checkpoint(ckpt_path, model, args, global_step)
+            print(f"[INFO] saved checkpoint = {ckpt_path}")
+        print(f"[INFO] stop_reason = {stop_reason}; steps = {global_step}")
 
 
 def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
@@ -178,6 +231,7 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
                 "register_attention_block_indices": (),
                 "cached_layer_indices": (4, 11, 17, 23),
             },
+            checkpoint_path=None,
         )
         model.aggregator.patch_embed = PatchEmbed(
             img_size=args.window_size,
@@ -204,6 +258,7 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
         luna_patch_layers="second_half",
         luna_camera_layers=[23],
         sampler=sampler,
+        checkpoint_path=None,
     )
 
 
@@ -217,11 +272,11 @@ def train_step(
     pano_images = batch["pano_image"]
     pano_depths = batch["pano_depth"]
 
-    target_depth = sample_depth_windows(model, pano_depths)
+    target_depth, target_valid = sample_depth_targets(model, pano_depths)
     predictions = model(pano_images=pano_images, return_sampler_output=True)
-    pred_depth = predictions["depth"]
+    pred_depth = predictions["depth"] * args.pred_depth_scale
 
-    loss_depth = masked_log_l1_depth(pred_depth, target_depth)
+    loss_depth = masked_log_l1_depth(pred_depth, target_depth, target_valid)
     loss_camera_dict = camera_alignment_loss(
         predictions=predictions,
         batch=batch,
@@ -250,16 +305,109 @@ def train_step(
 
 @torch.no_grad()
 def sample_depth_windows(model: VGGTOmega_LUNA, pano_depths: torch.Tensor) -> torch.Tensor:
-    depth_as_rgb = pano_depths.repeat(1, 3, 1, 1)
-    sampled = model.pano_sampler(depth_as_rgb).windows[:, :, :1]
-    return sampled.permute(0, 1, 3, 4, 2).contiguous()
+    target_depth, _ = sample_depth_targets(model, pano_depths)
+    return target_depth
 
 
-def masked_log_l1_depth(pred_depth: torch.Tensor, target_depth: torch.Tensor) -> torch.Tensor:
+@torch.no_grad()
+def sample_depth_targets(model: VGGTOmega_LUNA, pano_depths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample ERP range-depth, convert it to pinhole Z-depth, and keep a hard validity mask."""
+    source_valid = (pano_depths > 0).to(dtype=pano_depths.dtype)
+    packed_depth_valid = torch.cat([pano_depths * source_valid, source_valid, source_valid.new_zeros(source_valid.shape)], dim=1)
+    sampled = model.pano_sampler(packed_depth_valid, interpolation_mode="bilinear")
+    sampled_depth = sampled.windows[:, :, :1]
+    sampled_weight = sampled.windows[:, :, 1:2]
+    range_depth = (sampled_depth / sampled_weight.clamp_min(1e-6)).permute(0, 1, 3, 4, 2).contiguous()
+
+    valid_as_rgb = source_valid.repeat(1, 3, 1, 1)
+    sampled_valid = model.pano_sampler(valid_as_rgb, interpolation_mode="nearest").windows[:, :, :1]
+    valid = sampled_valid.permute(0, 1, 3, 4, 2).contiguous() > 0.5
+    valid = valid & (sampled_weight.permute(0, 1, 3, 4, 2).contiguous() > 1e-6)
+
+    z_factor = build_window_z_factor(sampled.camera_meta, range_depth.shape[2], range_depth.shape[3])
+    target_z = range_depth * z_factor[..., None]
+    valid = valid & torch.isfinite(target_z) & (target_z > 0)
+    target_z = torch.where(valid, target_z, torch.zeros_like(target_z))
+    return target_z, valid
+
+
+def build_window_z_factor(camera_meta: Dict[str, torch.Tensor], height: int, width: int) -> torch.Tensor:
+    """Return cos(angle-to-optical-axis) for each virtual pinhole pixel."""
+    yaw = camera_meta["yaw"].reshape(-1)
+    pitch = camera_meta["pitch"].reshape(-1)
+    fov_x = camera_meta["fov_x"].reshape(-1)
+    fov_y = camera_meta["fov_y"].reshape(-1)
+    rays = pinhole_rays(
+        yaw,
+        pitch,
+        fov_x,
+        fov_y,
+        height,
+        width,
+        device=yaw.device,
+        dtype=yaw.dtype,
+    )
+    forward = camera_meta["rotations"][..., :, 2].reshape(-1, 3)
+    z_factor = (rays * forward[:, None, None, :]).sum(dim=-1).clamp_min(0.0)
+    return z_factor.reshape(*camera_meta["yaw"].shape, height, width)
+
+
+def append_loss_csv(path: Path, metrics: Dict[str, float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(metrics.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(metrics)
+
+
+def save_loss_plot(path: Path, metrics_history: list[Dict[str, float]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[WARN] matplotlib is not installed; skip loss plot.")
+        return
+
+    steps = [item["step"] for item in metrics_history]
+    plt.figure(figsize=(8, 5), dpi=140)
+    for key, label in [
+        ("loss", "total"),
+        ("loss_depth", "depth"),
+        ("loss_camera", "camera"),
+    ]:
+        values = [item[key] for item in metrics_history]
+        plt.plot(steps, values, marker="o", linewidth=1.5, markersize=3, label=label)
+    plt.xlabel("step")
+    plt.ylabel("loss")
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+    print(f"[INFO] saved loss plot = {path}")
+
+
+def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace, step: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"model": model.state_dict(), "args": vars(args), "step": step}, path)
+
+
+def masked_log_l1_depth(
+    pred_depth: torch.Tensor,
+    target_depth: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     target_depth = target_depth.to(device=pred_depth.device, dtype=pred_depth.dtype)
     pred_depth = torch.nan_to_num(pred_depth, nan=1e-4, posinf=1e4, neginf=1e-4)
     target_depth = torch.nan_to_num(target_depth, nan=0.0, posinf=0.0, neginf=0.0)
     valid = torch.isfinite(target_depth) & (target_depth > 0)
+    if valid_mask is not None:
+        valid = valid & valid_mask.to(device=target_depth.device, dtype=torch.bool)
     if not bool(valid.any()):
         return pred_depth.new_zeros(())
     pred = pred_depth.clamp_min(1e-4)
