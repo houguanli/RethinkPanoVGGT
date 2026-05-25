@@ -3,7 +3,9 @@ set -euo pipefail
 
 source /home/aoki/miniconda3/etc/profile.d/conda.sh
 
-cd /home/aoki/RethinkPanoVGGT_omega/Rethink_pano_new_exp_omega
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_root="$(cd "$script_dir/.." && pwd)"
+cd "$project_root"
 
 run_dir="${1:-outputs/pano_omega_luna_1h_$(date +%Y%m%d_%H%M%S)}"
 pred_depth_scale="${2:-1.0}"

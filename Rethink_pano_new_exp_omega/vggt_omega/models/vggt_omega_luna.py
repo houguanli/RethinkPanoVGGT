@@ -17,6 +17,7 @@ from typing import Optional
 
 import torch
 
+from vggt_omega.checkpoint import DEFAULT_CHECKPOINT_PATH
 from vggt_omega.data.pano_sampler import PanoWindowSampler
 from vggt_omega.models.vggt_omega import VGGTOmega
 
@@ -41,6 +42,8 @@ class VGGTOmega_LUNA(VGGTOmega):
         luna_hidden_dim: Optional[int] = None,
         sampler: Optional[dict] = None,
         aggregator_kwargs: Optional[dict] = None,
+        checkpoint_path: Optional[str] = str(DEFAULT_CHECKPOINT_PATH),
+        checkpoint_strict: bool = False,
     ) -> None:
         super().__init__(
             patch_size=patch_size,
@@ -57,6 +60,8 @@ class VGGTOmega_LUNA(VGGTOmega):
             luna_camera_meta_dim=luna_camera_meta_dim,
             luna_hidden_dim=luna_hidden_dim,
             aggregator_kwargs=aggregator_kwargs,
+            checkpoint_path=checkpoint_path,
+            checkpoint_strict=checkpoint_strict,
         )
 
         # Sampler defaults reflect the omega patch size; users can still override

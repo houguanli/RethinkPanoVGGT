@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/aoki/RethinkPanoVGGT_omega/Rethink_pano_new_exp_omega
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_root="$(cd "$script_dir/.." && pwd)"
+cd "$project_root"
 
 run_dir="${1:-outputs/pano_omega_luna_1h_20260524}"
 pred_depth_scale="${2:-1.0}"
