@@ -78,6 +78,7 @@ class PanoWindowSampler(nn.Module):
         yaw: Optional[torch.Tensor] = None,
         pitch: Optional[torch.Tensor] = None,
         fov: Optional[torch.Tensor] = None,
+        interpolation_mode: str = "bilinear",
     ) -> PanoSamplerOutput:
         return sample_pano_windows(
             pano_images=pano_images,
@@ -87,6 +88,7 @@ class PanoWindowSampler(nn.Module):
             window_size=self.window_size,
             patch_size=self.patch_size,
             seam_width=self.seam_width,
+            interpolation_mode=interpolation_mode,
         )
 
 
@@ -98,6 +100,7 @@ def sample_pano_windows(
     window_size: int = 512,
     patch_size: int = 16,
     seam_width: float = 0.02,
+    interpolation_mode: str = "bilinear",
 ) -> PanoSamplerOutput:
     """Sample virtual pinhole windows and build LUNA metadata."""
     if pano_images.ndim == 3:
@@ -136,6 +139,7 @@ def sample_pano_windows(
         pano_images,
         u.reshape(B, S, window_size, window_size),
         v.reshape(B, S, window_size, window_size),
+        mode=interpolation_mode,
     )
 
     token_meta = _build_token_meta(
@@ -182,7 +186,12 @@ def _normalize_fov(fov, num_views: int, device: torch.device, dtype: torch.dtype
     return fov_x, fov_y
 
 
-def _sample_equirectangular(pano_images: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def _sample_equirectangular(
+    pano_images: torch.Tensor,
+    u: torch.Tensor,
+    v: torch.Tensor,
+    mode: str = "bilinear",
+) -> torch.Tensor:
     B, C, pano_h, pano_w = pano_images.shape
     _, S, out_h, out_w = u.shape
     pano_pad = torch.cat([pano_images[..., -1:], pano_images, pano_images[..., :1]], dim=-1)
@@ -194,7 +203,7 @@ def _sample_equirectangular(pano_images: torch.Tensor, u: torch.Tensor, v: torch
     grid_y = 2.0 * y_pixel / (pano_h - 1) - 1.0
     grid = torch.stack([grid_x, grid_y], dim=-1)
 
-    windows = F.grid_sample(pano_pad, grid, mode="bilinear", padding_mode="border", align_corners=True)
+    windows = F.grid_sample(pano_pad, grid, mode=mode, padding_mode="border", align_corners=True)
     return windows.reshape(B, S, C, out_h, out_w)
 
 
