@@ -36,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-points", type=int, default=250000)
     parser.add_argument("--depth-max-m", type=float, default=80.0)
     parser.add_argument("--pred-depth-scale", type=float, default=None)
+    parser.add_argument("--gt-depth-semantics", choices=["range", "cubemap_z", "double_cubemap_z"], default="range")
+    parser.add_argument(
+        "--mask-pred-by-target-valid",
+        action="store_true",
+        help="Only export predicted depth/points where the sampled GT depth target is valid.",
+    )
     parser.add_argument("--pano-height", type=int, default=None)
     parser.add_argument("--pano-width", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -72,18 +78,30 @@ def main() -> None:
 
     with torch.no_grad():
         predictions = model(pano_images=pano_image, return_sampler_output=True)
-        target_depth, target_valid = sample_depth_targets(model, pano_depth)
+        target_depth, target_valid = sample_depth_targets(
+            model,
+            pano_depth,
+            source_depth_semantics=args.gt_depth_semantics,
+            max_range_depth=args.depth_max_m,
+        )
 
-    pred_depth = (predictions["depth"] * pred_depth_scale)[0, ..., 0].detach().float().cpu().numpy()
+    raw_pred_depth = (predictions["depth"] * pred_depth_scale)[0, ..., 0].detach().float().cpu().numpy()
     pred_conf = predictions["depth_conf"][0].detach().float().cpu().numpy()
     target_depth_np = target_depth[0, ..., 0].detach().float().cpu().numpy()
     target_valid_np = target_valid[0, ..., 0].detach().cpu().numpy()
     windows = predictions["pano_windows"][0].detach().float().cpu().numpy()
     camera_meta = {key: value[0].detach().float().cpu() for key, value in predictions["pano_camera_meta"].items()}
     pano_np = tensor_image_to_uint8(sample["pano_image"])
+    pred_depth, pred_valid = apply_range_depth_modifier(raw_pred_depth, camera_meta, args.depth_max_m)
+    pred_valid_after_range = pred_valid.copy()
+    if args.mask_pred_by_target_valid:
+        pred_valid = pred_valid & target_valid_np.astype(bool)
+        pred_depth = pred_depth.copy()
+        pred_depth[~pred_valid] = np.inf
 
     Image.fromarray(pano_np).save(output_dir / "input_pano.jpg")
     save_contact_sheet(windows, output_dir / "sampled_windows.jpg")
+    save_depth_sheet(raw_pred_depth, output_dir / "pred_z_depth_windows_unfiltered.jpg", max_depth=args.depth_max_m)
     save_depth_sheet(pred_depth, output_dir / "pred_z_depth_windows.jpg", max_depth=args.depth_max_m)
     save_depth_sheet(target_depth_np, output_dir / "target_z_depth_windows.jpg", max_depth=args.depth_max_m)
     save_conf_sheet(pred_conf, output_dir / "pred_conf_windows.jpg")
@@ -94,7 +112,9 @@ def main() -> None:
         pano_hw=pano_np.shape[:2],
     )
     save_depth_image(pred_erp, valid_erp, output_dir / "pred_z_depth_erp_splat.png", max_depth=args.depth_max_m)
-    save_depth_image(sample["pano_depth"][0].numpy(), sample["pano_depth"][0].numpy() > 0, output_dir / "target_range_depth_erp.png", max_depth=args.depth_max_m)
+    target_range_erp = erp_range_depth_image(sample["pano_depth"][0].numpy(), args.gt_depth_semantics)
+    target_range_valid = np.isfinite(target_range_erp) & (target_range_erp > 0) & (target_range_erp <= args.depth_max_m)
+    save_depth_image(target_range_erp, target_range_valid, output_dir / "target_range_depth_erp.png", max_depth=args.depth_max_m)
     write_official_point_cloud(
         output_dir / "pred_official_camera_points.ply",
         pred_depth_z=pred_depth,
@@ -102,6 +122,19 @@ def main() -> None:
         pose_enc=predictions["pose_enc"][0].detach().float().cpu(),
         max_depth=args.depth_max_m,
         max_points=args.max_points,
+        display_y_up=True,
+        rotate_y_180=True,
+    )
+    write_official_point_cloud(
+        output_dir / "pred_official_camera_points_native.ply",
+        pred_depth_z=pred_depth,
+        windows=windows,
+        pose_enc=predictions["pose_enc"][0].detach().float().cpu(),
+        max_depth=args.depth_max_m,
+        max_points=args.max_points,
+        display_y_up=False,
+        rotate_y_180=False,
+        output_z_up=False,
     )
     write_known_window_point_cloud(
         output_dir / "pred_known_window_camera_points.ply",
@@ -126,8 +159,41 @@ def main() -> None:
         rgb=pano_np,
         max_depth=args.depth_max_m,
         max_points=args.max_points,
+        depth_semantics=args.gt_depth_semantics,
+        extra_valid=target_range_valid,
     )
-    write_summary(output_dir / "summary.json", args, sample, pred_depth, target_depth_np, target_valid_np, pred_depth_scale)
+    if args.gt_depth_semantics != "range":
+        write_erp_point_cloud(
+            output_dir / "target_erp_points_legacy_radial.ply",
+            depth=sample["pano_depth"][0].numpy(),
+            rgb=pano_np,
+            max_depth=args.depth_max_m,
+            max_points=args.max_points,
+            depth_semantics="range",
+            extra_valid=target_range_valid,
+        )
+    if args.gt_depth_semantics == "double_cubemap_z":
+        write_erp_point_cloud(
+            output_dir / "target_erp_points_single_cubemap_approx.ply",
+            depth=sample["pano_depth"][0].numpy(),
+            rgb=pano_np,
+            max_depth=args.depth_max_m,
+            max_points=args.max_points,
+            depth_semantics="cubemap_z",
+            extra_valid=target_range_valid,
+        )
+    write_summary(
+        output_dir / "summary.json",
+        args,
+        sample,
+        raw_pred_depth,
+        pred_depth,
+        pred_valid,
+        target_depth_np,
+        target_valid_np,
+        pred_valid_after_range,
+        pred_depth_scale,
+    )
     print(f"[INFO] exported reconstruction = {output_dir}")
 
 
@@ -232,6 +298,37 @@ def window_uv(camera_meta: Dict[str, torch.Tensor], height: int, width: int) -> 
     return u, v
 
 
+def window_z_factor(camera_meta: Dict[str, torch.Tensor], height: int, width: int) -> np.ndarray:
+    yaw = camera_meta["yaw"].flatten()
+    pitch = camera_meta["pitch"].flatten()
+    fov_x = camera_meta["fov_x"].flatten()
+    fov_y = camera_meta["fov_y"].flatten()
+    rays = pinhole_rays(yaw, pitch, fov_x, fov_y, height, width, device=yaw.device, dtype=yaw.dtype)
+    forward = camera_meta["rotations"][..., :, 2].reshape(-1, 3)
+    return (rays * forward[:, None, None, :]).sum(dim=-1).numpy()
+
+
+def apply_range_depth_modifier(
+    pred_depth_z: np.ndarray,
+    camera_meta: Dict[str, torch.Tensor],
+    max_range_depth: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Mark predictions beyond the ERP radial-depth support as non-output values."""
+    depth = pred_depth_z.astype(np.float32, copy=True)
+    z_factor = window_z_factor(camera_meta, depth.shape[-2], depth.shape[-1])
+    radial_depth = depth / np.maximum(z_factor, 1e-6)
+    valid = np.isfinite(depth) & (depth > 0) & (z_factor > 1e-6)
+    if max_range_depth > 0:
+        valid &= np.isfinite(radial_depth) & (radial_depth <= max_range_depth)
+    depth[~valid] = np.inf
+    return depth, valid
+
+
+def omega_y_up_to_z_up(points: np.ndarray) -> np.ndarray:
+    """Convert Omega internal [right, up, forward] points to ERP/GT [forward, right, up]."""
+    return np.stack([points[..., 2], points[..., 0], points[..., 1]], axis=-1)
+
+
 def write_known_window_point_cloud(
     path: Path,
     depth_z: np.ndarray,
@@ -247,15 +344,14 @@ def write_known_window_point_cloud(
     fov_y = camera_meta["fov_y"].flatten()
     rays = pinhole_rays(yaw, pitch, fov_x, fov_y, depth_z.shape[-2], depth_z.shape[-1], device=yaw.device, dtype=yaw.dtype)
     rays_np = rays.numpy()
-    forward = camera_meta["rotations"][..., :, 2].reshape(-1, 3).numpy()
-    z_factor = np.sum(rays_np * forward[:, None, None, :], axis=-1)
+    z_factor = window_z_factor(camera_meta, depth_z.shape[-2], depth_z.shape[-1])
     depth = np.nan_to_num(depth_z, nan=0.0, posinf=0.0, neginf=0.0)
     valid = (depth > 0) & (z_factor > 1e-6)
     if extra_valid is not None:
         valid &= extra_valid
     radial_depth = depth / np.maximum(z_factor, 1e-6)
     valid &= radial_depth <= max_depth
-    points = rays_np[valid] * radial_depth[valid, None]
+    points = omega_y_up_to_z_up(rays_np[valid] * radial_depth[valid, None])
     colors = np.clip(windows.transpose(0, 2, 3, 1)[valid] * 255.0, 0, 255).astype(np.uint8)
     write_ply(path, points, colors, max_points)
 
@@ -267,6 +363,10 @@ def write_official_point_cloud(
     pose_enc: torch.Tensor,
     max_depth: float,
     max_points: int,
+    display_y_up: bool,
+    rotate_y_180: bool = False,
+    output_z_up: bool = True,
+    extra_valid: np.ndarray | None = None,
 ) -> None:
     extrinsics, intrinsics = encoding_to_camera(pose_enc[None], pred_depth_z.shape[-2:])
     extrinsics = extrinsics[0].numpy()
@@ -291,8 +391,17 @@ def write_official_point_cloud(
         np.transpose(rotation, (0, 2, 1)),
         camera_points - translation[:, None, None, :],
     )
+    if display_y_up:
+        points[..., 1] *= -1.0
+    if rotate_y_180:
+        points[..., 0] *= -1.0
+        points[..., 2] *= -1.0
     radial_depth = np.linalg.norm(camera_points, axis=-1)
     valid = (depth > 0) & (radial_depth <= max_depth) & np.isfinite(points).all(axis=-1)
+    if extra_valid is not None:
+        valid &= extra_valid
+    if output_z_up:
+        points = omega_y_up_to_z_up(points)
     colors = np.clip(windows.transpose(0, 2, 3, 1)[valid] * 255.0, 0, 255).astype(np.uint8)
     write_ply(path, points[valid], colors, max_points)
 
@@ -319,23 +428,16 @@ def write_erp_point_cloud(
     rgb: np.ndarray,
     max_depth: float,
     max_points: int,
+    depth_semantics: str = "range",
+    extra_valid: np.ndarray | None = None,
 ) -> None:
     depth = np.nan_to_num(depth.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-    h, w = depth.shape
-    y, x = np.meshgrid(np.arange(h, dtype=np.float32), np.arange(w, dtype=np.float32), indexing="ij")
-    theta = (x / max(w - 1, 1) - 0.5) * (2.0 * math.pi)
-    phi = (0.5 - y / max(h - 1, 1)) * math.pi
-    cos_phi = np.cos(phi)
-    rays = np.stack(
-        [
-            cos_phi * np.sin(theta),
-            np.sin(phi),
-            cos_phi * np.cos(theta),
-        ],
-        axis=-1,
-    ).astype(np.float32)
-    valid = (depth > 0) & (depth <= max_depth)
-    points = rays[valid] * depth[valid, None]
+    rays = erp_rays_np(*depth.shape)
+    radial_depth = erp_range_depth_np(depth, rays, depth_semantics)
+    valid = np.isfinite(radial_depth) & (radial_depth > 0) & (radial_depth <= max_depth)
+    if extra_valid is not None:
+        valid &= extra_valid
+    points = rays[valid] * radial_depth[valid, None]
     colors = rgb[valid]
     if points.shape[0] > max_points:
         rng = np.random.default_rng(42)
@@ -352,16 +454,87 @@ def write_erp_point_cloud(
             f.write(f"{point[0]:.6f} {point[1]:.6f} {point[2]:.6f} {int(color[0])} {int(color[1])} {int(color[2])}\n")
 
 
+def erp_range_depth_np(depth: np.ndarray, rays: np.ndarray, semantics: str) -> np.ndarray:
+    if semantics == "range":
+        return depth
+    if semantics not in {"cubemap_z", "double_cubemap_z"}:
+        raise ValueError(f"Unknown ERP depth semantics: {semantics}")
+    source_rays = merged_cubemap_source_rays_np(*depth.shape)
+    face_z_factor = cube_projection_factor_np(source_rays)
+    if semantics == "double_cubemap_z":
+        back_rays = rotate_source_rays_about_vertical_np(source_rays, -math.pi / 4.0)
+        back_factor = cube_projection_factor_np(back_rays)
+        front_weight = cube_edge_weight_np(source_rays)
+        back_weight = cube_edge_weight_np(back_rays)
+        face_z_factor = (front_weight * face_z_factor + back_weight * back_factor) / np.maximum(
+            front_weight + back_weight, 1e-6
+        )
+    return depth / face_z_factor
+
+
+def erp_range_depth_image(depth: np.ndarray, semantics: str) -> np.ndarray:
+    return erp_range_depth_np(depth.astype(np.float32), erp_rays_np(*depth.shape), semantics)
+
+
+def erp_rays_np(height: int, width: int) -> np.ndarray:
+    y, x = np.meshgrid(np.arange(height, dtype=np.float32) + 0.5, np.arange(width, dtype=np.float32) + 0.5, indexing="ij")
+    theta = (x / max(width, 1) - 0.5) * (2.0 * math.pi)
+    phi = (0.5 - y / max(height, 1)) * math.pi
+    cos_phi = np.cos(phi)
+    return np.stack(
+        [cos_phi * np.cos(theta), cos_phi * np.sin(theta), np.sin(phi)],
+        axis=-1,
+    ).astype(np.float32)
+
+
+def merged_cubemap_source_rays_np(height: int, width: int) -> np.ndarray:
+    y, x = np.meshgrid(np.arange(height, dtype=np.float32) + 0.5, np.arange(width, dtype=np.float32) + 0.5, indexing="ij")
+    longitude = (x / max(width, 1) * 2.0 - 1.0) * math.pi
+    latitude = (0.5 - y / max(height, 1)) * math.pi
+    cos_lat = np.cos(latitude)
+    return np.stack(
+        [cos_lat * np.cos(longitude), cos_lat * np.sin(longitude), np.sin(latitude)],
+        axis=-1,
+    ).astype(np.float32)
+
+
+def rotate_source_rays_about_vertical_np(rays: np.ndarray, angle_rad: float) -> np.ndarray:
+    cosine = np.float32(math.cos(angle_rad))
+    sine = np.float32(math.sin(angle_rad))
+    return np.stack(
+        [
+            cosine * rays[..., 0] - sine * rays[..., 1],
+            sine * rays[..., 0] + cosine * rays[..., 1],
+            rays[..., 2],
+        ],
+        axis=-1,
+    ).astype(np.float32)
+
+
+def cube_projection_factor_np(rays: np.ndarray) -> np.ndarray:
+    return np.maximum(np.max(np.abs(rays), axis=-1), 1e-6)
+
+
+def cube_edge_weight_np(rays: np.ndarray) -> np.ndarray:
+    sorted_abs = np.sort(np.abs(rays), axis=-1)
+    factor = np.maximum(sorted_abs[..., 2], 1e-6)
+    return np.maximum(1.0 - sorted_abs[..., 1] / factor + 1e-6, 0.0).astype(np.float32)
+
+
 def write_summary(
     path: Path,
     args: argparse.Namespace,
     sample: Dict,
+    raw_pred_depth: np.ndarray,
     pred_depth: np.ndarray,
+    pred_valid: np.ndarray,
     target_depth: np.ndarray,
     target_valid: np.ndarray,
+    pred_valid_after_range: np.ndarray,
     pred_depth_scale: float,
 ) -> None:
-    valid_pred = np.isfinite(pred_depth) & (pred_depth > 0)
+    valid_pred_raw = np.isfinite(raw_pred_depth) & (raw_pred_depth > 0)
+    valid_pred = np.isfinite(pred_depth) & (pred_depth > 0) & pred_valid
     valid_target = np.isfinite(target_depth) & (target_depth > 0) & target_valid
     summary = {
         "checkpoint": str(args.checkpoint),
@@ -369,9 +542,18 @@ def write_summary(
         "sample_index": args.sample_index,
         "scene_name": sample["scene_name"],
         "rgb_path": sample["rgb_path"],
-        "depth_definition": "window Z-depth meters; ERP source/target_range_depth_erp.png stores radial range meters",
+        "depth_definition": "window Z-depth meters; target_range_depth_erp.png is decoded ERP radial range in meters",
+        "gt_source_depth_semantics": args.gt_depth_semantics,
+        "prediction_modifier": f"predictions with reconstructed radial range > {args.depth_max_m:g}m are marked non-output (inf)",
+        "mask_pred_by_target_valid": bool(args.mask_pred_by_target_valid),
+        "official_point_cloud_coordinates": "pred_official_camera_points_native.ply is Omega native Y-up; comparison PLYs are exported as ERP/GT Z-up [forward, right, up]",
         "pred_depth_scale": pred_depth_scale,
+        "pred_valid_ratio_before_modifier": float(valid_pred_raw.mean()),
+        "pred_valid_ratio_after_range_modifier": float(pred_valid_after_range.mean()),
         "pred_valid_ratio": float(valid_pred.mean()),
+        "pred_removed_by_gt_valid_mask_ratio": float((pred_valid_after_range & ~valid_pred).mean()),
+        "pred_removed_by_range_modifier_ratio": float((valid_pred_raw & ~pred_valid_after_range).mean()),
+        "pred_removed_by_all_masks_ratio": float((valid_pred_raw & ~valid_pred).mean()),
         "target_valid_ratio": float(valid_target.mean()),
         "pred_depth_median_m": float(np.median(pred_depth[valid_pred])) if np.any(valid_pred) else None,
         "target_depth_median_m": float(np.median(target_depth[valid_target])) if np.any(valid_target) else None,

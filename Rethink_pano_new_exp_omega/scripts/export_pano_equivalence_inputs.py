@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from training.data import PanoVKittiOmegaDataset  # noqa: E402
-from training.train_pano_omega import build_model, load_checkpoint, set_seed  # noqa: E402
+from training.train_pano_omega import build_model, load_checkpoint, sample_depth_targets, set_seed  # noqa: E402
 from vggt_omega.models.vggt_omega_luna import VGGTOmega_LUNA  # noqa: E402
 
 
@@ -27,6 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--device", choices=["cuda", "cpu", "auto"], default="auto")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--gt-depth-semantics", choices=["range", "cubemap_z", "double_cubemap_z"], default="range")
+    parser.add_argument("--depth-max-m", type=float, default=80.0)
     return parser
 
 
@@ -57,6 +59,12 @@ def main() -> None:
     load_checkpoint(current_model, args.checkpoint, strict=False)
     with torch.no_grad():
         current_pred = current_model(pano_images=pano, return_sampler_output=True)
+        target_depth, target_valid = sample_depth_targets(
+            current_model,
+            sample["pano_depth"][None].to(device),
+            source_depth_semantics=args.gt_depth_semantics,
+            max_range_depth=args.depth_max_m,
+        )
 
     windows = current_pred["pano_windows"].detach().cpu()
     camera_meta = {key: value.detach().cpu() for key, value in current_pred["pano_camera_meta"].items()}
@@ -64,6 +72,9 @@ def main() -> None:
         {
             "windows": windows,
             "camera_meta": camera_meta,
+            "target_depth": target_depth.detach().cpu(),
+            "target_valid": target_valid.detach().cpu(),
+            "gt_depth_semantics": args.gt_depth_semantics,
             "sample": {
                 "scene_name": sample["scene_name"],
                 "rgb_path": sample["rgb_path"],

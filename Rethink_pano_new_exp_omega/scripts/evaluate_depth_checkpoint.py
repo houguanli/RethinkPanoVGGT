@@ -29,6 +29,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--gt-depth-semantics", choices=["range", "cubemap_z", "double_cubemap_z"], default="range")
+    parser.add_argument("--depth-max-m", type=float, default=80.0)
     args = parser.parse_args()
     set_seed(args.seed)
     device = resolve_device(args.device)
@@ -57,8 +59,16 @@ def main() -> None:
         for batch in loader:
             moved = move_batch_to_device(batch, device)
             pred = model(pano_images=moved["pano_image"])["depth"].float() * scale
-            target, valid = sample_depth_targets(model, moved["pano_depth"])
+            target, valid = sample_depth_targets(
+                model,
+                moved["pano_depth"],
+                source_depth_semantics=args.gt_depth_semantics,
+                max_range_depth=args.depth_max_m,
+            )
+            valid = valid & torch.isfinite(pred) & torch.isfinite(target)
             values = (torch.log(pred.clamp_min(1e-6)) - torch.log(target.clamp_min(1e-6))).abs()[valid]
+            if values.numel() == 0:
+                continue
             loss = float(values.mean().cpu())
             losses.append(loss)
             sample_rows.append({"scene_name": batch["scene_name"][0], "log_l1_z_depth": loss})
@@ -66,6 +76,8 @@ def main() -> None:
     result = {
         "checkpoint": str(args.checkpoint),
         "pred_depth_scale": scale,
+        "gt_source_depth_semantics": args.gt_depth_semantics,
+        "depth_max_m": args.depth_max_m,
         "samples": len(losses),
         "mean_log_l1_z_depth": float(np.mean(losses)),
         "median_log_l1_z_depth": float(np.median(losses)),

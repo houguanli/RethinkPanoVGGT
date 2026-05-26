@@ -32,6 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--gt-depth-semantics", choices=["range", "cubemap_z", "double_cubemap_z"], default="range")
+    parser.add_argument("--depth-max-m", type=float, default=80.0)
     return parser
 
 
@@ -50,7 +52,12 @@ def main() -> None:
         for batch in loader:
             batch_device = move_batch_to_device(batch, device)
             pred = model(pano_images=batch_device["pano_image"])["depth"]
-            target, valid = sample_depth_targets(model, batch_device["pano_depth"])
+            target, valid = sample_depth_targets(
+                model,
+                batch_device["pano_depth"],
+                source_depth_semantics=args.gt_depth_semantics,
+                max_range_depth=args.depth_max_m,
+            )
             pred = torch.nan_to_num(pred.float(), nan=0.0, posinf=0.0, neginf=0.0)
             valid = valid & torch.isfinite(pred) & (pred > 1e-6)
             log_ratio = (torch.log(target.clamp_min(1e-6)) - torch.log(pred.clamp_min(1e-6)))[valid]
@@ -77,7 +84,9 @@ def main() -> None:
         "dataset_root": str(dataset.root),
         "model_mode": args.model_mode,
         "seed": args.seed,
-        "depth_definition": "GT ERP radial range converted to virtual-pinhole Z-depth before calibration",
+        "depth_definition": "GT ERP source depth decoded to radial range, then converted to virtual-pinhole Z-depth before calibration",
+        "gt_source_depth_semantics": args.gt_depth_semantics,
+        "depth_max_m": args.depth_max_m,
         "depth_sampling": "masked bilinear range sampling normalized by bilinear valid weight",
         "valid_mask": "nearest-sampled original valid depth mask",
         "samples": len(per_sample),

@@ -17,6 +17,7 @@ from typing import Optional
 
 import torch
 
+from vggt_omega.checkpoint import DEFAULT_CHECKPOINT_PATH
 from vggt_omega.data.pano_sampler import PanoWindowSampler
 from vggt_omega.models.vggt_omega import VGGTOmega
 
@@ -41,6 +42,8 @@ class VGGTOmega_LUNA(VGGTOmega):
         luna_hidden_dim: Optional[int] = None,
         sampler: Optional[dict] = None,
         aggregator_kwargs: Optional[dict] = None,
+        checkpoint_path: Optional[str] = str(DEFAULT_CHECKPOINT_PATH),
+        checkpoint_strict: bool = False,
     ) -> None:
         super().__init__(
             patch_size=patch_size,
@@ -57,6 +60,8 @@ class VGGTOmega_LUNA(VGGTOmega):
             luna_camera_meta_dim=luna_camera_meta_dim,
             luna_hidden_dim=luna_hidden_dim,
             aggregator_kwargs=aggregator_kwargs,
+            checkpoint_path=checkpoint_path,
+            checkpoint_strict=checkpoint_strict,
         )
 
         # Sampler defaults reflect the omega patch size; users can still override
@@ -85,7 +90,7 @@ class VGGTOmega_LUNA(VGGTOmega):
         if pano_images is None:
             return super().forward(images, **kwargs)
 
-        sampler_output = self.pano_sampler(pano_images, yaw=yaw, pitch=pitch, fov=fov)
+        sampler_output = self.sample_pano_windows(pano_images, yaw=yaw, pitch=pitch, fov=fov)
         predictions = super().forward(
             sampler_output.windows,
             pano_view_params=sampler_output.camera_meta["view_params"],
@@ -98,3 +103,64 @@ class VGGTOmega_LUNA(VGGTOmega):
             predictions["pano_camera_meta"] = sampler_output.camera_meta
             predictions["pano_token_meta"] = sampler_output.token_meta
         return predictions
+
+    def sample_pano_windows(
+        self,
+        pano_images: torch.Tensor,
+        yaw: Optional[torch.Tensor] = None,
+        pitch: Optional[torch.Tensor] = None,
+        fov: Optional[torch.Tensor] = None,
+        interpolation_mode: str = "bilinear",
+    ):
+        """Sample either single-pano batches or multi-pano batches.
+
+        Input shapes:
+        - [B, C, H, W] -> [B, S, C, window, window]
+        - [B, N, C, H, W] -> [B, N*S, C, window, window]
+        """
+        if pano_images.ndim != 5:
+            return self.pano_sampler(
+                pano_images,
+                yaw=yaw,
+                pitch=pitch,
+                fov=fov,
+                interpolation_mode=interpolation_mode,
+            )
+
+        batch_size, num_panos, channels, height, width = pano_images.shape
+        flat = pano_images.reshape(batch_size * num_panos, channels, height, width)
+        sampled = self.pano_sampler(
+            flat,
+            yaw=yaw,
+            pitch=pitch,
+            fov=fov,
+            interpolation_mode=interpolation_mode,
+        )
+        views_per_pano = sampled.windows.shape[1]
+        sampled.windows = sampled.windows.reshape(
+            batch_size,
+            num_panos * views_per_pano,
+            *sampled.windows.shape[2:],
+        )
+        sampled.camera_meta = _merge_multi_pano_meta(sampled.camera_meta, batch_size, num_panos, views_per_pano)
+        sampled.token_meta = _merge_multi_pano_meta(sampled.token_meta, batch_size, num_panos, views_per_pano)
+        patch_tokens = sampled.token_meta.get("pano_id")
+        if patch_tokens is not None:
+            patches_per_view = patch_tokens.shape[-1]
+            pano_id = torch.arange(num_panos, device=patch_tokens.device).reshape(1, num_panos, 1, 1)
+            pano_id = pano_id.expand(batch_size, num_panos, views_per_pano, patches_per_view)
+            sampled.token_meta["pano_id"] = pano_id.reshape(batch_size, num_panos * views_per_pano, patches_per_view)
+        return sampled
+
+
+def _merge_multi_pano_meta(meta, batch_size: int, num_panos: int, views_per_pano: int):
+    merged = {}
+    for key, value in meta.items():
+        if not torch.is_tensor(value):
+            merged[key] = value
+            continue
+        if value.shape[:2] == (batch_size * num_panos, views_per_pano):
+            merged[key] = value.reshape(batch_size, num_panos * views_per_pano, *value.shape[2:])
+        else:
+            merged[key] = value
+    return merged

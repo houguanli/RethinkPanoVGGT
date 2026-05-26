@@ -99,6 +99,39 @@ images = torch.rand(1, 4, 3, 512, 512)
 preds = model(images=images)
 ```
 
+## Camera Supervision For Single vs Multi Pano
+
+For a single panorama, all sampled pinhole windows are virtual crops from the
+same camera center. In that setting the absolute UE/world panorama position is
+not a useful target for the VGGT camera head. The correct local single-pano
+target is that every virtual camera shares the same origin, so the single-pano
+config uses:
+
+```yaml
+camera_position_mode: local_zero
+camera_translation_weight: 1.0
+```
+
+This trains all virtual camera translations to zero while rotation/FoV are
+supervised from the known yaw/pitch/FoV window sampler. Depth remains the
+metric reconstruction signal.
+
+For multi-pano training, the dataset can return neighboring panoramas as one
+sample:
+
+```yaml
+panos_per_sample: 2
+pano_grouping: nearest
+camera_position_mode: relative_anchor
+camera_translation_weight: 1.0
+```
+
+The model accepts `[B, N, 3, H, W]` pano batches, samples each pano into pinhole
+windows, and flattens them to a single `[B, N*S, 3, window, window]` VGGT view
+sequence. `relative_anchor` subtracts the first pano position in the group, so
+translation supervision is local to the multi-pano sample rather than tied to
+the UE/global coordinate origin.
+
 ### Loading the released VGGT-Omega weights
 
 Because all new parameters (`LunaPatchAdapter.alpha`, `LunaCameraAdapter.alpha`,

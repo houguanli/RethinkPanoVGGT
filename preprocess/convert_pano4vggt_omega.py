@@ -29,11 +29,12 @@ it writes:
           rgb/Camera_0/rgb_00000.jpg
           normal/Camera_0/normal_00000.png
           depth/Camera_0/depth_00000.png
+          depth_valid/Camera_0/valid_00000.png
           depth_vis/Camera_0/depth_00000_vis.png
           preview/Camera_0/pano_preview_00000.jpg
 
 Depth policy:
-  - raw_depth * input_depth_scale = meters
+  - raw_depth * input_depth_scale = meters in source_depth_semantics coordinates
   - non-finite, <= invalid_depth_raw_min, >= invalid_depth_raw_max are invalid
   - metric depth <= 0 or > max_depth_m is invalid and saved as 0
   - saved depth PNG is uint16, depth_m * output_depth_scale
@@ -540,6 +541,7 @@ def convert_one(
     camera_fov_degrees: float,
     image_ext: str,
     exr_depth_channel: Optional[str],
+    source_depth_semantics: str,
     input_depth_scale: float,
     invalid_depth_raw_min: float,
     invalid_depth_raw_max: float,
@@ -559,10 +561,11 @@ def convert_one(
     rgb_out_dir = frames_root / "rgb" / f"Camera_{camera_id}"
     normal_out_dir = frames_root / "normal" / f"Camera_{camera_id}"
     depth_out_dir = frames_root / "depth" / f"Camera_{camera_id}"
+    depth_valid_out_dir = frames_root / "depth_valid" / f"Camera_{camera_id}"
     depth_vis_out_dir = frames_root / "depth_vis" / f"Camera_{camera_id}"
     preview_out_dir = frames_root / "preview" / f"Camera_{camera_id}"
 
-    for directory in [rgb_out_dir, normal_out_dir, depth_out_dir, depth_vis_out_dir, preview_out_dir]:
+    for directory in [rgb_out_dir, normal_out_dir, depth_out_dir, depth_valid_out_dir, depth_vis_out_dir, preview_out_dir]:
         ensure_dir(directory)
 
     rgb_path: Path = item["rgb_path"]
@@ -602,6 +605,7 @@ def convert_one(
     rgb_name = f"rgb_00000{image_ext}"
     normal_name = "normal_00000.png"
     depth_name = "depth_00000.png"
+    depth_valid_name = "valid_00000.png"
     depth_vis_name = "depth_00000_vis.png"
     preview_name = "pano_preview_00000.jpg"
 
@@ -613,6 +617,7 @@ def convert_one(
         cv2.imwrite(str(normal_out_dir / normal_name), cv2.cvtColor(normal_vis_rgb, cv2.COLOR_RGB2BGR))
 
     save_metric_depth_png(depth_m, depth_out_dir / depth_name, output_depth_scale)
+    cv2.imwrite(str(depth_valid_out_dir / depth_valid_name), ((depth_m > 0).astype(np.uint8) * 255))
     depth_vis_meta = save_depth_colormap_vis(
         depth_m,
         depth_vis_out_dir / depth_vis_name,
@@ -661,16 +666,20 @@ def convert_one(
         "pano_shape_hw": [int(pano_h), int(pano_w)],
         "projection": "equirectangular panorama, full 360x180 degrees",
         "depth_semantics": (
-            "metric panorama ray/range depth in meters after input_depth_scale; "
-            "invalid or farther than max_depth_m is 0 in saved depth"
+            f"metric ERP depth in meters using source semantics '{source_depth_semantics}' after input_depth_scale; "
+            "decode source semantics to radial range before geometry export or loss"
         ),
         "depth_policy": {
             "unit": "meters",
+            "source_depth_semantics": source_depth_semantics,
             "invalid_depth_value": 0,
             "input_depth_scale": float(input_depth_scale),
             "invalid_depth_raw_min": float(invalid_depth_raw_min),
             "invalid_depth_raw_max": float(invalid_depth_raw_max),
             "max_depth_m": float(max_depth_m),
+            "max_depth_m_application": (
+                "converter applies cap in stored source coordinates; training/export must reapply cap after radial decode"
+            ),
             "output_depth_scale": float(output_depth_scale),
             "saved_depth_decode": f"depth_m = uint16_png / {float(output_depth_scale)}",
             "vggt_training_alignment": (
@@ -685,6 +694,7 @@ def convert_one(
             "rgb_relpath": str((rgb_out_dir / rgb_name).relative_to(scene_root)),
             "normal_vis_relpath": str((normal_out_dir / normal_name).relative_to(scene_root)) if normal_vis_rgb is not None else None,
             "depth_relpath": str((depth_out_dir / depth_name).relative_to(scene_root)),
+            "depth_valid_relpath": str((depth_valid_out_dir / depth_valid_name).relative_to(scene_root)),
             "depth_vis_relpath": str((depth_vis_out_dir / depth_vis_name).relative_to(scene_root)),
             "preview_relpath": str((preview_out_dir / preview_name).relative_to(scene_root)),
             "camera_meta_relpath": "camera_meta.json",
@@ -725,6 +735,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--depth_suffix", type=str, default="_depth.exr")
     parser.add_argument("--exr_depth_channel", type=str, default=None)
+    parser.add_argument(
+        "--source_depth_semantics",
+        choices=["range", "cubemap_z", "double_cubemap_z"],
+        default="double_cubemap_z",
+        help="Meaning of input ERP depth. The current UE 12-shot merge stores blended perspective Z-depth.",
+    )
 
     parser.add_argument(
         "--input_depth_scale",
@@ -809,6 +825,7 @@ def main() -> None:
     print(f"[INFO] output_root = {output_root}")
     print(f"[INFO] actual_pairs = {len(items)}")
     print(f"[INFO] depth_suffix = {args.depth_suffix}")
+    print(f"[INFO] source_depth_semantics = {args.source_depth_semantics}")
     print(f"[INFO] input_depth_scale = {args.input_depth_scale}")
     print(f"[INFO] invalid_depth_raw_max = {args.invalid_depth_raw_max}")
     print(f"[INFO] max_depth_m = {args.max_depth_m}")
@@ -835,6 +852,7 @@ def main() -> None:
             camera_fov_degrees=args.camera_fov_degrees,
             image_ext=args.image_ext,
             exr_depth_channel=args.exr_depth_channel,
+            source_depth_semantics=args.source_depth_semantics,
             input_depth_scale=args.input_depth_scale,
             invalid_depth_raw_min=args.invalid_depth_raw_min,
             invalid_depth_raw_max=args.invalid_depth_raw_max,

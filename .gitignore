@@ -3,3 +3,11 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .pytest_cache/
+ckpt/
+dataset/
+outputs/
+Rethink_pano_new_exp_omega/outputs/
+comapre_method/**/outputs/
+comapre_method/*_ckpt/
+comapre_method/**/.git/
+comapre_method/**/examples/

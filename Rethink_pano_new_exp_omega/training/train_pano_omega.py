@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import random
 import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, Iterable, Tuple
 
 import cv2
@@ -18,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -33,18 +36,23 @@ from vggt_omega.utils.rotation import mat_to_quat  # noqa: E402
 
 DEFAULT_DATASET_ROOT = Path("whitehole/AOKI/datasets/PANO_LUNA_omega")
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "ckpt" / "vggt_omega_1b_512.pt"
+CONFIG_PATH_KEYS = {"dataset_root", "checkpoint", "output_dir", "log_csv", "loss_plot"}
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train VGGT-Omega LUNA on converted pano VKitti-style data.")
+    parser.add_argument("--config", type=Path, default=None, help="Optional YAML config; explicit CLI values override it.")
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "pano_omega_luna")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default="none")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--panos-per-sample", type=int, default=1)
+    parser.add_argument("--pano-grouping", choices=["nearest", "sequential"], default="nearest")
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -66,15 +74,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-translation-weight", type=float, default=1.0)
     parser.add_argument("--camera-rotation-weight", type=float, default=1.0)
     parser.add_argument("--camera-fov-weight", type=float, default=0.1)
-    parser.add_argument("--camera-position-mode", choices=["local_zero", "world"], default="local_zero")
+    parser.add_argument(
+        "--camera-position-mode",
+        choices=["none", "local_zero", "relative_anchor", "relative_mean", "world"],
+        default="local_zero",
+    )
     parser.add_argument(
         "--pred-depth-scale",
         type=float,
         default=1.0,
         help="Fixed metric calibration applied to predicted Z-depth before loss/export.",
     )
+    parser.add_argument(
+        "--gt-depth-semantics",
+        choices=["range", "cubemap_z", "double_cubemap_z"],
+        default="range",
+        help="Interpretation of saved ERP GT depth before sampling virtual windows.",
+    )
+    parser.add_argument("--depth-max-m", type=float, default=80.0, help="Maximum valid radial GT depth in meters.")
     parser.add_argument("--save-last", action="store_true")
+    parser.add_argument("--no-save-last", dest="save_last", action="store_false")
     parser.add_argument("--save-every-steps", type=int, default=0)
+    parser.add_argument(
+        "--checkpoint-format",
+        choices=["trainable_delta", "full"],
+        default="trainable_delta",
+        help="Use trainable_delta on 24GB GPUs; full stores every model tensor.",
+    )
     parser.add_argument("--max-duration-minutes", type=float, default=0.0)
     parser.add_argument("--log-csv", type=Path, default=None)
     parser.add_argument("--loss-plot", type=Path, default=None)
@@ -83,7 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Iterable[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
+    args = parse_args(argv)
     set_seed(args.seed)
 
     if args.smoke:
@@ -108,10 +134,48 @@ def main(argv: Iterable[str] | None = None) -> None:
     train(args)
 
 
+def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+    argv_list = list(argv) if argv is not None else None
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", type=Path, default=None)
+    config_args, _ = config_parser.parse_known_args(argv_list)
+    parser = build_parser()
+    if config_args.config is not None:
+        parser.set_defaults(**load_config_defaults(config_args.config, parser))
+    return parser.parse_args(argv_list)
+
+
+def load_config_defaults(path: Path, parser: argparse.ArgumentParser) -> Dict:
+    with path.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"Training config must be a mapping: {path}")
+    flattened: Dict = {}
+    for key, value in raw.items():
+        if isinstance(value, dict):
+            flattened.update(value)
+        else:
+            flattened[key] = value
+    allowed = {action.dest for action in parser._actions}
+    unknown = sorted(set(flattened) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown training config keys in {path}: {unknown}")
+    for key in CONFIG_PATH_KEYS:
+        if key in flattened and flattened[key] is not None:
+            flattened[key] = Path(flattened[key])
+    flattened["config"] = path
+    return flattened
+
+
 def train(args: argparse.Namespace) -> None:
     device = resolve_device(args.device)
     pano_size = (args.pano_height, args.pano_width) if args.pano_height > 0 and args.pano_width > 0 else None
-    dataset = PanoVKittiOmegaDataset(root=args.dataset_root, pano_size=pano_size)
+    dataset = PanoVKittiOmegaDataset(
+        root=args.dataset_root,
+        pano_size=pano_size,
+        panos_per_sample=args.panos_per_sample,
+        grouping=args.pano_grouping,
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -272,21 +336,28 @@ def train_step(
     pano_images = batch["pano_image"]
     pano_depths = batch["pano_depth"]
 
-    target_depth, target_valid = sample_depth_targets(model, pano_depths)
-    predictions = model(pano_images=pano_images, return_sampler_output=True)
-    pred_depth = predictions["depth"] * args.pred_depth_scale
-
-    loss_depth = masked_log_l1_depth(pred_depth, target_depth, target_valid)
-    loss_camera_dict = camera_alignment_loss(
-        predictions=predictions,
-        batch=batch,
-        translation_weight=args.camera_translation_weight,
-        rotation_weight=args.camera_rotation_weight,
-        fov_weight=args.camera_fov_weight,
-        position_mode=args.camera_position_mode,
+    target_depth, target_valid = sample_depth_targets(
+        model,
+        pano_depths,
+        source_depth_semantics=args.gt_depth_semantics,
+        max_range_depth=args.depth_max_m,
     )
-    loss_camera = loss_camera_dict["loss_camera"]
-    loss = loss_depth + args.camera_loss_weight * loss_camera
+    amp_enabled = pano_images.device.type == "cuda" and args.amp_dtype != "none"
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float32
+    with torch.autocast(device_type=pano_images.device.type, dtype=amp_dtype, enabled=amp_enabled):
+        predictions = model(pano_images=pano_images, return_sampler_output=True)
+        pred_depth = predictions["depth"] * args.pred_depth_scale
+        loss_depth = masked_log_l1_depth(pred_depth, target_depth, target_valid)
+        loss_camera_dict = camera_alignment_loss(
+            predictions=predictions,
+            batch=batch,
+            translation_weight=args.camera_translation_weight,
+            rotation_weight=args.camera_rotation_weight,
+            fov_weight=args.camera_fov_weight,
+            position_mode=args.camera_position_mode,
+        )
+        loss_camera = loss_camera_dict["loss_camera"]
+        loss = loss_depth + args.camera_loss_weight * loss_camera
     loss.backward()
 
     if args.grad_clip > 0:
@@ -304,23 +375,41 @@ def train_step(
 
 
 @torch.no_grad()
-def sample_depth_windows(model: VGGTOmega_LUNA, pano_depths: torch.Tensor) -> torch.Tensor:
-    target_depth, _ = sample_depth_targets(model, pano_depths)
+def sample_depth_windows(
+    model: VGGTOmega_LUNA,
+    pano_depths: torch.Tensor,
+    source_depth_semantics: str = "range",
+    max_range_depth: float | None = None,
+) -> torch.Tensor:
+    target_depth, _ = sample_depth_targets(model, pano_depths, source_depth_semantics, max_range_depth)
     return target_depth
 
 
 @torch.no_grad()
-def sample_depth_targets(model: VGGTOmega_LUNA, pano_depths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample ERP range-depth, convert it to pinhole Z-depth, and keep a hard validity mask."""
-    source_valid = (pano_depths > 0).to(dtype=pano_depths.dtype)
-    packed_depth_valid = torch.cat([pano_depths * source_valid, source_valid, source_valid.new_zeros(source_valid.shape)], dim=1)
-    sampled = model.pano_sampler(packed_depth_valid, interpolation_mode="bilinear")
+def sample_depth_targets(
+    model: VGGTOmega_LUNA,
+    pano_depths: torch.Tensor,
+    source_depth_semantics: str = "range",
+    max_range_depth: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode source ERP depth to radial range, sample it, and convert to window Z-depth."""
+    source_valid_bool = torch.isfinite(pano_depths) & (pano_depths > 0)
+    source_valid = source_valid_bool.to(dtype=pano_depths.dtype)
+    range_depth_erp = erp_depth_to_range_depth(pano_depths, source_depth_semantics)
+    source_valid_bool &= torch.isfinite(range_depth_erp) & (range_depth_erp > 0)
+    if max_range_depth is not None and max_range_depth > 0:
+        source_valid_bool &= range_depth_erp <= max_range_depth
+    source_valid = source_valid_bool.to(dtype=pano_depths.dtype)
+    source_depth = torch.where(source_valid_bool, range_depth_erp, torch.zeros_like(range_depth_erp))
+    channel_dim = 1 if source_depth.ndim == 4 else 2
+    packed_depth_valid = torch.cat([source_depth, source_valid, source_valid.new_zeros(source_valid.shape)], dim=channel_dim)
+    sampled = sample_pano_tensor(model, packed_depth_valid, interpolation_mode="bilinear")
     sampled_depth = sampled.windows[:, :, :1]
     sampled_weight = sampled.windows[:, :, 1:2]
     range_depth = (sampled_depth / sampled_weight.clamp_min(1e-6)).permute(0, 1, 3, 4, 2).contiguous()
 
-    valid_as_rgb = source_valid.repeat(1, 3, 1, 1)
-    sampled_valid = model.pano_sampler(valid_as_rgb, interpolation_mode="nearest").windows[:, :, :1]
+    valid_as_rgb = source_valid.repeat(1, 3, 1, 1) if source_valid.ndim == 4 else source_valid.repeat(1, 1, 3, 1, 1)
+    sampled_valid = sample_pano_tensor(model, valid_as_rgb, interpolation_mode="nearest").windows[:, :, :1]
     valid = sampled_valid.permute(0, 1, 3, 4, 2).contiguous() > 0.5
     valid = valid & (sampled_weight.permute(0, 1, 3, 4, 2).contiguous() > 1e-6)
 
@@ -329,6 +418,76 @@ def sample_depth_targets(model: VGGTOmega_LUNA, pano_depths: torch.Tensor) -> tu
     valid = valid & torch.isfinite(target_z) & (target_z > 0)
     target_z = torch.where(valid, target_z, torch.zeros_like(target_z))
     return target_z, valid
+
+
+def sample_pano_tensor(
+    model: VGGTOmega_LUNA,
+    tensor: torch.Tensor,
+    interpolation_mode: str,
+) -> SimpleNamespace:
+    if hasattr(model, "sample_pano_windows"):
+        return model.sample_pano_windows(tensor, interpolation_mode=interpolation_mode)
+    return model.pano_sampler(tensor, interpolation_mode=interpolation_mode)
+
+
+def erp_depth_to_range_depth(pano_depths: torch.Tensor, semantics: str) -> torch.Tensor:
+    if semantics == "range":
+        return pano_depths
+    if semantics not in {"cubemap_z", "double_cubemap_z"}:
+        raise ValueError(f"Unknown ERP depth semantics: {semantics}")
+    height, width = pano_depths.shape[-2:]
+    rays = merged_cubemap_source_rays_torch(height, width, pano_depths.device, pano_depths.dtype)
+    face_z_factor = cube_projection_factor_torch(rays)
+    if semantics == "double_cubemap_z":
+        back_rays = rotate_source_rays_about_vertical_torch(rays, -math.pi / 4.0)
+        back_factor = cube_projection_factor_torch(back_rays)
+        front_weight = cube_edge_weight_torch(rays)
+        back_weight = cube_edge_weight_torch(back_rays)
+        face_z_factor = (front_weight * face_z_factor + back_weight * back_factor) / (
+            front_weight + back_weight
+        ).clamp_min(torch.finfo(pano_depths.dtype).eps)
+    return pano_depths / face_z_factor[None, None]
+
+
+def merged_cubemap_source_rays_torch(
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    y = (torch.arange(height, device=device, dtype=dtype) + 0.5) / float(height)
+    x = (torch.arange(width, device=device, dtype=dtype) + 0.5) / float(width)
+    vv, uu = torch.meshgrid(y, x, indexing="ij")
+    longitude = (uu * 2.0 - 1.0) * math.pi
+    latitude = (0.5 - vv) * math.pi
+    cos_lat = torch.cos(latitude)
+    return torch.stack(
+        [cos_lat * torch.cos(longitude), cos_lat * torch.sin(longitude), torch.sin(latitude)],
+        dim=-1,
+    )
+
+
+def rotate_source_rays_about_vertical_torch(rays: torch.Tensor, angle_rad: float) -> torch.Tensor:
+    cosine = math.cos(angle_rad)
+    sine = math.sin(angle_rad)
+    return torch.stack(
+        [
+            cosine * rays[..., 0] - sine * rays[..., 1],
+            sine * rays[..., 0] + cosine * rays[..., 1],
+            rays[..., 2],
+        ],
+        dim=-1,
+    )
+
+
+def cube_projection_factor_torch(rays: torch.Tensor) -> torch.Tensor:
+    return rays.abs().amax(dim=-1).clamp_min(torch.finfo(rays.dtype).eps)
+
+
+def cube_edge_weight_torch(rays: torch.Tensor) -> torch.Tensor:
+    sorted_abs = rays.abs().sort(dim=-1).values
+    factor = sorted_abs[..., 2].clamp_min(torch.finfo(rays.dtype).eps)
+    return (1.0 - sorted_abs[..., 1] / factor + 1e-6).clamp_min(0.0)
 
 
 def build_window_z_factor(camera_meta: Dict[str, torch.Tensor], height: int, width: int) -> torch.Tensor:
@@ -394,7 +553,37 @@ def save_loss_plot(path: Path, metrics_history: list[Dict[str, float]]) -> None:
 
 def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace, step: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model": model.state_dict(), "args": vars(args), "step": step}, path)
+    args_payload = vars(args).copy()
+    if args.checkpoint_format == "trainable_delta":
+        delta = {
+            name: param.detach().cpu()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+        torch.save(
+            {
+                "checkpoint_format": "trainable_delta",
+                "model_delta": delta,
+                "base_checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
+                "trainable": args.trainable,
+                "args": args_payload,
+                "step": step,
+            },
+            path,
+        )
+        return
+
+    cpu_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+    torch.save(
+        {
+            "checkpoint_format": "full",
+            "model": cpu_state,
+            "base_checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
+            "args": args_payload,
+            "step": step,
+        },
+        path,
+    )
 
 
 def masked_log_l1_depth(
@@ -402,17 +591,16 @@ def masked_log_l1_depth(
     target_depth: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    target_depth = target_depth.to(device=pred_depth.device, dtype=pred_depth.dtype)
-    pred_depth = torch.nan_to_num(pred_depth, nan=1e-4, posinf=1e4, neginf=1e-4)
-    target_depth = torch.nan_to_num(target_depth, nan=0.0, posinf=0.0, neginf=0.0)
-    valid = torch.isfinite(target_depth) & (target_depth > 0)
+    pred_depth = pred_depth.float()
+    target_depth = target_depth.to(device=pred_depth.device, dtype=torch.float32)
+    valid = torch.isfinite(pred_depth) & torch.isfinite(target_depth) & (target_depth > 0)
     if valid_mask is not None:
         valid = valid & valid_mask.to(device=target_depth.device, dtype=torch.bool)
     if not bool(valid.any()):
         return pred_depth.new_zeros(())
-    pred = pred_depth.clamp_min(1e-4)
-    target = target_depth.clamp_min(1e-4)
-    return (torch.log(pred[valid]) - torch.log(target[valid])).abs().mean()
+    pred = pred_depth[valid].clamp_min(1e-4)
+    target = target_depth[valid].clamp_min(1e-4)
+    return (torch.log(pred) - torch.log(target)).abs().mean()
 
 
 def camera_alignment_loss(
@@ -456,7 +644,10 @@ def camera_alignment_loss(
         dim=-1,
     )
 
-    loss_t = (pred_translation - target_translation).abs().mean()
+    if position_mode == "none" or translation_weight == 0:
+        loss_t = pred_translation.new_zeros(())
+    else:
+        loss_t = (pred_translation - target_translation).abs().mean()
     loss_r = torch.minimum(
         (pred_quat - target_quat).abs().sum(dim=-1),
         (pred_quat + target_quat).abs().sum(dim=-1),
@@ -472,9 +663,11 @@ def camera_alignment_loss(
 
 
 def build_target_translation(rotations_w2c: torch.Tensor, batch: Dict, position_mode: str) -> torch.Tensor:
+    if position_mode == "none":
+        return rotations_w2c.new_zeros(*rotations_w2c.shape[:2], 3)
     if position_mode == "local_zero":
         return rotations_w2c.new_zeros(*rotations_w2c.shape[:2], 3)
-    if position_mode != "world":
+    if position_mode not in {"world", "relative_anchor", "relative_mean"}:
         raise ValueError(f"Unknown camera-position-mode: {position_mode}")
 
     pano_position = batch.get("pano_position_m", None)
@@ -483,7 +676,20 @@ def build_target_translation(rotations_w2c: torch.Tensor, batch: Dict, position_
     center_world = pano_position.to(device=rotations_w2c.device, dtype=rotations_w2c.dtype)
     if center_world.ndim == 1:
         center_world = center_world[None]
-    center_world = center_world[:, None, :, None]
+    if center_world.ndim == 2:
+        center_world = center_world[:, None, :]
+    if position_mode == "relative_anchor":
+        center_world = center_world - center_world[:, :1, :]
+    elif position_mode == "relative_mean":
+        center_world = center_world - center_world.mean(dim=1, keepdim=True)
+
+    batch_size, total_views = rotations_w2c.shape[:2]
+    num_panos = center_world.shape[1]
+    if total_views % num_panos != 0:
+        raise ValueError(f"Cannot map {total_views} views to {num_panos} panos.")
+    views_per_pano = total_views // num_panos
+    center_world = center_world[:, :, None, :].expand(batch_size, num_panos, views_per_pano, 3)
+    center_world = center_world.reshape(batch_size, total_views, 3)[..., None]
     return (-(rotations_w2c @ center_world)[..., 0]).contiguous()
 
 
@@ -497,6 +703,24 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path, strict: bool)
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     except TypeError:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    if isinstance(checkpoint, dict) and "model_delta" in checkpoint:
+        base_checkpoint = checkpoint.get("base_checkpoint")
+        if base_checkpoint is None:
+            base_checkpoint = checkpoint.get("args", {}).get("checkpoint")
+        if base_checkpoint:
+            base_checkpoint_path = Path(base_checkpoint)
+            if base_checkpoint_path.exists() and base_checkpoint_path.resolve() != checkpoint_path.resolve():
+                load_checkpoint(model, base_checkpoint_path, strict=False)
+            else:
+                print(f"[WARN] base checkpoint is unavailable for delta load: {base_checkpoint}")
+        else:
+            print("[WARN] delta checkpoint has no base_checkpoint; applying delta to current model.")
+        state_dict = strip_state_dict_prefix(checkpoint["model_delta"])
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"[INFO] loaded trainable-delta checkpoint = {checkpoint_path}")
+        print(f"[INFO] missing_keys = {len(missing)}; unexpected_keys = {len(unexpected)}")
+        return
 
     state_dict = checkpoint
     if isinstance(checkpoint, dict):

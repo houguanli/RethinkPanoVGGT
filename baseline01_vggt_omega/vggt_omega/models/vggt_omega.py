@@ -9,6 +9,7 @@ import warnings
 import torch
 import torch.nn as nn
 
+from vggt_omega.checkpoint import DEFAULT_CHECKPOINT_PATH, load_checkpoint
 from vggt_omega.models.aggregator import Aggregator
 from vggt_omega.models.heads import CameraHead, DenseHead, TextAlignmentHead
 
@@ -23,6 +24,8 @@ class VGGTOmega(nn.Module):
         enable_camera: bool = True,
         enable_depth: bool = True,
         enable_alignment: bool = False,
+        checkpoint_path: str | None = str(DEFAULT_CHECKPOINT_PATH),
+        checkpoint_strict: bool = True,
     ) -> None:
         super().__init__()
 
@@ -31,6 +34,8 @@ class VGGTOmega(nn.Module):
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.dense_head = DenseHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_depth else None
         self.text_alignment_head = TextAlignmentHead(dim_in=2 * embed_dim) if enable_alignment else None
+        if checkpoint_path is not None:
+            load_checkpoint(self, checkpoint_path, strict=checkpoint_strict)
 
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
         if len(images.shape) == 4:

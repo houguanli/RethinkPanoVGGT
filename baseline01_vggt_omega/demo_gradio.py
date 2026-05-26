@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from visual_util import predictions_to_glb
+from vggt_omega.checkpoint import DEFAULT_CHECKPOINT_PATH
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.load_fn import load_and_preprocess_images
 from vggt_omega.utils.pose_enc import encoding_to_camera
@@ -28,9 +29,7 @@ def load_model(checkpoint_path: str) -> VGGTOmega:
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    model = VGGTOmega().eval()
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
-    model.load_state_dict(state_dict)
+    model = VGGTOmega(checkpoint_path=checkpoint_path).eval()
     return model.to("cuda")
 
 
@@ -547,7 +546,11 @@ def build_ui(model: VGGTOmega, image_resolution: int):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="VGGT-Omega Gradio demo")
-    parser.add_argument("--checkpoint", required=True, help="Local VGGT-Omega checkpoint path.")
+    parser.add_argument(
+        "--checkpoint",
+        default=str(DEFAULT_CHECKPOINT_PATH),
+        help="Local VGGT-Omega checkpoint path.",
+    )
     parser.add_argument("--image-resolution", type=int, default=512, help="Input image resolution. Default: 512.")
     parser.add_argument("--server-name", default="0.0.0.0")
     parser.add_argument("--server-port", type=int, default=7860)

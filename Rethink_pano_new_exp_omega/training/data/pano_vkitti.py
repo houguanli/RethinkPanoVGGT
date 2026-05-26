@@ -48,12 +48,21 @@ class PanoVKittiOmegaDataset(Dataset):
         self,
         root: str | Path = DEFAULT_DATASET_ROOT,
         pano_size: Optional[Tuple[int, int]] = None,
+        panos_per_sample: int = 1,
+        grouping: str = "nearest",
         max_samples: Optional[int] = None,
         strict: bool = True,
     ) -> None:
+        if panos_per_sample < 1:
+            raise ValueError(f"panos_per_sample must be >= 1, got {panos_per_sample}")
+        if grouping not in {"nearest", "sequential"}:
+            raise ValueError(f"Unknown grouping mode: {grouping}")
         self.root = resolve_converted_dataset_root(root)
         self.pano_size = pano_size
+        self.panos_per_sample = panos_per_sample
+        self.grouping = grouping
         self.items = self._build_index(max_samples=max_samples)
+        self.groups = self._build_groups()
         if strict and not self.items:
             raise FileNotFoundError(
                 f"No pano VKitti samples found under {self.root}. "
@@ -61,10 +70,25 @@ class PanoVKittiOmegaDataset(Dataset):
             )
 
     def __len__(self) -> int:
-        return len(self.items)
+        return len(self.groups)
 
     def __getitem__(self, index: int) -> Dict:
-        item = self.items[index]
+        group = self.groups[index]
+        if self.panos_per_sample == 1:
+            return self._read_item(self.items[group[0]])
+
+        samples = [self._read_item(self.items[item_index]) for item_index in group]
+        return {
+            "pano_image": torch.stack([sample["pano_image"] for sample in samples], dim=0),
+            "pano_depth": torch.stack([sample["pano_depth"] for sample in samples], dim=0),
+            "sequence_name": [sample["sequence_name"] for sample in samples],
+            "scene_name": "|".join(sample["scene_name"] for sample in samples),
+            "rgb_path": [sample["rgb_path"] for sample in samples],
+            "depth_path": [sample["depth_path"] for sample in samples],
+            "pano_position_m": torch.stack([sample["pano_position_m"] for sample in samples], dim=0),
+        }
+
+    def _read_item(self, item: Dict) -> Dict:
         image = _read_rgb_tensor(item["rgb_path"])
         depth = _read_depth_tensor(item["depth_path"], item["output_depth_scale"])
 
@@ -91,6 +115,29 @@ class PanoVKittiOmegaDataset(Dataset):
             "depth_path": str(item["depth_path"]),
             "pano_position_m": torch.tensor(item["pano_position_m"], dtype=torch.float32),
         }
+
+    def _build_groups(self) -> List[List[int]]:
+        if self.panos_per_sample == 1:
+            return [[idx] for idx in range(len(self.items))]
+        if not self.items:
+            return []
+
+        if self.grouping == "sequential":
+            groups = []
+            for idx in range(len(self.items)):
+                group = list(range(idx, min(idx + self.panos_per_sample, len(self.items))))
+                if len(group) < self.panos_per_sample:
+                    group.extend(range(0, self.panos_per_sample - len(group)))
+                groups.append(group)
+            return groups
+
+        positions = np.asarray([item["pano_position_m"] for item in self.items], dtype=np.float32)
+        groups = []
+        for idx, position in enumerate(positions):
+            distances = np.linalg.norm(positions - position[None], axis=1)
+            nearest = np.argsort(distances, kind="stable")[: self.panos_per_sample]
+            groups.append([int(item_idx) for item_idx in nearest])
+        return groups
 
     def _build_index(self, max_samples: Optional[int]) -> List[Dict]:
         sequence_list_path = self.root / "sequence_list.txt"
