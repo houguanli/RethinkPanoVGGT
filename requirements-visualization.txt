@@ -1,0 +1,27 @@
+# Visualization, demo, and point-cloud inspection extras.
+# Install after requirements.txt:
+#   pip install -r requirements-visualization.txt
+#
+# Confirmed against conda env: RethinkPanoVGGT_omega
+# Verified on: 2026-05-26
+
+-r requirements.txt
+
+matplotlib==3.10.9
+trimesh==4.12.2
+gradio==6.14.0
+gradio_client==2.5.0
+viser==1.0.29
+onnxruntime==1.26.0
+fastapi==0.136.1
+uvicorn==0.47.0
+rich==14.3.4
+
+# Optional upstream-baseline extras found in the imported official code paths
+# but not installed in the current RethinkPanoVGGT_omega conda environment.
+# Uncomment only when running those specific upstream utilities.
+# open3d
+# plyfile
+# kornia
+# wcmatch
+# xformers
