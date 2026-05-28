@@ -1,17 +1,21 @@
-# Single RTX 4090 debug profile for variable-length neighborhood pano training.
+# RTX 4090 profile for variable-length multi-pano training.
+# The model sees 2..X neighboring panos. Per-window geometry is fixed by the
+# pano sampler; camera supervision is applied to pano centers relative to pano0.
 data:
   dataset_root: /home/aoki/RethinkPanoVGGT_omega/dataset/converted_pano4vggt_omega_range_v2
   checkpoint: /home/aoki/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt
   pano_sample_mode: variable_neighborhood
   pano_min_count: 2
-  pano_max_count: 3
+  # Verified on the local RTX 4090 with num_yaw=2: pano_max_count=8
+  # completes one full train step, but high counts are slow.
+  pano_max_count: 8
   pano_grouping: nearest
 
 sampler:
   patch_size: 16
   window_size: 512
-  # 2-3 panos x 2 yaw windows keeps the total VGGT view count small on a 4090.
-  # For larger GPUs, raise this together with pano_max_count for denser coverage.
+  # Keep this at 2 on a 24GB 4090 when pano_max_count can reach 8.
+  # Raise on larger GPUs if denser per-pano coverage is needed.
   num_yaw: 2
   pitch_degrees: "0"
   fov_degrees: 75.0
@@ -45,10 +49,10 @@ runtime:
   max_steps: 1000000
   num_workers: 2
   seed: 42
-  max_duration_minutes: 60.0
+  max_duration_minutes: 180.0
   save_every_steps: 0
   save_last: true
   checkpoint_format: trainable_delta
 
 output:
-  output_dir: /home/aoki/RethinkPanoVGGT_omega/Rethink_pano_new_exp_omega/outputs/luna_range_v2_multipano_variable_single4090
+  output_dir: /home/aoki/RethinkPanoVGGT_omega/outputs/multipano_pano_relative_4090

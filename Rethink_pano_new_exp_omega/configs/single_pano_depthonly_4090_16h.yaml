@@ -1,18 +1,19 @@
-# Single RTX 4090 debug profile for variable-length neighborhood pano training.
+# RTX 4090 profile for single-pano reconstruction.
+# In single-pano mode, virtual windows share a known center and known sampling
+# geometry, so camera supervision is disabled and reconstruction uses the known
+# window geometry path for evaluation.
 data:
   dataset_root: /home/aoki/RethinkPanoVGGT_omega/dataset/converted_pano4vggt_omega_range_v2
   checkpoint: /home/aoki/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt
-  pano_sample_mode: variable_neighborhood
-  pano_min_count: 2
-  pano_max_count: 3
+  pano_sample_mode: single
+  pano_min_count: 1
+  pano_max_count: 1
   pano_grouping: nearest
 
 sampler:
   patch_size: 16
   window_size: 512
-  # 2-3 panos x 2 yaw windows keeps the total VGGT view count small on a 4090.
-  # For larger GPUs, raise this together with pano_max_count for denser coverage.
-  num_yaw: 2
+  num_yaw: 8
   pitch_degrees: "0"
   fov_degrees: 75.0
   pano_height: 0
@@ -23,16 +24,15 @@ supervision:
   depth_max_m: 80.0
   pred_depth_scale: 21.137727657535685
   enable_camera_head: true
-  camera_supervision_mode: pano_relative
-  camera_loss_weight: 1.0
-  camera_translation_weight: 1.0
+  camera_supervision_mode: none
+  camera_loss_weight: 0.0
+  camera_translation_weight: 0.0
   camera_rotation_weight: 0.0
   camera_fov_weight: 0.0
-  pano_translation_consistency_weight: 0.1
-  camera_position_mode: relative_anchor
+  camera_position_mode: local_zero
 
 optimization:
-  trainable: luna_heads
+  trainable: luna_dense
   lr: 5.0e-5
   weight_decay: 0.05
   grad_clip: 1.0
@@ -45,10 +45,10 @@ runtime:
   max_steps: 1000000
   num_workers: 2
   seed: 42
-  max_duration_minutes: 60.0
+  max_duration_minutes: 960.0
   save_every_steps: 0
   save_last: true
   checkpoint_format: trainable_delta
 
 output:
-  output_dir: /home/aoki/RethinkPanoVGGT_omega/Rethink_pano_new_exp_omega/outputs/luna_range_v2_multipano_variable_single4090
+  output_dir: /home/aoki/RethinkPanoVGGT_omega/outputs/single_pano_depthonly_16h

@@ -21,14 +21,15 @@ supervision:
   depth_max_m: 80.0
   pred_depth_scale: 21.137727657535685
   enable_camera_head: true
-  camera_loss_weight: 1.0
-  camera_translation_weight: 1.0
-  camera_rotation_weight: 1.0
-  camera_fov_weight: 0.1
+  camera_supervision_mode: none
+  camera_loss_weight: 0.0
+  camera_translation_weight: 0.0
+  camera_rotation_weight: 0.0
+  camera_fov_weight: 0.0
   camera_position_mode: local_zero
 
 optimization:
-  trainable: luna_heads
+  trainable: luna_dense
   lr: 5.0e-5
   weight_decay: 0.05
   grad_clip: 1.0
