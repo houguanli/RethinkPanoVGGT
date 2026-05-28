@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=COMPARE_ROOT / "panovggt_ckpt" / "model.pt",
+        default=PROJECT_ROOT / "ckpt" / "panovggt" / "model.pt",
     )
     parser.add_argument(
         "--config",

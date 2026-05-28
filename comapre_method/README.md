@@ -4,9 +4,12 @@ This directory stores external baselines used for local pano reconstruction comp
 
 ## Layout
 
-- `vggt_omega_baseline/`: official VGGT-Omega baseline code. Its default checkpoint resolves to `../..//ckpt/vggt_omega_1b_512.pt` from the project root.
+- `vggt_omega_baseline/`: official VGGT-Omega baseline code. Its default checkpoint resolves to `ckpt/vggt_omega_1b_512.pt` from the project root.
 - `PANOVGGT_baseline/`: PanoVGGT baseline code, copied without its `.venv`, example data, outputs, or checkpoint payload.
-- `panovggt_ckpt/model.pt`: externalized PanoVGGT checkpoint.
+
+PanoVGGT's external checkpoint is kept with the other project checkpoints:
+
+- `/home/aoki/RethinkPanoVGGT_omega/ckpt/panovggt/model.pt`
 
 PanoVGGT example images are kept outside the method code at:
 

@@ -44,6 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pano-height", type=int, default=None)
     parser.add_argument("--pano-width", type=int, default=None)
+    parser.add_argument("--num-yaw", type=int, default=None, help="Override checkpoint window yaw count for eval/export.")
+    parser.add_argument("--pitch-degrees", type=str, default=None, help="Override checkpoint pitch list for eval/export.")
+    parser.add_argument("--fov-degrees", type=float, default=None, help="Override checkpoint window FOV for eval/export.")
+    parser.add_argument("--window-size", type=int, default=None, help="Override checkpoint window size for eval/export.")
     parser.add_argument("--seed", type=int, default=42)
     return parser
 
@@ -61,6 +65,14 @@ def main() -> None:
     if args.pano_height is not None and args.pano_width is not None:
         model_args.pano_height = args.pano_height
         model_args.pano_width = args.pano_width
+    if args.num_yaw is not None:
+        model_args.num_yaw = args.num_yaw
+    if args.pitch_degrees is not None:
+        model_args.pitch_degrees = args.pitch_degrees
+    if args.fov_degrees is not None:
+        model_args.fov_degrees = args.fov_degrees
+    if args.window_size is not None:
+        model_args.window_size = args.window_size
 
     dataset = PanoVKittiOmegaDataset(
         root=args.dataset_root,

@@ -51,7 +51,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--panos-per-sample", type=int, default=1)
+    parser.add_argument(
+        "--pano-sample-mode",
+        choices=["single", "fixed_neighborhood", "variable_neighborhood"],
+        default="single",
+    )
+    parser.add_argument("--pano-min-count", type=int, default=1)
+    parser.add_argument("--pano-max-count", type=int, default=1)
+    parser.add_argument("--panos-per-sample", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--pano-grouping", choices=["nearest", "sequential"], default="nearest")
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=0.05)
@@ -170,10 +177,15 @@ def load_config_defaults(path: Path, parser: argparse.ArgumentParser) -> Dict:
 def train(args: argparse.Namespace) -> None:
     device = resolve_device(args.device)
     pano_size = (args.pano_height, args.pano_width) if args.pano_height > 0 and args.pano_width > 0 else None
+    normalize_pano_sampling_args(args)
+    if args.pano_sample_mode == "variable_neighborhood" and args.batch_size != 1:
+        raise ValueError("variable_neighborhood uses variable-length inputs and currently requires batch_size=1.")
     dataset = PanoVKittiOmegaDataset(
         root=args.dataset_root,
         pano_size=pano_size,
-        panos_per_sample=args.panos_per_sample,
+        pano_sample_mode=args.pano_sample_mode,
+        pano_min_count=args.pano_min_count,
+        pano_max_count=args.pano_max_count,
         grouping=args.pano_grouping,
     )
     loader = DataLoader(
@@ -198,6 +210,10 @@ def train(args: argparse.Namespace) -> None:
 
     print(f"[INFO] dataset_root = {dataset.root}")
     print(f"[INFO] samples = {len(dataset)}")
+    print(
+        "[INFO] pano_sampling = "
+        f"{args.pano_sample_mode} min={args.pano_min_count} max={args.pano_max_count} grouping={args.pano_grouping}"
+    )
     print(f"[INFO] device = {device}")
     print(f"[INFO] trainable_params = {trainable_count:,}; frozen_params = {frozen_count:,}")
 
@@ -263,6 +279,27 @@ def train(args: argparse.Namespace) -> None:
             save_checkpoint(ckpt_path, model, args, global_step)
             print(f"[INFO] saved checkpoint = {ckpt_path}")
         print(f"[INFO] stop_reason = {stop_reason}; steps = {global_step}")
+
+
+def normalize_pano_sampling_args(args: argparse.Namespace) -> None:
+    legacy_count = getattr(args, "panos_per_sample", None)
+    if legacy_count is not None:
+        if legacy_count < 1:
+            raise ValueError(f"panos_per_sample must be >= 1, got {legacy_count}")
+        args.pano_sample_mode = "single" if legacy_count == 1 else "fixed_neighborhood"
+        args.pano_min_count = legacy_count
+        args.pano_max_count = legacy_count
+        print(
+            "[WARN] --panos-per-sample is deprecated; use "
+            "--pano-sample-mode/--pano-min-count/--pano-max-count instead."
+        )
+    if args.pano_sample_mode == "single":
+        args.pano_min_count = 1
+        args.pano_max_count = 1
+    if args.pano_min_count < 1 or args.pano_max_count < args.pano_min_count:
+        raise ValueError(f"Invalid pano count range: min={args.pano_min_count}, max={args.pano_max_count}")
+    if args.pano_sample_mode == "variable_neighborhood" and args.pano_min_count < 2:
+        raise ValueError("variable_neighborhood requires --pano-min-count >= 2.")
 
 
 def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
@@ -797,49 +834,50 @@ def set_seed(seed: int) -> None:
 
 
 def write_smoke_dataset(root: Path) -> None:
-    rgb_dir = root / "pano_smoke" / "clone" / "frames" / "rgb" / "Camera_0"
-    depth_dir = root / "pano_smoke" / "clone" / "frames" / "depth" / "Camera_0"
-    rgb_dir.mkdir(parents=True, exist_ok=True)
-    depth_dir.mkdir(parents=True, exist_ok=True)
-
     height, width = 32, 64
+    sequence_lines = []
     x = np.linspace(0, 255, width, dtype=np.uint8)[None, :]
     y = np.linspace(0, 255, height, dtype=np.uint8)[:, None]
-    rgb = np.stack(
-        [
-            np.broadcast_to(x, (height, width)),
-            np.broadcast_to(y, (height, width)),
-            np.full((height, width), 128, dtype=np.uint8),
-        ],
-        axis=-1,
-    )
-    Image.fromarray(rgb, mode="RGB").save(rgb_dir / "rgb_00000.jpg")
+    for idx in range(3):
+        scene_name = f"pano_smoke_{idx:02d}"
+        rgb_dir = root / scene_name / "clone" / "frames" / "rgb" / "Camera_0"
+        depth_dir = root / scene_name / "clone" / "frames" / "depth" / "Camera_0"
+        rgb_dir.mkdir(parents=True, exist_ok=True)
+        depth_dir.mkdir(parents=True, exist_ok=True)
 
-    depth_m = np.full((height, width), 2.0, dtype=np.float32)
-    cv2.imwrite(str(depth_dir / "depth_00000.png"), np.round(depth_m * 100.0).astype(np.uint16))
+        rgb = np.stack(
+            [
+                np.broadcast_to((x + idx * 35).astype(np.uint8), (height, width)),
+                np.broadcast_to(y, (height, width)),
+                np.full((height, width), 128 + idx * 20, dtype=np.uint8),
+            ],
+            axis=-1,
+        )
+        Image.fromarray(rgb, mode="RGB").save(rgb_dir / "rgb_00000.jpg")
 
-    meta = {
-        "scene_name": "pano_smoke",
-        "pano_shape_hw": [height, width],
-        "camera_alignment": {
-            "alignment_policy": "smoke sample uses pano-local zero translation",
-            "panorama_position_m_xyz": [0.0, 0.0, 0.0],
-        },
-        "depth_policy": {
-            "unit": "meters",
-            "invalid_depth_value": 0,
-            "output_depth_scale": 100.0,
-            "saved_depth_decode": "depth_m = uint16_png / 100.0",
-        },
-    }
-    (root / "pano_smoke" / "clone" / "pano_meta.json").write_text(
-        json.dumps(meta, indent=2),
-        encoding="utf-8",
-    )
-    (root / "sequence_list.txt").write_text(
-        "pano_smoke/clone/frames/rgb/Camera_0\n",
-        encoding="utf-8",
-    )
+        depth_m = np.full((height, width), 2.0 + idx * 0.25, dtype=np.float32)
+        cv2.imwrite(str(depth_dir / "depth_00000.png"), np.round(depth_m * 100.0).astype(np.uint16))
+
+        meta = {
+            "scene_name": scene_name,
+            "pano_shape_hw": [height, width],
+            "camera_alignment": {
+                "alignment_policy": "smoke sample uses pano-local or relative-anchor translation",
+                "panorama_position_m_xyz": [float(idx), 0.0, 0.0],
+            },
+            "depth_policy": {
+                "unit": "meters",
+                "invalid_depth_value": 0,
+                "output_depth_scale": 100.0,
+                "saved_depth_decode": "depth_m = uint16_png / 100.0",
+            },
+        }
+        (root / scene_name / "clone" / "pano_meta.json").write_text(
+            json.dumps(meta, indent=2),
+            encoding="utf-8",
+        )
+        sequence_lines.append(f"{scene_name}/clone/frames/rgb/Camera_0")
+    (root / "sequence_list.txt").write_text("\n".join(sequence_lines) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

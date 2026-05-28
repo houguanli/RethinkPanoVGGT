@@ -14,6 +14,7 @@ PanoWindowSampler is responsible for turning it into virtual pinhole windows.
 from __future__ import annotations
 
 import json
+import random
 import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -48,18 +49,34 @@ class PanoVKittiOmegaDataset(Dataset):
         self,
         root: str | Path = DEFAULT_DATASET_ROOT,
         pano_size: Optional[Tuple[int, int]] = None,
-        panos_per_sample: int = 1,
+        pano_sample_mode: str = "single",
+        pano_min_count: int = 1,
+        pano_max_count: int = 1,
+        panos_per_sample: Optional[int] = None,
         grouping: str = "nearest",
         max_samples: Optional[int] = None,
         strict: bool = True,
     ) -> None:
-        if panos_per_sample < 1:
-            raise ValueError(f"panos_per_sample must be >= 1, got {panos_per_sample}")
+        if panos_per_sample is not None:
+            pano_sample_mode = "single" if panos_per_sample == 1 else "fixed_neighborhood"
+            pano_min_count = panos_per_sample
+            pano_max_count = panos_per_sample
+        if pano_sample_mode not in {"single", "fixed_neighborhood", "variable_neighborhood"}:
+            raise ValueError(f"Unknown pano_sample_mode: {pano_sample_mode}")
+        if pano_min_count < 1 or pano_max_count < pano_min_count:
+            raise ValueError(f"Invalid pano count range: min={pano_min_count}, max={pano_max_count}")
+        if pano_sample_mode == "single":
+            pano_min_count = 1
+            pano_max_count = 1
+        if pano_sample_mode == "variable_neighborhood" and pano_min_count < 2:
+            raise ValueError("variable_neighborhood requires pano_min_count >= 2")
         if grouping not in {"nearest", "sequential"}:
             raise ValueError(f"Unknown grouping mode: {grouping}")
         self.root = resolve_converted_dataset_root(root)
         self.pano_size = pano_size
-        self.panos_per_sample = panos_per_sample
+        self.pano_sample_mode = pano_sample_mode
+        self.pano_min_count = pano_min_count
+        self.pano_max_count = pano_max_count
         self.grouping = grouping
         self.items = self._build_index(max_samples=max_samples)
         self.groups = self._build_groups()
@@ -68,14 +85,23 @@ class PanoVKittiOmegaDataset(Dataset):
                 f"No pano VKitti samples found under {self.root}. "
                 "Expected sequence_list.txt plus frames/rgb and frames/depth folders."
             )
+        if self.pano_sample_mode != "single" and strict and len(self.items) < self.pano_min_count:
+            raise ValueError(
+                f"{self.pano_sample_mode} needs at least {self.pano_min_count} panos, "
+                f"but only found {len(self.items)} under {self.root}."
+            )
 
     def __len__(self) -> int:
         return len(self.groups)
 
     def __getitem__(self, index: int) -> Dict:
         group = self.groups[index]
-        if self.panos_per_sample == 1:
+        if self.pano_sample_mode == "single":
             return self._read_item(self.items[group[0]])
+        if self.pano_sample_mode == "variable_neighborhood":
+            max_count = min(self.pano_max_count, len(group))
+            min_count = min(self.pano_min_count, max_count)
+            group = group[: random.randint(min_count, max_count)]
 
         samples = [self._read_item(self.items[item_index]) for item_index in group]
         return {
@@ -117,7 +143,7 @@ class PanoVKittiOmegaDataset(Dataset):
         }
 
     def _build_groups(self) -> List[List[int]]:
-        if self.panos_per_sample == 1:
+        if self.pano_sample_mode == "single":
             return [[idx] for idx in range(len(self.items))]
         if not self.items:
             return []
@@ -125,19 +151,60 @@ class PanoVKittiOmegaDataset(Dataset):
         if self.grouping == "sequential":
             groups = []
             for idx in range(len(self.items)):
-                group = list(range(idx, min(idx + self.panos_per_sample, len(self.items))))
-                if len(group) < self.panos_per_sample:
-                    group.extend(range(0, self.panos_per_sample - len(group)))
+                group = list(range(idx, min(idx + self.pano_max_count, len(self.items))))
+                if len(group) < self.pano_max_count:
+                    group.extend(range(0, self.pano_max_count - len(group)))
                 groups.append(group)
             return groups
 
         positions = np.asarray([item["pano_position_m"] for item in self.items], dtype=np.float32)
-        groups = []
-        for idx, position in enumerate(positions):
-            distances = np.linalg.norm(positions - position[None], axis=1)
-            nearest = np.argsort(distances, kind="stable")[: self.panos_per_sample]
-            groups.append([int(item_idx) for item_idx in nearest])
+        groups: List[List[int]] = []
+        for idx in range(len(positions)):
+            groups.append(self._anchor_first_neighborhood_sequence(idx, positions, self.pano_max_count))
         return groups
+
+    @staticmethod
+    def _anchor_first_neighborhood_sequence(anchor_idx: int, positions: np.ndarray, max_count: int) -> List[int]:
+        """Return an anchor-first local path ordered along the nearest-neighbor tangent."""
+        anchor = positions[anchor_idx]
+        all_indices = [item_idx for item_idx in range(len(positions)) if item_idx != anchor_idx]
+        if not all_indices:
+            return [anchor_idx]
+        offsets = positions[all_indices] - anchor[None]
+        distances = np.linalg.norm(offsets, axis=1)
+        nearest_nonzero = np.where(distances > 1e-6, distances, np.inf)
+        if not np.isfinite(nearest_nonzero).any():
+            return [anchor_idx]
+        tangent = offsets[int(np.argmin(nearest_nonzero))]
+        norm = float(np.linalg.norm(tangent))
+        if not np.isfinite(norm) or norm <= 1e-6:
+            return [anchor_idx, *[item_idx for _, item_idx in sorted(zip(distances.tolist(), all_indices))]][:max_count]
+        tangent = tangent / norm
+        signed = offsets @ tangent
+        perp = np.linalg.norm(offsets - signed[:, None] * tangent[None], axis=1)
+        step = float(np.min(nearest_nonzero))
+        max_perp = max(2.0, step * 0.6)
+        aligned_rows = [
+            (abs(float(signed_value)), float(signed_value), float(distance), item_idx)
+            for item_idx, signed_value, distance, perp_value in zip(all_indices, signed, distances, perp)
+            if abs(float(signed_value)) > 1e-6 and float(perp_value) <= max_perp
+        ]
+        fallback_rows = [
+            (float(distance), item_idx)
+            for item_idx, distance in zip(all_indices, distances)
+        ]
+        ordered: List[int] = [
+            item_idx
+            for _, _, _, item_idx in sorted(aligned_rows, key=lambda row: (row[0], row[1], row[2], row[3]))
+        ]
+        seen = {anchor_idx, *ordered}
+        for _, item_idx in sorted(fallback_rows, key=lambda row: (row[0], row[1])):
+            if len(ordered) >= max_count - 1:
+                break
+            if item_idx not in seen:
+                ordered.append(item_idx)
+                seen.add(item_idx)
+        return [anchor_idx, *ordered[: max_count - 1]]
 
     def _build_index(self, max_samples: Optional[int]) -> List[Dict]:
         sequence_list_path = self.root / "sequence_list.txt"

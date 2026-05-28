@@ -2,7 +2,9 @@
 data:
   dataset_root: /home/aoki/RethinkPanoVGGT_omega/dataset/converted_pano4vggt_omega_range_v2
   checkpoint: /home/aoki/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt
-  panos_per_sample: 1
+  pano_sample_mode: single
+  pano_min_count: 1
+  pano_max_count: 1
   pano_grouping: nearest
 
 sampler:
