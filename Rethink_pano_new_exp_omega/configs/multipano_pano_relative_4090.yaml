@@ -44,6 +44,9 @@ optimization:
 
 runtime:
   device: cuda
+  distributed: auto
+  dist_backend: nccl
+  find_unused_parameters: true
   amp_dtype: bfloat16
   epochs: 100000
   max_steps: 1000000

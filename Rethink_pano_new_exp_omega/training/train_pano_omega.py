@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
 import sys
 import tempfile
@@ -17,9 +18,11 @@ from typing import Dict, Iterable, Tuple
 import cv2
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "pano_omega_luna")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--distributed", choices=["auto", "none", "ddp"], default="auto")
+    parser.add_argument("--dist-backend", choices=["nccl", "gloo"], default="nccl")
+    parser.add_argument("--find-unused-parameters", action="store_true", default=True)
+    parser.add_argument("--no-find-unused-parameters", dest="find_unused_parameters", action="store_false")
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default="none")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=1000)
@@ -194,74 +201,102 @@ def load_config_defaults(path: Path, parser: argparse.ArgumentParser) -> Dict:
 
 
 def train(args: argparse.Namespace) -> None:
-    device = resolve_device(args.device)
+    dist_state = setup_distributed(args)
+    device = resolve_device(args.device, dist_state)
     pano_size = (args.pano_height, args.pano_width) if args.pano_height > 0 and args.pano_width > 0 else None
     normalize_pano_sampling_args(args)
     normalize_camera_supervision_args(args)
     if args.pano_sample_mode == "variable_neighborhood" and args.batch_size != 1:
         raise ValueError("variable_neighborhood uses variable-length inputs and currently requires batch_size=1.")
-    dataset = PanoVKittiOmegaDataset(
-        root=args.dataset_root,
-        pano_size=pano_size,
-        pano_sample_mode=args.pano_sample_mode,
-        pano_min_count=args.pano_min_count,
-        pano_max_count=args.pano_max_count,
-        grouping=args.pano_grouping,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=False,
-    )
-
-    model = build_model(args).to(device)
-    if args.checkpoint is not None:
-        load_checkpoint(model, args.checkpoint, strict=args.strict_checkpoint)
-
-    trainable_count, frozen_count = configure_trainable(model, args.trainable)
-    optimizer = torch.optim.AdamW(
-        [param for param in model.parameters() if param.requires_grad],
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-
-    print(f"[INFO] dataset_root = {dataset.root}")
-    print(f"[INFO] samples = {len(dataset)}")
-    print(
-        "[INFO] pano_sampling = "
-        f"{args.pano_sample_mode} min={args.pano_min_count} max={args.pano_max_count} grouping={args.pano_grouping}"
-    )
-    print(
-        "[INFO] camera_supervision = "
-        f"{args.camera_supervision_mode} position={args.camera_position_mode} "
-        f"weight={args.camera_loss_weight}"
-    )
-    print(f"[INFO] device = {device}")
-    print(f"[INFO] trainable_params = {trainable_count:,}; frozen_params = {frozen_count:,}")
-
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    log_csv = args.log_csv or (args.output_dir / "loss.csv")
-    loss_plot = args.loss_plot or (args.output_dir / "loss_curve.png")
-    max_duration_seconds = args.max_duration_minutes * 60.0 if args.max_duration_minutes > 0 else None
-    started_at = time.time()
-    metrics_history = []
-
-    model.train()
-    global_step = 0
-    stop_reason = "max_steps"
     try:
+        dataset = PanoVKittiOmegaDataset(
+            root=args.dataset_root,
+            pano_size=pano_size,
+            pano_sample_mode=args.pano_sample_mode,
+            pano_min_count=args.pano_min_count,
+            pano_max_count=args.pano_max_count,
+            grouping=args.pano_grouping,
+        )
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=dist_state["world_size"],
+            rank=dist_state["rank"],
+            shuffle=True,
+            drop_last=False,
+        ) if dist_state["distributed"] else None
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=(sampler is None),
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+            drop_last=False,
+        )
+
+        model = build_model(args).to(device)
+        if args.checkpoint is not None:
+            load_checkpoint(model, args.checkpoint, strict=args.strict_checkpoint)
+
+        trainable_count, frozen_count = configure_trainable(model, args.trainable)
+        if dist_state["distributed"]:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[dist_state["local_rank"]] if device.type == "cuda" else None,
+                output_device=dist_state["local_rank"] if device.type == "cuda" else None,
+                find_unused_parameters=args.find_unused_parameters,
+            )
+        optimizer = torch.optim.AdamW(
+            [param for param in model.parameters() if param.requires_grad],
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+
+        rank0_print(f"[INFO] dataset_root = {dataset.root}", dist_state)
+        rank0_print(f"[INFO] samples = {len(dataset)}", dist_state)
+        rank0_print(
+            "[INFO] pano_sampling = "
+            f"{args.pano_sample_mode} min={args.pano_min_count} max={args.pano_max_count} grouping={args.pano_grouping}",
+            dist_state,
+        )
+        rank0_print(
+            "[INFO] camera_supervision = "
+            f"{args.camera_supervision_mode} position={args.camera_position_mode} "
+            f"weight={args.camera_loss_weight}",
+            dist_state,
+        )
+        rank0_print(
+            f"[INFO] distributed = {dist_state['distributed']} "
+            f"rank={dist_state['rank']} world_size={dist_state['world_size']} local_rank={dist_state['local_rank']}",
+            dist_state,
+        )
+        rank0_print(f"[INFO] device = {device}", dist_state)
+        rank0_print(f"[INFO] trainable_params = {trainable_count:,}; frozen_params = {frozen_count:,}", dist_state)
+
+        if is_main_process(dist_state):
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+        barrier(dist_state)
+        log_csv = args.log_csv or (args.output_dir / "loss.csv")
+        loss_plot = args.loss_plot or (args.output_dir / "loss_curve.png")
+        max_duration_seconds = args.max_duration_minutes * 60.0 if args.max_duration_minutes > 0 else None
+        started_at = time.time()
+        metrics_history = []
+
+        model.train()
+        global_step = 0
+        stop_reason = "max_steps"
         for epoch in range(args.epochs):
+            if sampler is not None:
+                sampler.set_epoch(epoch)
             for batch in loader:
-                if max_duration_seconds is not None and time.time() - started_at >= max_duration_seconds:
+                if should_stop_for_duration(started_at, max_duration_seconds, device, dist_state):
                     stop_reason = "max_duration"
                     break
 
                 global_step += 1
                 batch = move_batch_to_device(batch, device)
                 loss_dict = train_step(model, batch, optimizer, args)
+                loss_dict = reduce_loss_dict(loss_dict, dist_state)
                 elapsed_seconds = time.time() - started_at
                 metrics = {
                     "step": global_step,
@@ -278,18 +313,24 @@ def train(args: argparse.Namespace) -> None:
                     ),
                     "lr": optimizer.param_groups[0]["lr"],
                 }
-                metrics_history.append(metrics)
-                append_loss_csv(log_csv, metrics)
-                print(
-                    f"[TRAIN] epoch={epoch + 1} step={global_step} "
-                    f"elapsed={elapsed_seconds / 60.0:.2f}m "
-                    f"loss={metrics['loss']:.6f} depth={metrics['loss_depth']:.6f} "
-                    f"camera={metrics['loss_camera']:.6f}",
-                    flush=True,
-                )
+                if is_main_process(dist_state):
+                    metrics_history.append(metrics)
+                    append_loss_csv(log_csv, metrics)
+                    print(
+                        f"[TRAIN] epoch={epoch + 1} step={global_step} "
+                        f"elapsed={elapsed_seconds / 60.0:.2f}m "
+                        f"loss={metrics['loss']:.6f} depth={metrics['loss_depth']:.6f} "
+                        f"camera={metrics['loss_camera']:.6f}",
+                        flush=True,
+                    )
 
-                if args.save_every_steps > 0 and global_step % args.save_every_steps == 0 and not args.smoke:
-                    save_checkpoint(args.output_dir / f"step_{global_step:06d}.pt", model, args, global_step)
+                if (
+                    is_main_process(dist_state)
+                    and args.save_every_steps > 0
+                    and global_step % args.save_every_steps == 0
+                    and not args.smoke
+                ):
+                    save_checkpoint(args.output_dir / f"step_{global_step:06d}.pt", unwrap_model(model), args, global_step)
 
                 if global_step >= args.max_steps:
                     stop_reason = "max_steps"
@@ -300,13 +341,15 @@ def train(args: argparse.Namespace) -> None:
         else:
             stop_reason = "epochs_complete"
     finally:
-        if metrics_history:
-            save_loss_plot(loss_plot, metrics_history)
-        if args.save_last and not args.smoke:
-            ckpt_path = args.output_dir / "last.pt"
-            save_checkpoint(ckpt_path, model, args, global_step)
-            print(f"[INFO] saved checkpoint = {ckpt_path}")
-        print(f"[INFO] stop_reason = {stop_reason}; steps = {global_step}")
+        if "metrics_history" in locals() and is_main_process(dist_state):
+            if metrics_history:
+                save_loss_plot(loss_plot, metrics_history)
+            if args.save_last and not args.smoke:
+                ckpt_path = args.output_dir / "last.pt"
+                save_checkpoint(ckpt_path, unwrap_model(model), args, global_step)
+                print(f"[INFO] saved checkpoint = {ckpt_path}")
+            print(f"[INFO] stop_reason = {stop_reason}; steps = {global_step}")
+        cleanup_distributed(dist_state)
 
 
 def normalize_pano_sampling_args(args: argparse.Namespace) -> None:
@@ -412,9 +455,10 @@ def train_step(
     optimizer.zero_grad(set_to_none=True)
     pano_images = batch["pano_image"]
     pano_depths = batch["pano_depth"]
+    sampler_model = unwrap_model(model)
 
     target_depth, target_valid = sample_depth_targets(
-        model,
+        sampler_model,
         pano_depths,
         source_depth_semantics=args.gt_depth_semantics,
         max_range_depth=args.depth_max_m,
@@ -941,11 +985,93 @@ def move_batch_to_device(batch: Dict, device: torch.device) -> Dict:
     return moved
 
 
-def resolve_device(requested: str) -> torch.device:
+def setup_distributed(args: argparse.Namespace) -> Dict[str, int | bool]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    use_ddp = args.distributed == "ddp" or (args.distributed == "auto" and world_size > 1)
+    if args.distributed == "ddp" and world_size <= 1:
+        raise RuntimeError("distributed=ddp requires torchrun or WORLD_SIZE > 1.")
+    if use_ddp:
+        if not dist.is_available():
+            raise RuntimeError("torch.distributed is not available in this PyTorch build.")
+        if args.dist_backend == "nccl" and not torch.cuda.is_available():
+            raise RuntimeError("NCCL backend requires CUDA. Use --dist-backend gloo for CPU debugging.")
+        if not dist.is_initialized():
+            dist.init_process_group(backend=args.dist_backend, init_method="env://")
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+    return {
+        "distributed": use_ddp,
+        "rank": rank,
+        "local_rank": local_rank,
+        "world_size": world_size,
+    }
+
+
+def cleanup_distributed(dist_state: Dict[str, int | bool]) -> None:
+    if dist_state["distributed"] and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(dist_state: Dict[str, int | bool]) -> bool:
+    return int(dist_state["rank"]) == 0
+
+
+def rank0_print(message: str, dist_state: Dict[str, int | bool]) -> None:
+    if is_main_process(dist_state):
+        print(message)
+
+
+def barrier(dist_state: Dict[str, int | bool]) -> None:
+    if dist_state["distributed"] and dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def reduce_loss_dict(
+    loss_dict: Dict[str, torch.Tensor],
+    dist_state: Dict[str, int | bool],
+) -> Dict[str, torch.Tensor]:
+    if not dist_state["distributed"]:
+        return loss_dict
+    reduced = {}
+    for key, value in loss_dict.items():
+        item = value.detach().clone()
+        dist.all_reduce(item, op=dist.ReduceOp.SUM)
+        item /= int(dist_state["world_size"])
+        reduced[key] = item
+    return reduced
+
+
+def should_stop_for_duration(
+    started_at: float,
+    max_duration_seconds: float | None,
+    device: torch.device,
+    dist_state: Dict[str, int | bool],
+) -> bool:
+    if max_duration_seconds is None:
+        return False
+    local_stop = time.time() - started_at >= max_duration_seconds
+    if not dist_state["distributed"]:
+        return local_stop
+    flag = torch.tensor(1 if local_stop else 0, device=device, dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item())
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+
+def resolve_device(requested: str, dist_state: Dict[str, int | bool]) -> torch.device:
     if requested == "auto":
         requested = "cuda" if torch.cuda.is_available() else "cpu"
     if requested == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is False.")
+    if requested == "cuda" and dist_state["distributed"]:
+        return torch.device("cuda", int(dist_state["local_rank"]))
     return torch.device(requested)
 
 

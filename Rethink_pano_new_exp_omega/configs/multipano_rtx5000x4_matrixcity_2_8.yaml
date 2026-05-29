@@ -1,17 +1,18 @@
-# Single RTX 4090 debug profile for variable-length neighborhood pano training.
+# Multi-pano MatrixCity profile for a 4x RTX 5000 machine.
+# Launch with torchrun --nproc_per_node=4 for synchronized DDP training.
 data:
-  dataset_root: /home/aoki/RethinkPanoVGGT_omega/dataset/converted_pano4vggt_omega_range_v2
-  checkpoint: /home/aoki/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt
+  dataset_root: /whitehole/AOKI/datasets/MatrixCity_large/converted_pano4vggt_omega
+  checkpoint: /whitehole/AOKI/RethinkPanoVGGT-omega/ckpt/vggt_omega_1b_512.pt
   pano_sample_mode: variable_neighborhood
   pano_min_count: 2
-  pano_max_count: 3
+  pano_max_count: 8
   pano_grouping: nearest
 
 sampler:
   patch_size: 16
   window_size: 512
-  # 2-3 panos x 2 yaw windows keeps the total VGGT view count small on a 4090.
-  # For larger GPUs, raise this together with pano_max_count for denser coverage.
+  # 2 yaw views keeps the worst case at 8 panos x 2 windows = 16 VGGT views.
+  # Raise to 4 or 8 only after confirming memory headroom on your RTX 5000 cards.
   num_yaw: 2
   pitch_degrees: "0"
   fov_degrees: 75.0
@@ -19,7 +20,8 @@ sampler:
   pano_width: 0
 
 supervision:
-  gt_depth_semantics: range
+  # Match this to preprocessing. The default MatrixCity conversion command uses double_cubemap_z.
+  gt_depth_semantics: double_cubemap_z
   depth_max_m: 80.0
   pred_depth_scale: 21.137727657535685
   enable_camera_head: true
@@ -36,6 +38,7 @@ optimization:
   lr: 5.0e-5
   weight_decay: 0.05
   grad_clip: 1.0
+  # variable_neighborhood currently requires batch_size=1 in training/train_pano_omega.py.
   batch_size: 1
 
 runtime:
@@ -46,12 +49,12 @@ runtime:
   amp_dtype: bfloat16
   epochs: 100000
   max_steps: 1000000
-  num_workers: 2
+  num_workers: 4
   seed: 42
-  max_duration_minutes: 60.0
+  max_duration_minutes: 180.0
   save_every_steps: 0
   save_last: true
   checkpoint_format: trainable_delta
 
 output:
-  output_dir: /home/aoki/RethinkPanoVGGT_omega/Rethink_pano_new_exp_omega/outputs/luna_range_v2_multipano_variable_single4090
+  output_dir: /whitehole/AOKI/RethinkPanoVGGT-omega/Rethink_pano_new_exp_omega/outputs/matrixcity_multipano_2_8_rtx5000
