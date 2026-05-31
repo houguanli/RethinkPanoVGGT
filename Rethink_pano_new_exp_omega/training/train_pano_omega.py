@@ -77,6 +77,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-yaw", type=int, default=8)
     parser.add_argument("--pitch-degrees", type=str, default="0")
     parser.add_argument("--fov-degrees", type=float, default=75.0)
+    parser.add_argument(
+        "--view-sampling-mode",
+        choices=["fixed", "random", "cyclic"],
+        default="fixed",
+        help=(
+            "How to choose pano window directions during training. 'fixed' keeps the full "
+            "configured yaw/pitch grid; 'random' and 'cyclic' draw --views-per-pano windows "
+            "from that grid each step."
+        ),
+    )
+    parser.add_argument(
+        "--views-per-pano",
+        type=int,
+        default=0,
+        help="Number of yaw/pitch windows sampled per pano when view-sampling-mode is not fixed.",
+    )
     parser.add_argument("--pano-height", type=int, default=0, help="Optional resize height before sampling.")
     parser.add_argument("--pano-width", type=int, default=0, help="Optional resize width before sampling.")
 
@@ -260,6 +276,13 @@ def train(args: argparse.Namespace) -> None:
             dist_state,
         )
         rank0_print(
+            "[INFO] view_sampling = "
+            f"{args.view_sampling_mode} views_per_pano={args.views_per_pano} "
+            f"candidate_yaw={args.num_yaw} candidate_pitch={args.pitch_degrees} "
+            f"window={args.window_size} fov={args.fov_degrees}",
+            dist_state,
+        )
+        rank0_print(
             "[INFO] camera_supervision = "
             f"{args.camera_supervision_mode} position={args.camera_position_mode} "
             f"weight={args.camera_loss_weight}",
@@ -295,7 +318,7 @@ def train(args: argparse.Namespace) -> None:
 
                 global_step += 1
                 batch = move_batch_to_device(batch, device)
-                loss_dict = train_step(model, batch, optimizer, args)
+                loss_dict = train_step(model, batch, optimizer, args, step=global_step)
                 loss_dict = reduce_loss_dict(loss_dict, dist_state)
                 elapsed_seconds = time.time() - started_at
                 metrics = {
@@ -383,6 +406,8 @@ def normalize_camera_supervision_args(args: argparse.Namespace) -> None:
         args.camera_fov_weight = 0.0
     if args.camera_supervision_mode == "pano_relative" and args.pano_sample_mode == "single":
         raise ValueError("pano_relative camera supervision requires at least two panos per sample.")
+    if args.view_sampling_mode != "fixed" and args.views_per_pano < 1:
+        raise ValueError("--views-per-pano must be >= 1 when dynamic view sampling is enabled.")
 
 
 def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
@@ -451,22 +476,31 @@ def train_step(
     batch: Dict,
     optimizer: torch.optim.Optimizer,
     args: argparse.Namespace,
+    step: int = 1,
 ) -> Dict[str, torch.Tensor]:
     optimizer.zero_grad(set_to_none=True)
     pano_images = batch["pano_image"]
     pano_depths = batch["pano_depth"]
     sampler_model = unwrap_model(model)
+    view_yaw, view_pitch = sample_training_views(
+        args,
+        step=step,
+        device=pano_images.device,
+        dtype=pano_images.dtype,
+    )
 
     target_depth, target_valid = sample_depth_targets(
         sampler_model,
         pano_depths,
         source_depth_semantics=args.gt_depth_semantics,
         max_range_depth=args.depth_max_m,
+        yaw=view_yaw,
+        pitch=view_pitch,
     )
     amp_enabled = pano_images.device.type == "cuda" and args.amp_dtype != "none"
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float32
     with torch.autocast(device_type=pano_images.device.type, dtype=amp_dtype, enabled=amp_enabled):
-        predictions = model(pano_images=pano_images, return_sampler_output=True)
+        predictions = model(pano_images=pano_images, yaw=view_yaw, pitch=view_pitch, return_sampler_output=True)
         pred_depth = predictions["depth"] * args.pred_depth_scale
         loss_depth = masked_log_l1_depth(pred_depth, target_depth, target_valid)
         loss_camera_dict = camera_alignment_loss(
@@ -503,8 +537,10 @@ def sample_depth_windows(
     pano_depths: torch.Tensor,
     source_depth_semantics: str = "range",
     max_range_depth: float | None = None,
+    yaw: torch.Tensor | None = None,
+    pitch: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    target_depth, _ = sample_depth_targets(model, pano_depths, source_depth_semantics, max_range_depth)
+    target_depth, _ = sample_depth_targets(model, pano_depths, source_depth_semantics, max_range_depth, yaw, pitch)
     return target_depth
 
 
@@ -514,6 +550,8 @@ def sample_depth_targets(
     pano_depths: torch.Tensor,
     source_depth_semantics: str = "range",
     max_range_depth: float | None = None,
+    yaw: torch.Tensor | None = None,
+    pitch: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decode source ERP depth to radial range, sample it, and convert to window Z-depth."""
     source_valid_bool = torch.isfinite(pano_depths) & (pano_depths > 0)
@@ -526,13 +564,13 @@ def sample_depth_targets(
     source_depth = torch.where(source_valid_bool, range_depth_erp, torch.zeros_like(range_depth_erp))
     channel_dim = 1 if source_depth.ndim == 4 else 2
     packed_depth_valid = torch.cat([source_depth, source_valid, source_valid.new_zeros(source_valid.shape)], dim=channel_dim)
-    sampled = sample_pano_tensor(model, packed_depth_valid, interpolation_mode="bilinear")
+    sampled = sample_pano_tensor(model, packed_depth_valid, interpolation_mode="bilinear", yaw=yaw, pitch=pitch)
     sampled_depth = sampled.windows[:, :, :1]
     sampled_weight = sampled.windows[:, :, 1:2]
     range_depth = (sampled_depth / sampled_weight.clamp_min(1e-6)).permute(0, 1, 3, 4, 2).contiguous()
 
     valid_as_rgb = source_valid.repeat(1, 3, 1, 1) if source_valid.ndim == 4 else source_valid.repeat(1, 1, 3, 1, 1)
-    sampled_valid = sample_pano_tensor(model, valid_as_rgb, interpolation_mode="nearest").windows[:, :, :1]
+    sampled_valid = sample_pano_tensor(model, valid_as_rgb, interpolation_mode="nearest", yaw=yaw, pitch=pitch).windows[:, :, :1]
     valid = sampled_valid.permute(0, 1, 3, 4, 2).contiguous() > 0.5
     valid = valid & (sampled_weight.permute(0, 1, 3, 4, 2).contiguous() > 1e-6)
 
@@ -547,10 +585,53 @@ def sample_pano_tensor(
     model: VGGTOmega_LUNA,
     tensor: torch.Tensor,
     interpolation_mode: str,
+    yaw: torch.Tensor | None = None,
+    pitch: torch.Tensor | None = None,
 ) -> SimpleNamespace:
     if hasattr(model, "sample_pano_windows"):
-        return model.sample_pano_windows(tensor, interpolation_mode=interpolation_mode)
-    return model.pano_sampler(tensor, interpolation_mode=interpolation_mode)
+        return model.sample_pano_windows(tensor, yaw=yaw, pitch=pitch, interpolation_mode=interpolation_mode)
+    return model.pano_sampler(tensor, yaw=yaw, pitch=pitch, interpolation_mode=interpolation_mode)
+
+
+def sample_training_views(
+    args: argparse.Namespace,
+    step: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Return a per-step subset of the configured spherical view grid."""
+    if args.view_sampling_mode == "fixed":
+        return None, None
+
+    yaw, pitch = build_training_view_grid(args.num_yaw, parse_pitch_degrees(args.pitch_degrees), device, dtype)
+    total_views = int(yaw.numel())
+    views_per_pano = int(args.views_per_pano)
+    if views_per_pano >= total_views:
+        return yaw, pitch
+
+    if args.view_sampling_mode == "random":
+        indices = torch.randperm(total_views, device=device)[:views_per_pano]
+    elif args.view_sampling_mode == "cyclic":
+        start = ((max(1, step) - 1) * views_per_pano) % total_views
+        stride = max(1, total_views // views_per_pano)
+        indices = (torch.arange(views_per_pano, device=device) * stride + start) % total_views
+    else:
+        raise ValueError(f"Unknown view-sampling-mode: {args.view_sampling_mode}")
+    return yaw[indices], pitch[indices]
+
+
+def build_training_view_grid(
+    num_yaw: int,
+    pitch_degrees: Tuple[float, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if num_yaw < 1:
+        raise ValueError(f"num_yaw must be >= 1, got {num_yaw}")
+    yaw = torch.arange(num_yaw, device=device, dtype=dtype) * (2.0 * math.pi / float(num_yaw)) - math.pi
+    pitch = torch.tensor([math.radians(value) for value in pitch_degrees], device=device, dtype=dtype)
+    yaw_grid, pitch_grid = torch.meshgrid(yaw, pitch, indexing="ij")
+    return yaw_grid.reshape(-1), pitch_grid.reshape(-1)
 
 
 def erp_depth_to_range_depth(pano_depths: torch.Tensor, semantics: str) -> torch.Tensor:

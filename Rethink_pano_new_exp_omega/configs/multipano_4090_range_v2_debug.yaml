@@ -9,12 +9,14 @@ data:
 
 sampler:
   patch_size: 16
-  window_size: 512
-  # 2-3 panos x 2 yaw windows keeps the total VGGT view count small on a 4090.
-  # For larger GPUs, raise this together with pano_max_count for denser coverage.
-  num_yaw: 2
-  pitch_degrees: "0"
+  window_size: 384
+  # Debug uses the same dynamic sphere coverage strategy as the main 4090
+  # multipano profile, with fewer panos for faster smoke runs.
+  num_yaw: 8
+  pitch_degrees: "-35,0,35"
   fov_degrees: 75.0
+  view_sampling_mode: cyclic
+  views_per_pano: 2
   pano_height: 0
   pano_width: 0
 

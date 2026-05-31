@@ -29,6 +29,8 @@ independent local-window pose:
 - `pano_max_count: 8`
 - `camera_supervision_mode: pano_relative`
 - `camera_position_mode: relative_anchor`
+- `view_sampling_mode: cyclic`
+- `views_per_pano: 2`
 
 The loss converts each predicted window translation back to a pano center using
 the known sampled window rotation, averages centers per pano, and compares
@@ -37,8 +39,18 @@ keeps windows sampled from the same pano from disagreeing about the pano center.
 
 ## 4090 Capacity Check
 
-With `window_size=512` and `num_yaw=2`, the local RTX 4090 completed one train
-step for fixed neighborhoods of 4, 5, 6, 7 and 8 panos. The measured one-step
-times were approximately 1.4, 4.2, 8.1, 10.9 and 13.7 minutes respectively.
-`pano_max_count=8` is the verified upper setting for this configuration, but
-lower caps are more practical for iterative experiments.
+The current 4090 multipano profile keeps the source panorama at its converted
+resolution, but uses `window_size=384` and samples only two perspective windows
+per pano per step from an `8 yaw x 3 pitch` candidate grid. This preserves
+long-run spherical coverage without placing all candidate windows into the
+Omega aggregator at once.
+
+The older `window_size=512`, `num_yaw=2`, `pitch_degrees=0` setting was memory
+fragile for 6-pano batches and only observed the equatorial band. Prefer the
+dynamic 384 profile for local multipano experiments, then use denser eval
+windows or a short higher-resolution fine-tune after the loss behavior is
+validated.
+
+Smoke checks on the local RTX 4090 passed for fixed worst-case batches of
+6 panos and 8 panos with `views_per_pano=2`; the 8-pano step is usable but
+noticeably slower, so reduce `pano_max_count` to 6 for faster iteration.
