@@ -10,12 +10,14 @@ data:
 
 sampler:
   patch_size: 16
-  window_size: 512
-  # 2 yaw views keeps the worst case at 8 panos x 2 windows = 16 VGGT views.
-  # Raise to 4 or 8 only after confirming memory headroom on your RTX 5000 cards.
-  num_yaw: 2
-  pitch_degrees: "0"
+  window_size: 384
+  # Candidate sphere grid: 8 yaw directions x 3 pitch bands. Training samples a
+  # small subset per step to keep memory bounded while covering the pano over time.
+  num_yaw: 8
+  pitch_degrees: "-35,0,35"
   fov_degrees: 75.0
+  view_sampling_mode: cyclic
+  views_per_pano: 2
   pano_height: 0
   pano_width: 0
 

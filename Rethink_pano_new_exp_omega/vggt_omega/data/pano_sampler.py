@@ -44,7 +44,7 @@ def make_default_view_grid(
     yaw = yaw + math.radians(yaw_offset_degrees) - math.pi
     pitch = torch.tensor([math.radians(v) for v in pitch_degrees], dtype=torch.float32)
     yaw_grid, pitch_grid = torch.meshgrid(yaw, pitch, indexing="ij")
-    return yaw_grid.reshape(-1), pitch_grid.reshape(-1)
+    return yaw_grid.reshape(-1).clone(), pitch_grid.reshape(-1).clone()
 
 
 class PanoWindowSampler(nn.Module):
