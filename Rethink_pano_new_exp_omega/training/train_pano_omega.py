@@ -140,6 +140,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fixed metric calibration applied to predicted Z-depth before loss/export.",
     )
     parser.add_argument(
+        "--learn-pred-depth-scale",
+        action="store_true",
+        help="Learn a positive scalar multiplier on predicted depth during training.",
+    )
+    parser.add_argument(
+        "--pred-depth-scale-lr",
+        type=float,
+        default=None,
+        help="Optional learning rate for --learn-pred-depth-scale; defaults to --lr.",
+    )
+    parser.add_argument(
         "--gt-depth-semantics",
         choices=["range", "cubemap_z", "double_cubemap_z"],
         default="range",
@@ -255,6 +266,9 @@ def train(args: argparse.Namespace) -> None:
             load_checkpoint(model, args.checkpoint, strict=args.strict_checkpoint)
 
         trainable_count, frozen_count = configure_trainable(model, args.trainable)
+        if args.learn_pred_depth_scale:
+            model = LearnablePredDepthScale(model, initial_scale=args.pred_depth_scale).to(device)
+            trainable_count += 1
         if dist_state["distributed"]:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
@@ -262,11 +276,7 @@ def train(args: argparse.Namespace) -> None:
                 output_device=dist_state["local_rank"] if device.type == "cuda" else None,
                 find_unused_parameters=args.find_unused_parameters,
             )
-        optimizer = torch.optim.AdamW(
-            [param for param in model.parameters() if param.requires_grad],
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
+        optimizer = build_optimizer(model, args)
 
         rank0_print(f"[INFO] dataset_root = {dataset.root}", dist_state)
         rank0_print(f"[INFO] dataset_format = {args.dataset_format}", dist_state)
@@ -283,6 +293,7 @@ def train(args: argparse.Namespace) -> None:
             dist_state,
         )
         rank0_print(f"[INFO] pred_depth_scale = {args.pred_depth_scale}", dist_state)
+        rank0_print(f"[INFO] learn_pred_depth_scale = {args.learn_pred_depth_scale}", dist_state)
         rank0_print(
             f"[INFO] distributed = {dist_state['distributed']} "
             f"rank={dist_state['rank']} world_size={dist_state['world_size']} local_rank={dist_state['local_rank']}",
@@ -329,6 +340,7 @@ def train(args: argparse.Namespace) -> None:
                     "loss_camera_consistency": float(
                         loss_dict.get("loss_camera_consistency", torch.tensor(0.0)).item()
                     ),
+                    "pred_depth_scale": float(loss_dict["pred_depth_scale"].item()),
                     "lr": optimizer.param_groups[0]["lr"],
                 }
                 if is_main_process(dist_state):
@@ -338,7 +350,7 @@ def train(args: argparse.Namespace) -> None:
                         f"[TRAIN] epoch={epoch + 1} step={global_step} "
                         f"elapsed={elapsed_seconds / 60.0:.2f}m "
                         f"loss={metrics['loss']:.6f} depth={metrics['loss_depth']:.6f} "
-                        f"camera={metrics['loss_camera']:.6f}",
+                        f"camera={metrics['loss_camera']:.6f} scale={metrics['pred_depth_scale']:.6f}",
                         flush=True,
                     )
 
@@ -390,6 +402,53 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
             position_step_m=args.pano_position_step_m,
         )
     raise ValueError(f"Unknown dataset_format: {args.dataset_format}")
+
+
+class LearnablePredDepthScale(torch.nn.Module):
+    """Wrap a VGGT-Omega model with a learnable positive depth scale."""
+
+    def __init__(self, model: VGGTOmega_LUNA, initial_scale: float) -> None:
+        super().__init__()
+        if initial_scale <= 0:
+            raise ValueError(f"initial pred_depth_scale must be positive, got {initial_scale}")
+        self.model = model
+        self.pred_depth_log_scale = torch.nn.Parameter(torch.tensor(math.log(float(initial_scale)), dtype=torch.float32))
+
+    def forward(self, *args, **kwargs) -> Dict:
+        predictions = dict(self.model(*args, **kwargs))
+        predictions["_pred_depth_scale"] = self.pred_depth_scale()
+        return predictions
+
+    def pred_depth_scale(self) -> torch.Tensor:
+        return self.pred_depth_log_scale.float().exp()
+
+    def sample_pano_windows(self, *args, **kwargs):
+        return self.model.sample_pano_windows(*args, **kwargs)
+
+    @property
+    def pano_sampler(self):
+        return self.model.pano_sampler
+
+
+def build_optimizer(model: torch.nn.Module, args: argparse.Namespace) -> torch.optim.Optimizer:
+    scale_params = []
+    regular_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.endswith("pred_depth_log_scale"):
+            scale_params.append(param)
+        else:
+            regular_params.append(param)
+    param_groups = []
+    if regular_params:
+        param_groups.append({"params": regular_params, "lr": args.lr, "weight_decay": args.weight_decay})
+    if scale_params:
+        scale_lr = args.pred_depth_scale_lr if args.pred_depth_scale_lr is not None else args.lr
+        param_groups.append({"params": scale_params, "lr": scale_lr, "weight_decay": 0.0})
+    if not param_groups:
+        raise ValueError("No trainable parameters for optimizer.")
+    return torch.optim.AdamW(param_groups)
 
 
 def normalize_pano_sampling_args(args: argparse.Namespace) -> None:
@@ -513,7 +572,11 @@ def train_step(
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float32
     with torch.autocast(device_type=pano_images.device.type, dtype=amp_dtype, enabled=amp_enabled):
         predictions = model(pano_images=pano_images, return_sampler_output=True)
-        pred_depth = predictions["depth"] * args.pred_depth_scale
+        pred_depth_scale = predictions.get(
+            "_pred_depth_scale",
+            predictions["depth"].new_tensor(float(args.pred_depth_scale)),
+        )
+        pred_depth = predictions["depth"] * pred_depth_scale
         loss_depth = masked_log_l1_depth(pred_depth, target_depth, target_valid)
         loss_camera_dict = camera_alignment_loss(
             predictions=predictions,
@@ -535,10 +598,15 @@ def train_step(
             max_norm=args.grad_clip,
         )
     optimizer.step()
+    logged_pred_depth_scale = pred_depth_scale.detach()
+    unwrapped_model = unwrap_model(model)
+    if isinstance(unwrapped_model, LearnablePredDepthScale):
+        logged_pred_depth_scale = unwrapped_model.pred_depth_scale().detach()
     return {
         "loss": loss.detach(),
         "loss_depth": loss_depth.detach(),
         "loss_camera": loss_camera.detach(),
+        "pred_depth_scale": logged_pred_depth_scale,
         **{key: value.detach() for key, value in loss_camera_dict.items() if key != "loss_camera"},
     }
 
@@ -722,11 +790,14 @@ def save_loss_plot(path: Path, metrics_history: list[Dict[str, float]]) -> None:
 
 def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace, step: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    pred_depth_scale = current_pred_depth_scale(model, args)
     args_payload = vars(args).copy()
+    args_payload["pred_depth_scale"] = pred_depth_scale
+    checkpoint_model = model.model if isinstance(model, LearnablePredDepthScale) else model
     if args.checkpoint_format == "trainable_delta":
         delta = {
             name: param.detach().cpu()
-            for name, param in model.named_parameters()
+            for name, param in checkpoint_model.named_parameters()
             if param.requires_grad
         }
         torch.save(
@@ -735,6 +806,8 @@ def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace
                 "model_delta": delta,
                 "base_checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
                 "trainable": args.trainable,
+                "pred_depth_scale": pred_depth_scale,
+                "learn_pred_depth_scale": bool(args.learn_pred_depth_scale),
                 "args": args_payload,
                 "step": step,
             },
@@ -742,17 +815,25 @@ def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace
         )
         return
 
-    cpu_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+    cpu_state = {key: value.detach().cpu() for key, value in checkpoint_model.state_dict().items()}
     torch.save(
         {
             "checkpoint_format": "full",
             "model": cpu_state,
             "base_checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
+            "pred_depth_scale": pred_depth_scale,
+            "learn_pred_depth_scale": bool(args.learn_pred_depth_scale),
             "args": args_payload,
             "step": step,
         },
         path,
     )
+
+
+def current_pred_depth_scale(model: torch.nn.Module, args: argparse.Namespace) -> float:
+    if isinstance(model, LearnablePredDepthScale):
+        return float(model.pred_depth_scale().detach().cpu())
+    return float(args.pred_depth_scale)
 
 
 def masked_log_l1_depth(
