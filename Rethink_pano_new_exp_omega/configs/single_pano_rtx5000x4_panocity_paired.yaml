@@ -1,12 +1,12 @@
-# Multi-pano PanoCity paired profile for a 4x RTX 5000 machine.
+# Single-pano PanoCity paired profile for a 4x RTX 5000 machine.
 # Launch with torchrun --nproc_per_node=4 for synchronized DDP training.
 data:
-  dataset_root: /mnt/f/panovggt/PanoCity_paired
+  dataset_root: ../dataset/PanoCity_paired
   dataset_format: panocity_paired
-  checkpoint: /home/aoki/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt
-  pano_sample_mode: variable_neighborhood
-  pano_min_count: 2
-  pano_max_count: 8
+  checkpoint: ckpt/vggt_omega_1b_512.pt
+  pano_sample_mode: single
+  pano_min_count: 1
+  pano_max_count: 1
   pano_grouping: nearest
   output_depth_scale: 1000.0
   invalid_depth_value: 65535.0
@@ -15,7 +15,7 @@ data:
 sampler:
   patch_size: 16
   window_size: 512
-  # 2 yaw views keeps the worst case at 8 panos x 2 windows = 16 VGGT views.
+  # 2 yaw views keeps each sample at 1 pano x 2 windows = 2 VGGT views.
   # Raise to 4 or 8 only after confirming memory headroom on your RTX 5000 cards.
   num_yaw: 2
   pitch_degrees: "0"
@@ -28,20 +28,19 @@ supervision:
   depth_max_m: 80.0
   pred_depth_scale: 1.0
   enable_camera_head: true
-  camera_supervision_mode: pano_relative
-  camera_loss_weight: 1.0
-  camera_translation_weight: 1.0
+  camera_supervision_mode: none
+  camera_loss_weight: 0.0
+  camera_translation_weight: 0.0
   camera_rotation_weight: 0.0
   camera_fov_weight: 0.0
   pano_translation_consistency_weight: 0.1
-  camera_position_mode: relative_anchor
+  camera_position_mode: local_zero
 
 optimization:
   trainable: luna_heads
   lr: 5.0e-5
   weight_decay: 0.05
   grad_clip: 1.0
-  # variable_neighborhood currently requires batch_size=1 in training/train_pano_omega.py.
   batch_size: 1
 
 runtime:
@@ -60,4 +59,4 @@ runtime:
   checkpoint_format: trainable_delta
 
 output:
-  output_dir: /home/aoki/RethinkPanoVGGT_omega_single_pano_reconstruction/Rethink_pano_new_exp_omega/outputs/panocity_paired_multipano_2_8_rtx5000
+  output_dir: logs/panocity_paired_single_pano_rtx5000
