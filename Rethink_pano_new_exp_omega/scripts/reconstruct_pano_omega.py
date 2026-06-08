@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from training.data import PanoVKittiOmegaDataset  # noqa: E402
+from training.data import PanoCityPairedOmegaDataset, PanoVKittiOmegaDataset  # noqa: E402
 from training.train_pano_omega import build_model, load_checkpoint, sample_depth_targets, set_seed  # noqa: E402
 from vggt_omega.models.layers.pano_position import pinhole_rays, rays_to_equirectangular  # noqa: E402
 from vggt_omega.utils.pose_enc import encoding_to_camera  # noqa: E402
@@ -29,6 +29,7 @@ from vggt_omega.utils.pose_enc import encoding_to_camera  # noqa: E402
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Export pano reconstruction previews from a trained LUNA checkpoint.")
     parser.add_argument("--dataset-root", type=Path, default=PROJECT_ROOT.parent / "dataset")
+    parser.add_argument("--dataset-format", choices=["vkitti", "panocity_paired"], default="vkitti")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--sample-index", type=int, default=0)
@@ -44,6 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pano-height", type=int, default=None)
     parser.add_argument("--pano-width", type=int, default=None)
+    parser.add_argument("--output-depth-scale", type=float, default=100.0)
+    parser.add_argument("--invalid-depth-value", type=float, default=None)
     parser.add_argument("--num-yaw", type=int, default=None, help="Override checkpoint window yaw count for eval/export.")
     parser.add_argument("--pitch-degrees", type=str, default=None, help="Override checkpoint pitch list for eval/export.")
     parser.add_argument("--fov-degrees", type=float, default=None, help="Override checkpoint window FOV for eval/export.")
@@ -74,10 +77,7 @@ def main() -> None:
     if args.window_size is not None:
         model_args.window_size = args.window_size
 
-    dataset = PanoVKittiOmegaDataset(
-        root=args.dataset_root,
-        pano_size=pano_size_from_args(model_args),
-    )
+    dataset = build_dataset(args, pano_size_from_args(model_args))
     sample = dataset[args.sample_index]
     model = build_model(model_args).to(device)
     load_checkpoint(model, args.checkpoint, strict=False)
@@ -230,6 +230,22 @@ def pano_size_from_args(args: SimpleNamespace) -> Tuple[int, int] | None:
     if args.pano_height and args.pano_width:
         return int(args.pano_height), int(args.pano_width)
     return None
+
+
+def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
+    if args.dataset_format == "vkitti":
+        return PanoVKittiOmegaDataset(
+            root=args.dataset_root,
+            pano_size=pano_size,
+        )
+    if args.dataset_format == "panocity_paired":
+        return PanoCityPairedOmegaDataset(
+            root=args.dataset_root,
+            pano_size=pano_size,
+            output_depth_scale=args.output_depth_scale,
+            invalid_depth_value=args.invalid_depth_value,
+        )
+    raise ValueError(f"Unknown dataset format: {args.dataset_format}")
 
 
 def tensor_image_to_uint8(image: torch.Tensor) -> np.ndarray:
@@ -551,9 +567,11 @@ def write_summary(
     summary = {
         "checkpoint": str(args.checkpoint),
         "dataset_root": str(args.dataset_root),
+        "dataset_format": args.dataset_format,
         "sample_index": args.sample_index,
         "scene_name": sample["scene_name"],
         "rgb_path": sample["rgb_path"],
+        "depth_path": sample.get("depth_path"),
         "depth_definition": "window Z-depth meters; target_range_depth_erp.png is decoded ERP radial range in meters",
         "gt_source_depth_semantics": args.gt_depth_semantics,
         "prediction_modifier": f"predictions with reconstructed radial range > {args.depth_max_m:g}m are marked non-output (inf)",

@@ -1,9 +1,9 @@
 # Single-pano PanoCity paired profile for a 4x RTX 5000 machine.
 # Launch with torchrun --nproc_per_node=4 for synchronized DDP training.
 data:
-  dataset_root: ../dataset/PanoCity_paired
+  dataset_root: ../../panovggt/PanoCity_paired
   dataset_format: panocity_paired
-  checkpoint: ckpt/vggt_omega_1b_512.pt
+  checkpoint: ../ckpt/vggt_omega_1b_512.pt
   pano_sample_mode: single
   pano_min_count: 1
   pano_max_count: 1
@@ -17,7 +17,7 @@ sampler:
   window_size: 512
   # 2 yaw views keeps each sample at 1 pano x 2 windows = 2 VGGT views.
   # Raise to 4 or 8 only after confirming memory headroom on your RTX 5000 cards.
-  num_yaw: 2
+  num_yaw: 8
   pitch_degrees: "0"
   fov_degrees: 75.0
   pano_height: 0
@@ -49,8 +49,8 @@ runtime:
   dist_backend: nccl
   find_unused_parameters: true
   amp_dtype: bfloat16
-  epochs: 100000
-  max_steps: 1000000
+  epochs: 1
+  max_steps: 1000
   num_workers: 4
   seed: 42
   max_duration_minutes: 180.0
