@@ -40,6 +40,7 @@ from vggt_omega.utils.rotation import mat_to_quat  # noqa: E402
 DEFAULT_DATASET_ROOT = Path("whitehole/AOKI/datasets/PANO_LUNA_omega")
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "ckpt" / "vggt_omega_1b_512.pt"
 CONFIG_PATH_KEYS = {"dataset_root", "checkpoint", "output_dir", "log_csv", "loss_plot"}
+DEFAULT_PANOCITY_PRED_DEPTH_SCALE = 5.491308212280273
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -227,6 +228,7 @@ def train(args: argparse.Namespace) -> None:
     pano_size = (args.pano_height, args.pano_width) if args.pano_height > 0 and args.pano_width > 0 else None
     normalize_pano_sampling_args(args)
     normalize_camera_supervision_args(args)
+    normalize_pred_depth_scale_args(args)
     if args.pano_sample_mode == "variable_neighborhood" and args.batch_size != 1:
         raise ValueError("variable_neighborhood uses variable-length inputs and currently requires batch_size=1.")
     try:
@@ -280,6 +282,7 @@ def train(args: argparse.Namespace) -> None:
             f"weight={args.camera_loss_weight}",
             dist_state,
         )
+        rank0_print(f"[INFO] pred_depth_scale = {args.pred_depth_scale}", dist_state)
         rank0_print(
             f"[INFO] distributed = {dist_state['distributed']} "
             f"rank={dist_state['rank']} world_size={dist_state['world_size']} local_rank={dist_state['local_rank']}",
@@ -420,6 +423,12 @@ def normalize_camera_supervision_args(args: argparse.Namespace) -> None:
         args.camera_fov_weight = 0.0
     if args.camera_supervision_mode == "pano_relative" and args.pano_sample_mode == "single":
         raise ValueError("pano_relative camera supervision requires at least two panos per sample.")
+
+
+def normalize_pred_depth_scale_args(args: argparse.Namespace) -> None:
+    if args.dataset_format == "panocity_paired" and float(args.pred_depth_scale) == 1.0:
+        args.pred_depth_scale = DEFAULT_PANOCITY_PRED_DEPTH_SCALE
+        print(f"[INFO] using PanoCity pred_depth_scale = {args.pred_depth_scale}")
 
 
 def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
