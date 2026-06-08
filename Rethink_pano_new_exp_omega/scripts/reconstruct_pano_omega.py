@@ -47,6 +47,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pano-width", type=int, default=None)
     parser.add_argument("--output-depth-scale", type=float, default=100.0)
     parser.add_argument("--invalid-depth-value", type=float, default=None)
+    parser.add_argument(
+        "--pred-camera-center-z",
+        type=float,
+        default=None,
+        help=(
+            "Override the exported official prediction camera center height in z-up coordinates. "
+            "Defaults to 0.0 for panocity_paired and leaves checkpoint pose unchanged otherwise."
+        ),
+    )
     parser.add_argument("--num-yaw", type=int, default=None, help="Override checkpoint window yaw count for eval/export.")
     parser.add_argument("--pitch-degrees", type=str, default=None, help="Override checkpoint pitch list for eval/export.")
     parser.add_argument("--fov-degrees", type=float, default=None, help="Override checkpoint window FOV for eval/export.")
@@ -65,6 +74,7 @@ def main() -> None:
     pred_depth_scale = args.pred_depth_scale
     if pred_depth_scale is None:
         pred_depth_scale = float(ckpt_args.get("pred_depth_scale", 1.0))
+    pred_camera_center_z = resolve_pred_camera_center_z(args)
     if args.pano_height is not None and args.pano_width is not None:
         model_args.pano_height = args.pano_height
         model_args.pano_width = args.pano_width
@@ -136,6 +146,7 @@ def main() -> None:
         max_points=args.max_points,
         display_y_up=True,
         rotate_y_180=True,
+        camera_center_z=pred_camera_center_z,
     )
     write_official_point_cloud(
         output_dir / "pred_official_camera_points_native.ply",
@@ -147,6 +158,7 @@ def main() -> None:
         display_y_up=False,
         rotate_y_180=False,
         output_z_up=False,
+        camera_center_z=pred_camera_center_z,
     )
     write_known_window_point_cloud(
         output_dir / "pred_known_window_camera_points.ply",
@@ -205,6 +217,7 @@ def main() -> None:
         target_valid_np,
         pred_valid_after_range,
         pred_depth_scale,
+        pred_camera_center_z,
     )
     print(f"[INFO] exported reconstruction = {output_dir}")
 
@@ -246,6 +259,14 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
             invalid_depth_value=args.invalid_depth_value,
         )
     raise ValueError(f"Unknown dataset format: {args.dataset_format}")
+
+
+def resolve_pred_camera_center_z(args: argparse.Namespace) -> float | None:
+    if args.pred_camera_center_z is not None:
+        return float(args.pred_camera_center_z)
+    if args.dataset_format == "panocity_paired":
+        return 0.0
+    return None
 
 
 def tensor_image_to_uint8(image: torch.Tensor) -> np.ndarray:
@@ -395,6 +416,7 @@ def write_official_point_cloud(
     rotate_y_180: bool = False,
     output_z_up: bool = True,
     extra_valid: np.ndarray | None = None,
+    camera_center_z: float | None = None,
 ) -> None:
     extrinsics, intrinsics = encoding_to_camera(pose_enc[None], pred_depth_z.shape[-2:])
     extrinsics = extrinsics[0].numpy()
@@ -414,6 +436,8 @@ def write_official_point_cloud(
     )
     rotation = extrinsics[:, :3, :3]
     translation = extrinsics[:, :3, 3]
+    if camera_center_z is not None:
+        translation = translation_for_camera_center_z(rotation, translation, camera_center_z)
     points = np.einsum(
         "sij,shwj->shwi",
         np.transpose(rotation, (0, 2, 1)),
@@ -432,6 +456,21 @@ def write_official_point_cloud(
         points = omega_y_up_to_z_up(points)
     colors = np.clip(windows.transpose(0, 2, 3, 1)[valid] * 255.0, 0, 255).astype(np.uint8)
     write_ply(path, points[valid], colors, max_points)
+
+
+def translation_for_camera_center_z(
+    rotation: np.ndarray,
+    translation: np.ndarray,
+    camera_center_z: float,
+) -> np.ndarray:
+    """Keep predicted orientation, but set camera center up-height in z-up exports.
+
+    Omega native coordinates are [right, up, forward], and z-up exports map native
+    up to output z. For a world-to-camera transform, camera center C = -R^T t.
+    """
+    centers = -np.einsum("sji,sj->si", rotation, translation)
+    centers[:, 1] = float(camera_center_z)
+    return -np.einsum("sij,sj->si", rotation, centers)
 
 
 def write_ply(path: Path, points: np.ndarray, colors: np.ndarray, max_points: int) -> None:
@@ -560,6 +599,7 @@ def write_summary(
     target_valid: np.ndarray,
     pred_valid_after_range: np.ndarray,
     pred_depth_scale: float,
+    pred_camera_center_z: float | None,
 ) -> None:
     valid_pred_raw = np.isfinite(raw_pred_depth) & (raw_pred_depth > 0)
     valid_pred = np.isfinite(pred_depth) & (pred_depth > 0) & pred_valid
@@ -578,6 +618,7 @@ def write_summary(
         "mask_pred_by_target_valid": bool(args.mask_pred_by_target_valid),
         "official_point_cloud_coordinates": "pred_official_camera_points_native.ply is Omega native Y-up; comparison PLYs are exported as ERP/GT Z-up [forward, right, up]",
         "pred_depth_scale": pred_depth_scale,
+        "pred_camera_center_z": pred_camera_center_z,
         "pred_valid_ratio_before_modifier": float(valid_pred_raw.mean()),
         "pred_valid_ratio_after_range_modifier": float(pred_valid_after_range.mean()),
         "pred_valid_ratio": float(valid_pred.mean()),
