@@ -1,0 +1,84 @@
+label_dataset_1:
+  name: structured3d
+  root_path: 
+  list_path: datasets/Structure3D_train.txt
+  args:
+    height: 504
+    width: 1008
+    repeat: 1
+    augment_color: False
+    augment_flip: True
+    augment_rotation: True
+  batch_size: 4
+  num_workers: 4
+
+label_dataset_2:
+  name: deep360
+  root_path:
+  list_path: datasets/deep360_train.txt
+  args:
+    height: 504
+    width: 1008
+    repeat: 1
+    augment_color: False
+    augment_flip: True
+    augment_rotation: True
+  batch_size: 4
+  num_workers: 4
+
+unlabel_dataset:
+  name: zind
+  root_path:
+  list_path: datasets/360x_zind.txt
+  args:
+    height: 504
+    width: 1008
+    repeat: 1
+    augment_color: True
+    augment_flip: True
+    augment_rotation: True
+  batch_size: 4
+  num_workers: 4
+
+val_dataset:
+  name: matterport3d
+  root_path:
+  list_path: datasets/matterport3d_test.txt
+  args:
+    height: 504
+    width: 1008
+    repeat: 1
+    augment_color: False
+    augment_flip: False
+    augment_rotation: False
+  batch_size: 1
+  num_workers: 4
+
+model:
+  name: panda
+  args:
+    midas_model_type: vitl
+    fine_tune_type: hypersim
+    min_depth: 0.01
+    max_depth: 1.0
+    lora: True
+    train_decoder: True
+    lora_rank: 4
+
+loss: [ {'type': 'silog', 'params': {'loss_weight': 1.0}}, 
+        {'type': 'gradient', 'params': {'loss_weight': 1.0}},
+        {'type': 'epnl', 'params': {'loss_weight':5.0, 'random_num':32, 'batch_limit':8, 'lower_bound':0.125, 'upper_bound':0.5}}]
+loss_weights: [1.0, 1.0, 1.0, 1.0]
+
+mobius:
+  conduct: True
+  vertical_res: 18
+  zoom_res: 0.5
+
+optimizer:
+  lr: 1.e-4
+epoch_max: 4
+log_frequency: 40
+
+epoch_val: 1
+epoch_save: 1

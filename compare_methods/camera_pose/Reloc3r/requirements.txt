@@ -1,0 +1,20 @@
+roma
+gradio
+matplotlib
+tqdm
+numpy
+opencv-python
+scipy
+einops
+tensorboard
+pyglet<2
+huggingface-hub[torch]>=0.22
+imagesize
+open3d
+Pillow
+
+# Training-data preprocessing
+h5py
+trimesh
+pyrender
+numpy-quaternion

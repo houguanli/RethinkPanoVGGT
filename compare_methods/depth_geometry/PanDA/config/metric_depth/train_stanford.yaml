@@ -1,0 +1,52 @@
+train_dataset:
+  name: stanford2d3d
+  root_path: 
+  list_path: datasets/stanford2d3d_train.txt
+  args:
+    height: 504
+    width: 1008
+    repeat: 10
+    augment_color: True
+    augment_flip: True
+    augment_rotation: True
+  batch_size: 8
+  num_workers: 4
+
+val_dataset:
+  name: stanford2d3d
+  root_path: 
+  list_path: datasets/stanford2d3d_val.txt
+  args:
+    height: 504
+    width: 1008
+    repeat: 1
+    augment_color: False
+    augment_flip: False
+    augment_rotation: False
+  batch_size: 1
+  num_workers: 4
+
+model:
+  name: panda
+  args:
+    midas_model_type: vits
+    fine_tune_type: inference
+    min_depth: 0.01
+    max_depth: 10.0
+    lora: True
+    train_decoder: True
+    lora_rank: 4
+
+loss: [ {'type': 'l1', 'params': {'loss_weight': 1.0}}, 
+        {'type': 'gradient', 'params': {'loss_weight': 1.0}},
+        {'type': 'epnl', 'params': {'loss_weight':1.0, 'random_num':32, 'batch_limit':8, 'lower_bound':0.125, 'upper_bound':0.5}}]
+
+optimizer:
+  lr: 1.e-4
+epoch_max: 30
+log_frequency: 40
+
+epoch_val: 1
+epoch_save: 10
+
+load_weights_dir:

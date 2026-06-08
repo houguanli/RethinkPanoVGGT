@@ -1,0 +1,17 @@
+model:
+  name: panda
+  args:
+    midas_model_type: vitl
+    fine_tune_type: inference
+    min_depth: 0.01
+    max_depth: 1.0
+    lora: True
+    train_decoder: True
+    lora_rank: 4
+
+load_weights_dir: 
+
+
+
+
+
