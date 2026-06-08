@@ -29,7 +29,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from training.data import PanoVKittiOmegaDataset  # noqa: E402
+from training.data import PanoCityPairedOmegaDataset, PanoVKittiOmegaDataset  # noqa: E402
 from vggt_omega.models.heads.dense_head import DenseHead  # noqa: E402
 from vggt_omega.models.layers import PatchEmbed  # noqa: E402
 from vggt_omega.models.layers.pano_position import pinhole_rays  # noqa: E402
@@ -46,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train VGGT-Omega LUNA on converted pano VKitti-style data.")
     parser.add_argument("--config", type=Path, default=None, help="Optional YAML config; explicit CLI values override it.")
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
+    parser.add_argument("--dataset-format", choices=["vkitti", "panocity_paired"], default="vkitti")
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "pano_omega_luna")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
@@ -67,6 +68,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pano-max-count", type=int, default=1)
     parser.add_argument("--panos-per-sample", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--pano-grouping", choices=["nearest", "sequential"], default="nearest")
+    parser.add_argument("--dataset-max-samples", type=int, default=None, help="Optional dataset cap for debugging.")
+    parser.add_argument(
+        "--output-depth-scale",
+        type=float,
+        default=100.0,
+        help="Scale factor used by flat paired datasets to convert stored depth values to meters.",
+    )
+    parser.add_argument(
+        "--invalid-depth-value",
+        type=float,
+        default=None,
+        help="Stored depth values greater than or equal to this are treated as invalid for paired datasets.",
+    )
+    parser.add_argument(
+        "--pano-position-step-m",
+        type=float,
+        default=1.0,
+        help="Synthetic center spacing used when a dataset does not provide pano poses.",
+    )
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -150,6 +170,7 @@ def main(argv: Iterable[str] | None = None) -> None:
             smoke_root = Path(tmp) / "converted_pano4vggt_omega"
             write_smoke_dataset(smoke_root)
             args.dataset_root = smoke_root
+            args.dataset_format = "vkitti"
             args.checkpoint = None
             args.output_dir = Path(tmp) / "outputs"
             args.device = "cpu"
@@ -209,14 +230,7 @@ def train(args: argparse.Namespace) -> None:
     if args.pano_sample_mode == "variable_neighborhood" and args.batch_size != 1:
         raise ValueError("variable_neighborhood uses variable-length inputs and currently requires batch_size=1.")
     try:
-        dataset = PanoVKittiOmegaDataset(
-            root=args.dataset_root,
-            pano_size=pano_size,
-            pano_sample_mode=args.pano_sample_mode,
-            pano_min_count=args.pano_min_count,
-            pano_max_count=args.pano_max_count,
-            grouping=args.pano_grouping,
-        )
+        dataset = build_dataset(args, pano_size)
         sampler = DistributedSampler(
             dataset,
             num_replicas=dist_state["world_size"],
@@ -253,6 +267,7 @@ def train(args: argparse.Namespace) -> None:
         )
 
         rank0_print(f"[INFO] dataset_root = {dataset.root}", dist_state)
+        rank0_print(f"[INFO] dataset_format = {args.dataset_format}", dist_state)
         rank0_print(f"[INFO] samples = {len(dataset)}", dist_state)
         rank0_print(
             "[INFO] pano_sampling = "
@@ -350,6 +365,28 @@ def train(args: argparse.Namespace) -> None:
                 print(f"[INFO] saved checkpoint = {ckpt_path}")
             print(f"[INFO] stop_reason = {stop_reason}; steps = {global_step}")
         cleanup_distributed(dist_state)
+
+
+def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
+    common_kwargs = {
+        "root": args.dataset_root,
+        "pano_size": pano_size,
+        "pano_sample_mode": args.pano_sample_mode,
+        "pano_min_count": args.pano_min_count,
+        "pano_max_count": args.pano_max_count,
+        "grouping": args.pano_grouping,
+        "max_samples": args.dataset_max_samples,
+    }
+    if args.dataset_format == "vkitti":
+        return PanoVKittiOmegaDataset(**common_kwargs)
+    if args.dataset_format == "panocity_paired":
+        return PanoCityPairedOmegaDataset(
+            **common_kwargs,
+            output_depth_scale=args.output_depth_scale,
+            invalid_depth_value=args.invalid_depth_value,
+            position_step_m=args.pano_position_step_m,
+        )
+    raise ValueError(f"Unknown dataset_format: {args.dataset_format}")
 
 
 def normalize_pano_sampling_args(args: argparse.Namespace) -> None:
