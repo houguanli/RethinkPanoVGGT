@@ -51,6 +51,7 @@ except ImportError:
     from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
     from train_utils.optimizer import construct_optimizers
 from vggt_omega.utils.lora import apply_lora_to_model
+from vggt_omega.checkpoint import print_checkpoint_key_analysis
 
 
 class Trainer:
@@ -219,6 +220,7 @@ class Trainer:
         )
         if self.rank == 0:
             logging.info(f"Model state loaded. Missing keys: {missing or 'None'}. Unexpected keys: {unexpected or 'None'}.")
+            print_checkpoint_key_analysis(missing, unexpected)
 
         # Load optimizer state if available and in training mode
         if "optimizer" in checkpoint:

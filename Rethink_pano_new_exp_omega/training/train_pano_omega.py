@@ -13,7 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -39,7 +39,7 @@ from vggt_omega.utils.rotation import mat_to_quat  # noqa: E402
 
 DEFAULT_DATASET_ROOT = Path("whitehole/AOKI/datasets/PANO_LUNA_omega")
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "ckpt" / "vggt_omega_1b_512.pt"
-CONFIG_PATH_KEYS = {"dataset_root", "checkpoint", "output_dir", "log_csv", "loss_plot"}
+CONFIG_PATH_KEYS = {"dataset_root", "checkpoint", "output_dir", "log_csv", "loss_plot", "debug_dir"}
 DEFAULT_PANOCITY_PRED_DEPTH_SCALE = 5.491308212280273
 
 
@@ -169,6 +169,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-duration-minutes", type=float, default=0.0)
     parser.add_argument("--log-csv", type=Path, default=None)
     parser.add_argument("--loss-plot", type=Path, default=None)
+    parser.add_argument("--debug-depth-dump", dest="debug_depth_dump", action="store_true", default=True)
+    parser.add_argument("--no-debug-depth-dump", dest="debug_depth_dump", action="store_false")
+    parser.add_argument(
+        "--debug-depth-threshold",
+        type=float,
+        default=0.3,
+        help="Dump pred/GT depth windows whose per-window log-L1 depth loss exceeds this value.",
+    )
+    parser.add_argument("--debug-dir", type=Path, default=Path("logs/debug"))
+    parser.add_argument("--debug-depth-max-dumps-per-step", type=int, default=4)
     parser.add_argument("--smoke", action="store_true", help="Run a tiny generated-data training step.")
     return parser
 
@@ -324,7 +334,7 @@ def train(args: argparse.Namespace) -> None:
 
                 global_step += 1
                 batch = move_batch_to_device(batch, device)
-                loss_dict = train_step(model, batch, optimizer, args)
+                loss_dict = train_step(model, batch, optimizer, args, global_step=global_step)
                 loss_dict = reduce_loss_dict(loss_dict, dist_state)
                 elapsed_seconds = time.time() - started_at
                 metrics = {
@@ -556,6 +566,7 @@ def train_step(
     batch: Dict,
     optimizer: torch.optim.Optimizer,
     args: argparse.Namespace,
+    global_step: int = 0,
 ) -> Dict[str, torch.Tensor]:
     optimizer.zero_grad(set_to_none=True)
     pano_images = batch["pano_image"]
@@ -578,6 +589,15 @@ def train_step(
         )
         pred_depth = predictions["depth"] * pred_depth_scale
         loss_depth = masked_log_l1_depth(pred_depth, target_depth, target_valid)
+        if args.debug_depth_dump and _is_rank0_process():
+            dump_debug_depth_predictions(
+                args=args,
+                pred_depth=pred_depth,
+                target_depth=target_depth,
+                valid_mask=target_valid,
+                global_step=global_step,
+                batch=batch,
+            )
         loss_camera_dict = camera_alignment_loss(
             predictions=predictions,
             batch=batch,
@@ -609,6 +629,98 @@ def train_step(
         "pred_depth_scale": logged_pred_depth_scale,
         **{key: value.detach() for key, value in loss_camera_dict.items() if key != "loss_camera"},
     }
+
+
+def _is_rank0_process() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+@torch.no_grad()
+def dump_debug_depth_predictions(
+    args: argparse.Namespace,
+    pred_depth: torch.Tensor,
+    target_depth: torch.Tensor,
+    valid_mask: torch.Tensor,
+    global_step: int,
+    batch: Dict,
+) -> None:
+    per_window_loss = per_window_log_l1_depth(pred_depth, target_depth, valid_mask)
+    bad_windows = torch.nonzero(per_window_loss > float(args.debug_depth_threshold), as_tuple=False)
+    if bad_windows.numel() == 0:
+        return
+
+    max_dumps = max(0, int(args.debug_depth_max_dumps_per_step))
+    if max_dumps == 0:
+        return
+    debug_dir = Path(args.debug_dir)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    scene_names = batch.get("scene_name", None)
+    dumped = 0
+    for batch_idx, view_idx in bad_windows.detach().cpu().tolist():
+        if dumped >= max_dumps:
+            break
+        loss_value = float(per_window_loss[batch_idx, view_idx].detach().cpu())
+        scene = _debug_scene_name(scene_names, batch_idx)
+        prefix = debug_dir / f"step_{global_step:06d}_b{batch_idx:02d}_v{view_idx:02d}_{scene}_loss_{loss_value:.4f}"
+        valid = valid_mask[batch_idx, view_idx, ..., 0].detach().cpu().numpy().astype(bool)
+        pred = pred_depth[batch_idx, view_idx, ..., 0].detach().float().cpu().numpy()
+        target = target_depth[batch_idx, view_idx, ..., 0].detach().float().cpu().numpy()
+        save_depth_debug_pngs(prefix, pred, target, valid, max_depth_m=float(args.depth_max_m))
+        dumped += 1
+
+
+def _debug_scene_name(scene_names, batch_idx: int) -> str:
+    if scene_names is None:
+        return "sample"
+    if isinstance(scene_names, (list, tuple)) and len(scene_names) > batch_idx:
+        value = scene_names[batch_idx]
+    else:
+        value = scene_names
+    if isinstance(value, (list, tuple)):
+        value = "_".join(str(part) for part in value)
+    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in str(value))[:80]
+
+
+def save_depth_debug_pngs(prefix: Path, pred: np.ndarray, target: np.ndarray, valid: np.ndarray, max_depth_m: float) -> None:
+    valid = valid & np.isfinite(pred) & np.isfinite(target) & (target > 0)
+    pred_to_save = np.where(valid, pred, 0.0)
+    target_to_save = np.where(valid, target, 0.0)
+    pred_u16 = np.clip(pred_to_save * 1000.0, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+    target_u16 = np.clip(target_to_save * 1000.0, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+    Image.fromarray(pred_u16).save(prefix.with_name(prefix.name + "_pred_depth_m.png"))
+    Image.fromarray(target_u16).save(prefix.with_name(prefix.name + "_gt_depth_m.png"))
+    Image.fromarray((valid.astype(np.uint8) * 255)).save(prefix.with_name(prefix.name + "_valid_mask.png"))
+
+    denom = max(max_depth_m, 1e-6)
+    pred_vis = (np.clip(pred_to_save / denom, 0.0, 1.0) * 255.0).astype(np.uint8)
+    target_vis = (np.clip(target_to_save / denom, 0.0, 1.0) * 255.0).astype(np.uint8)
+    Image.fromarray(pred_vis).save(prefix.with_name(prefix.name + "_pred_vis.png"))
+    Image.fromarray(target_vis).save(prefix.with_name(prefix.name + "_gt_vis.png"))
+
+    err = np.zeros_like(target_to_save, dtype=np.float32)
+    err[valid] = np.abs(np.log(np.clip(pred_to_save[valid], 1e-4, None)) - np.log(np.clip(target_to_save[valid], 1e-4, None)))
+    err_vis = (np.clip(err / 1.0, 0.0, 1.0) * 255.0).astype(np.uint8)
+    Image.fromarray(err_vis).save(prefix.with_name(prefix.name + "_abs_log_err.png"))
+
+
+def per_window_log_l1_depth(
+    pred_depth: torch.Tensor,
+    target_depth: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    pred_depth = pred_depth.float()
+    target_depth = target_depth.to(device=pred_depth.device, dtype=torch.float32)
+    valid = torch.isfinite(pred_depth) & torch.isfinite(target_depth) & (target_depth > 0)
+    if valid_mask is not None:
+        valid = valid & valid_mask.to(device=target_depth.device, dtype=torch.bool)
+    diff = torch.zeros_like(pred_depth, dtype=torch.float32)
+    diff[valid] = (
+        torch.log(pred_depth[valid].clamp_min(1e-4))
+        - torch.log(target_depth[valid].clamp_min(1e-4))
+    ).abs()
+    numerator = diff.sum(dim=(2, 3, 4))
+    denominator = valid.sum(dim=(2, 3, 4)).clamp_min(1)
+    return numerator / denominator
 
 
 @torch.no_grad()
@@ -1054,6 +1166,7 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path, strict: bool)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         print(f"[INFO] loaded trainable-delta checkpoint = {checkpoint_path}")
         print(f"[INFO] missing_keys = {len(missing)}; unexpected_keys = {len(unexpected)}")
+        print_checkpoint_key_analysis(missing, unexpected)
         return
 
     state_dict = checkpoint
@@ -1066,6 +1179,26 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path, strict: bool)
     missing, unexpected = model.load_state_dict(state_dict, strict=strict)
     print(f"[INFO] loaded checkpoint = {checkpoint_path}")
     print(f"[INFO] missing_keys = {len(missing)}; unexpected_keys = {len(unexpected)}")
+    print_checkpoint_key_analysis(missing, unexpected)
+
+
+def print_checkpoint_key_analysis(missing: Sequence[str], unexpected: Sequence[str], max_items: int = 20) -> None:
+    if missing:
+        print(f"[INFO] missing_key_prefixes = {_format_key_prefix_counts(missing)}")
+        print(f"[INFO] missing_keys_sample = {list(missing)[:max_items]}")
+    if unexpected:
+        print(f"[INFO] unexpected_key_prefixes = {_format_key_prefix_counts(unexpected)}")
+        print(f"[INFO] unexpected_keys_sample = {list(unexpected)[:max_items]}")
+
+
+def _format_key_prefix_counts(keys: Sequence[str], depth: int = 2, max_groups: int = 12) -> str:
+    counts: Dict[str, int] = {}
+    for key in keys:
+        parts = str(key).split(".")
+        prefix = ".".join(parts[:depth]) if len(parts) >= depth else str(key)
+        counts[prefix] = counts.get(prefix, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:max_groups]
+    return ", ".join(f"{prefix}:{count}" for prefix, count in ranked)
 
 
 def strip_state_dict_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:

@@ -28,7 +28,7 @@ supervision:
   depth_max_m: 80.0
   pred_depth_scale: 5.491308212280273
   learn_pred_depth_scale: true
-  pred_depth_scale_lr: 1.0e-3
+  pred_depth_scale_lr: 1.0e-4
   enable_camera_head: true
   camera_supervision_mode: none
   camera_loss_weight: 0.0
@@ -59,6 +59,10 @@ runtime:
   save_every_steps: 0
   save_last: true
   checkpoint_format: trainable_delta
+  debug_depth_dump: true
+  debug_depth_threshold: 0.3
+  debug_depth_max_dumps_per_step: 4
+  debug_dir: logs/debug
 
 output:
   output_dir: logs/panocity_paired_single_pano_rtx5000

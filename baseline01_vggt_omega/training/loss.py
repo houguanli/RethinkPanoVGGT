@@ -266,7 +266,17 @@ def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     return loss_dict
 
 
-def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn = None, valid_range=-1, **kwargs):
+def compute_depth_loss(
+    predictions,
+    batch,
+    gamma=1.0,
+    alpha=0.2,
+    gradient_loss_fn=None,
+    valid_range=-1,
+    mode="vggt",
+    pred_depth_scale=1.0,
+    **kwargs,
+):
     """
     Compute depth loss.
     
@@ -278,13 +288,13 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
         gradient_loss_fn: Type of gradient loss to apply
         valid_range: Quantile range for outlier filtering
     """
-    pred_depth = predictions['depth']
+    pred_depth = predictions['depth'] * float(pred_depth_scale)
     pred_depth_conf = predictions['depth_conf']
 
     gt_depth = batch['depths']
-    gt_depth = check_and_fix_inf_nan(gt_depth, "gt_depth")
     gt_depth = gt_depth[..., None]              # (B, H, W, 1)
     gt_depth_mask = batch['point_masks'].clone()   # 3D points derived from depth map, so we use the same mask
+    gt_depth_mask = gt_depth_mask & torch.isfinite(gt_depth[..., 0]) & (gt_depth[..., 0] > 0)
 
     if gt_depth_mask.sum() < 100:
         # If there are less than 100 valid points, skip this batch
@@ -293,6 +303,16 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
                     f"loss_reg_depth": dummy_loss,
                     f"loss_grad_depth": dummy_loss,}
         return loss_dict
+
+    if mode == "log_l1":
+        loss_log = masked_log_l1_depth(pred_depth, gt_depth, gt_depth_mask)
+        dummy_loss = (0.0 * pred_depth).mean()
+        return {
+            "loss_conf_depth": dummy_loss,
+            "loss_reg_depth": loss_log,
+            "loss_grad_depth": dummy_loss,
+            "loss_log_l1_depth": loss_log,
+        }
 
     # NOTE: we put conf inside regression_loss so that we can also apply conf loss to the gradient loss in a multi-scale manner
     # this is hacky, but very easier to implement
@@ -306,6 +326,19 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     }
 
     return loss_dict
+
+
+def masked_log_l1_depth(pred_depth, target_depth, valid_mask=None):
+    pred_depth = pred_depth.float()
+    target_depth = target_depth.to(device=pred_depth.device, dtype=torch.float32)
+    valid = torch.isfinite(pred_depth) & torch.isfinite(target_depth) & (target_depth > 0)
+    if valid_mask is not None:
+        valid = valid & valid_mask.to(device=target_depth.device, dtype=torch.bool)[..., None]
+    if not bool(valid.any()):
+        return torch.nan_to_num(pred_depth, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
+    pred = pred_depth[valid].clamp_min(1e-4)
+    target = target_depth[valid].clamp_min(1e-4)
+    return (torch.log(pred) - torch.log(target)).abs().mean()
 
 
 def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0, alpha=0.2, valid_range=-1):

@@ -6,7 +6,10 @@ __pycache__/
 ckpt/
 dataset/
 outputs/
+logs/
 Rethink_pano_new_exp_omega/outputs/
+Rethink_pano_new_exp_omega/logs/
+baseline01_vggt_omega/logs/
 comapre_method/**/outputs/
 comapre_method/*_ckpt/
 comapre_method/**/.git/
