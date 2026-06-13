@@ -3,7 +3,7 @@
 data:
   dataset_root: ../../panovggt/PanoCity_paired
   dataset_format: panocity_paired
-  dataset_max_samples: 5
+  dataset_max_samples: 100
   checkpoint: ../ckpt/vggt_omega_1b_512.pt
   pano_sample_mode: single
   pano_min_count: 1
