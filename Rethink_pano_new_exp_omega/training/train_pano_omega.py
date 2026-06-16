@@ -157,6 +157,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Interpretation of saved ERP GT depth before sampling virtual windows.",
     )
     parser.add_argument("--depth-max-m", type=float, default=80.0, help="Maximum valid radial GT depth in meters.")
+    parser.add_argument(
+        "--depth-loss-mode",
+        choices=["log_l1", "log_huber", "clipped_log_l1"],
+        default="log_l1",
+        help="Robust depth loss variant applied in log-depth space.",
+    )
+    parser.add_argument(
+        "--depth-log-huber-delta",
+        type=float,
+        default=0.2,
+        help="SmoothL1 beta for --depth-loss-mode=log_huber.",
+    )
+    parser.add_argument(
+        "--depth-log-error-clip",
+        type=float,
+        default=0.5,
+        help="Maximum per-pixel absolute log-depth error for --depth-loss-mode=clipped_log_l1.",
+    )
     parser.add_argument("--save-last", action="store_true")
     parser.add_argument("--no-save-last", dest="save_last", action="store_false")
     parser.add_argument("--save-every-steps", type=int, default=0)
@@ -304,6 +322,12 @@ def train(args: argparse.Namespace) -> None:
         )
         rank0_print(f"[INFO] pred_depth_scale = {args.pred_depth_scale}", dist_state)
         rank0_print(f"[INFO] learn_pred_depth_scale = {args.learn_pred_depth_scale}", dist_state)
+        rank0_print(
+            "[INFO] depth_loss = "
+            f"{args.depth_loss_mode} huber_delta={args.depth_log_huber_delta} "
+            f"clip={args.depth_log_error_clip}",
+            dist_state,
+        )
         rank0_print(
             f"[INFO] distributed = {dist_state['distributed']} "
             f"rank={dist_state['rank']} world_size={dist_state['world_size']} local_rank={dist_state['local_rank']}",
@@ -588,7 +612,14 @@ def train_step(
             predictions["depth"].new_tensor(float(args.pred_depth_scale)),
         )
         pred_depth = predictions["depth"] * pred_depth_scale
-        loss_depth = masked_log_l1_depth(pred_depth, target_depth, target_valid)
+        loss_depth = masked_depth_loss(
+            pred_depth,
+            target_depth,
+            target_valid,
+            mode=args.depth_loss_mode,
+            huber_delta=args.depth_log_huber_delta,
+            error_clip=args.depth_log_error_clip,
+        )
         if args.debug_depth_dump and _is_rank0_process():
             dump_debug_depth_predictions(
                 args=args,
@@ -953,6 +984,17 @@ def masked_log_l1_depth(
     target_depth: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    return masked_depth_loss(pred_depth, target_depth, valid_mask, mode="log_l1")
+
+
+def masked_depth_loss(
+    pred_depth: torch.Tensor,
+    target_depth: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    mode: str = "log_l1",
+    huber_delta: float = 0.2,
+    error_clip: float = 0.5,
+) -> torch.Tensor:
     pred_depth = pred_depth.float()
     target_depth = target_depth.to(device=pred_depth.device, dtype=torch.float32)
     valid = torch.isfinite(pred_depth) & torch.isfinite(target_depth) & (target_depth > 0)
@@ -962,7 +1004,20 @@ def masked_log_l1_depth(
         return torch.nan_to_num(pred_depth, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
     pred = pred_depth[valid].clamp_min(1e-4)
     target = target_depth[valid].clamp_min(1e-4)
-    return (torch.log(pred) - torch.log(target)).abs().mean()
+    log_abs_error = (torch.log(pred) - torch.log(target)).abs()
+    if mode == "log_l1":
+        return log_abs_error.mean()
+    if mode == "log_huber":
+        delta = max(float(huber_delta), 1e-6)
+        return torch.where(
+            log_abs_error < delta,
+            0.5 * log_abs_error.square() / delta,
+            log_abs_error - 0.5 * delta,
+        ).mean()
+    if mode == "clipped_log_l1":
+        clip_value = max(float(error_clip), 1e-6)
+        return log_abs_error.clamp_max(clip_value).mean()
+    raise ValueError(f"Unknown depth loss mode: {mode}")
 
 
 def camera_alignment_loss(
