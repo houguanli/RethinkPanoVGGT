@@ -5,3 +5,4 @@ from .matterport3d_robust import Matterport3D_Robust
 from .structured3d import Structured3D
 from .deep360 import Deep360
 from .zind import Zind
+from .panocity import PanoCity

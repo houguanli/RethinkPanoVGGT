@@ -68,7 +68,8 @@ class Trainer:
                          "stanford2d3d": datasets.Stanford2D3D,
                          "matterport3d": datasets.Matterport3D,
                          "structured3d": datasets.Structured3D,
-                         "deep360": datasets.Deep360,}
+                         "deep360": datasets.Deep360,
+                         "panocity": datasets.PanoCity,}
         
         cf_train = self.config['train_dataset']
         self.dataset = datasets_dict[cf_train['name']]

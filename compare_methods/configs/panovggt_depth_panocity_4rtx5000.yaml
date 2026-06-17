@@ -1,0 +1,20 @@
+method:
+  name: panovggt_depth
+  path: depth_geometry/PanoVGGT
+panocity:
+  root: ${PANOCITY_ROOT:-../PanoCity_paired}
+  layout: paired_csv
+  pairs_file: pairs.csv
+hardware:
+  gpus: 4
+  gpu_model: rtx_5000
+  launcher: torchrun
+budget:
+  walltime_hours: 24
+  max_epochs: 20
+  reference: luna
+finetune:
+  supported: true
+  command: [torchrun, --standalone, --nproc_per_node=4, training/launch.py, --config, panocity_4rtx5000]
+evaluate:
+  command: [python, inference.py, --help]

@@ -1,0 +1,21 @@
+method:
+  name: reloc3r
+  path: camera_pose/Reloc3r
+panocity:
+  root: ${PANOCITY_ROOT:-../PanoCity_paired}
+  layout: paired_csv
+  pairs_file: pairs.csv
+hardware:
+  gpus: 4
+  gpu_model: rtx_5000
+  launcher: torchrun
+budget:
+  walltime_hours: 24
+  max_epochs: 20
+  reference: luna
+finetune:
+  supported: false
+  unsupported_reason: Reloc3r requires relative camera-pose labels; PanoCity_paired pairs.csv only provides RGB/depth paths.
+  command: [python, train.py, --train_dataset, "PanoCityReloc3r(split='train')", --test_dataset, "PanoCityReloc3r(split='test')", --epochs, "20", --batch_size, "8", --num_workers, "8", --pretrained, "../../ckpt/Reloc3r-512/Reloc3r-512.pth", --output_dir, "outputs/panocity_4rtx5000"]
+evaluate:
+  command: [python, evaluate_panocity.py, --stage, smoke]

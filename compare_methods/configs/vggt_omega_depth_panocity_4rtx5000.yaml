@@ -1,0 +1,21 @@
+method:
+  name: vggt_omega_depth
+  path: depth_geometry/VGGT-Omega
+panocity:
+  root: ${PANOCITY_ROOT:-../PanoCity_paired}
+  layout: paired_csv
+  pairs_file: pairs.csv
+hardware:
+  gpus: 4
+  gpu_model: rtx_5000
+  launcher: torchrun
+budget:
+  walltime_hours: 24
+  max_epochs: 20
+  reference: luna
+finetune:
+  supported: false
+  unsupported_reason: VGGT-Omega public checkout contains inference/demo code but no finetune trainer or loss implementation.
+  command: [python, finetune_panocity.py, --stage, smoke]
+evaluate:
+  command: [python, evaluate_panocity.py, --stage, smoke]

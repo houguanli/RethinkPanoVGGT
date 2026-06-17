@@ -1,0 +1,20 @@
+method:
+  name: panda
+  path: depth_geometry/PanDA
+panocity:
+  root: ${PANOCITY_ROOT:-../PanoCity_paired}
+  layout: paired_csv
+  pairs_file: pairs.csv
+hardware:
+  gpus: 4
+  gpu_model: rtx_5000
+  launcher: data_parallel
+budget:
+  walltime_hours: 24
+  max_epochs: 20
+  reference: luna
+finetune:
+  supported: true
+  command: [python, train_metric_depth/train.py, --config, config/metric_depth/train_panocity_4rtx5000.yaml, --name, panocity_4rtx5000, --gpu, "0,1,2,3"]
+evaluate:
+  command: [python, evaluate_panocity.py, --stage, smoke]
