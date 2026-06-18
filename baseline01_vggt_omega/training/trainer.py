@@ -19,6 +19,7 @@ os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
 
 
 import contextlib
+import csv
 import gc
 import json
 import logging
@@ -88,6 +89,9 @@ class Trainer:
         loss: Optional[Dict[str, Any]] = None,
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
+        max_duration_minutes: float = 0.0,
+        normalize_scene_scale: bool = True,
+        save_checkpoint_on_exit: bool = True,
         **kwargs,
     ):
         """
@@ -131,6 +135,10 @@ class Trainer:
         self.limit_train_batches = limit_train_batches
         self.limit_val_batches = limit_val_batches
         self.seed_value = seed_value
+        self.max_duration_seconds = float(max_duration_minutes) * 60.0
+        self.normalize_scene_scale = bool(normalize_scene_scale)
+        self.save_checkpoint_on_exit = bool(save_checkpoint_on_exit)
+        self.stop_requested = False
         
         # 'where' tracks training progress from 0.0 to 1.0 for schedulers
         self.where = 0.0
@@ -148,6 +156,22 @@ class Trainer:
             log_level_secondary=self.logging_conf.log_level_secondary,
             all_ranks=self.logging_conf.all_ranks,
         )
+        self.metrics_csv_path = os.path.join(self.logging_conf.log_dir, "loss.csv")
+        if self.rank == 0:
+            with open(self.metrics_csv_path, "w", newline="", encoding="utf-8") as handle:
+                csv.writer(handle).writerow(
+                    [
+                        "step",
+                        "epoch",
+                        "elapsed_seconds",
+                        "seq_name",
+                        "valid_fraction",
+                        "loss_objective",
+                        "loss_reg_depth",
+                        "loss_log_l1_depth",
+                        "lr",
+                    ]
+                )
         set_seeds(seed_value, self.max_epochs, self.distributed_rank)
 
         assert is_dist_avail_and_initialized(), "Torch distributed needs to be initialized before calling the trainer."
@@ -405,13 +429,17 @@ class Trainer:
             self.train_epoch(dataloader)
             
             # Save checkpoint after each training epoch
-            self.save_checkpoint(self.epoch)
+            if self.save_checkpoint_on_exit:
+                self.save_checkpoint(self.epoch)
 
             # Clean up memory
             del dataloader
             gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
+
+            if self.stop_requested:
+                break
 
             # Run validation at the specified frequency
             # Skips validation after the last training epoch, as it can be run separately.
@@ -420,7 +448,7 @@ class Trainer:
             
             self.epoch += 1
         
-        self.epoch -= 1
+        self.epoch = max(0, self.epoch - 1)
 
     def run_val(self):
         """Runs a full validation epoch if a validation dataset is available."""
@@ -568,6 +596,9 @@ class Trainer:
         for data_iter, batch in enumerate(train_loader):
             if data_iter > limit_train_batches:
                 break
+            if self._duration_limit_reached():
+                self.stop_requested = True
+                break
             
             # measure data loading time
             data_time.update(time.time() - end)
@@ -592,7 +623,7 @@ class Trainer:
 
             # compute gradient and do SGD step
             assert data_iter <= limit_train_batches  # allow for off by one errors
-            exact_epoch = self.epoch + float(data_iter) / limit_train_batches
+            exact_epoch = self.epoch + float(data_iter) / max(1, limit_train_batches)
             self.where = float(exact_epoch) / self.max_epochs
             
             assert self.where <= 1 + self.EPSILON
@@ -608,7 +639,8 @@ class Trainer:
             if self.steps[phase] % self.logging_conf.log_freq == 0:
                 for i, optim in enumerate(self.optims):
                     for j, param_group in enumerate(optim.optimizer.param_groups):
-                        for option in optim.schedulers[j]:
+                        scheduler_options = optim.schedulers[j] if optim.schedulers is not None else {}
+                        for option in scheduler_options:
                             optim_prefix = (
                                 f"{i}_"
                                 if len(self.optims) > 1
@@ -654,6 +686,14 @@ class Trainer:
 
             if data_iter % self.logging_conf.log_freq == 0:
                 progress.display(data_iter)
+
+            if self._duration_limit_reached():
+                self.stop_requested = True
+                logging.info(
+                    f"Stopping after reaching max_duration_minutes="
+                    f"{self.max_duration_seconds / 60.0:.2f}"
+                )
+                break
 
         return True
 
@@ -738,6 +778,9 @@ class Trainer:
     def _process_batch(self, batch: Mapping):      
         if self.data_conf.train.common_config.repeat_batch:
             batch = self._apply_batch_repetition(batch)
+
+        if not self.normalize_scene_scale:
+            return batch
         
         # Normalize camera extrinsics and points. The function returns new tensors.
         normalized_extrinsics, normalized_cam_points, normalized_world_points, normalized_depths = \
@@ -769,6 +812,8 @@ class Trainer:
         
         # Loss computation
         loss_dict = self.loss(y_hat, batch)
+        if phase == "train" and self.rank == 0:
+            self._append_metrics_csv(batch, loss_dict)
         
         # Combine all data for logging
         log_data = {**y_hat, **loss_dict, **batch}
@@ -778,6 +823,41 @@ class Trainer:
 
         self.steps[phase] += 1
         return loss_dict
+
+    def _duration_limit_reached(self) -> bool:
+        if self.max_duration_seconds <= 0:
+            return False
+        elapsed = time.time() - self.start_time + self.ckpt_time_elapsed
+        return elapsed >= self.max_duration_seconds
+
+    def _append_metrics_csv(self, batch: Mapping, loss_dict: Mapping) -> None:
+        def scalar(name: str) -> float:
+            value = loss_dict.get(name, 0.0)
+            return float(value.detach().item()) if torch.is_tensor(value) else float(value)
+
+        seq_name = batch.get("seq_name", "")
+        if isinstance(seq_name, (list, tuple)):
+            seq_name = "|".join(str(value) for value in seq_name)
+        point_masks = batch.get("point_masks")
+        valid_fraction = float(point_masks.float().mean().item()) if torch.is_tensor(point_masks) else 0.0
+        lr = 0.0
+        if hasattr(self, "optims") and self.optims:
+            lr = float(self.optims[0].optimizer.param_groups[0]["lr"])
+        elapsed = time.time() - self.start_time + self.ckpt_time_elapsed
+        with open(self.metrics_csv_path, "a", newline="", encoding="utf-8") as handle:
+            csv.writer(handle).writerow(
+                [
+                    self.steps["train"] + 1,
+                    self.epoch + 1,
+                    elapsed,
+                    seq_name,
+                    valid_fraction,
+                    scalar("objective"),
+                    scalar("loss_reg_depth"),
+                    scalar("loss_log_l1_depth"),
+                    lr,
+                ]
+            )
 
     def _update_and_log_scalars(self, data: Mapping, phase: str, step: int, loss_meters: dict):
         """Updates average meters and logs scalar values to TensorBoard."""

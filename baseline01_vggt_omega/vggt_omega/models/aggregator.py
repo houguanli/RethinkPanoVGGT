@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from vggt_omega.models.layers import Mlp, RopePositionEmbedding, SelfAttentionBlock
 from vggt_omega.models.layers.vision_transformer import DinoVisionTransformer
@@ -28,10 +29,16 @@ class Aggregator(nn.Module):
         num_register_tokens: int = 16,
         register_attention_block_indices: list[int] = [2, 6, 9, 14, 20],
         cached_layer_indices: tuple[int, ...] = (4, 11, 17, 23),
+        activation_checkpointing: bool = False,
     ) -> None:
         super().__init__()
 
-        self.patch_embed = _build_patch_embed(patch_size=patch_size, embed_dim=embed_dim)
+        self.activation_checkpointing = bool(activation_checkpointing)
+        self.patch_embed = _build_patch_embed(
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            activation_checkpointing=self.activation_checkpointing,
+        )
         self.rope_embed = RopePositionEmbedding(
             embed_dim=embed_dim,
             num_heads=num_heads,
@@ -164,7 +171,7 @@ class Aggregator(nn.Module):
         rope_sincos: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = tokens.view(batch_size * num_frames, num_tokens, embed_dim)
-        tokens = self.frame_blocks[block_idx](tokens, rope_sincos)
+        tokens = self._run_block(self.frame_blocks[block_idx], tokens, rope_sincos)
         return tokens, tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
     def _run_inter_frame_attention_block(
@@ -181,7 +188,7 @@ class Aggregator(nn.Module):
 
         if attention_type == "global":
             tokens = tokens.view(batch_size, num_frames * num_tokens, embed_dim)
-            tokens = self.inter_frame_blocks[block_idx](tokens, None)
+            tokens = self._run_block(self.inter_frame_blocks[block_idx], tokens, None)
             return tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
         if attention_type != "register":
@@ -199,7 +206,11 @@ class Aggregator(nn.Module):
             embed_dim,
         )
 
-        camera_and_register_tokens = self.inter_frame_blocks[block_idx](camera_and_register_tokens, None)
+        camera_and_register_tokens = self._run_block(
+            self.inter_frame_blocks[block_idx],
+            camera_and_register_tokens,
+            None,
+        )
         tokens = torch.cat([camera_and_register_tokens, patch_tokens], dim=1)
 
         camera_and_register_tokens = tokens[:, : num_frames * patch_token_start].view(
@@ -216,8 +227,22 @@ class Aggregator(nn.Module):
         )
         return torch.cat([camera_and_register_tokens, patch_tokens], dim=2)
 
+    def _run_block(
+        self,
+        block: nn.Module,
+        tokens: torch.Tensor,
+        rope_sincos,
+    ) -> torch.Tensor:
+        if self.activation_checkpointing and self.training:
+            return checkpoint(block, tokens, rope_sincos, use_reentrant=False)
+        return block(tokens, rope_sincos)
 
-def _build_patch_embed(patch_size: int, embed_dim: int) -> DinoVisionTransformer:
+
+def _build_patch_embed(
+    patch_size: int,
+    embed_dim: int,
+    activation_checkpointing: bool = False,
+) -> DinoVisionTransformer:
     model = DinoVisionTransformer(
         img_size=224,
         patch_size=patch_size,
@@ -238,6 +263,7 @@ def _build_patch_embed(patch_size: int, embed_dim: int) -> DinoVisionTransformer
         proj_bias=True,
         n_storage_tokens=4,
         mask_k_bias=True,
+        activation_checkpointing=activation_checkpointing,
     )
     model.init_weights()
     return model

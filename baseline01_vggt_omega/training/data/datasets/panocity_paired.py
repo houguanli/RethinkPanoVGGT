@@ -25,6 +25,7 @@ class PanoCityPairedPinholeDataset(BaseDataset):
         num_yaw: int = 8,
         pitch_degrees: float = 0.0,
         fov_degrees: float = 75.0,
+        max_samples: Optional[int] = None,
     ):
         super().__init__(common_conf=common_conf)
         self.root = root
@@ -36,7 +37,7 @@ class PanoCityPairedPinholeDataset(BaseDataset):
         self.num_yaw = int(num_yaw)
         self.pitch_degrees = float(pitch_degrees)
         self.fov_degrees = float(fov_degrees)
-        self.items = self._build_index()
+        self.items = self._build_index(max_samples=max_samples)
         if not self.items:
             raise FileNotFoundError(f"No PanoCity paired samples found under {self.root}/rgb and {self.root}/depth")
 
@@ -105,7 +106,7 @@ class PanoCityPairedPinholeDataset(BaseDataset):
             "original_sizes": original_sizes,
         }
 
-    def _build_index(self):
+    def _build_index(self, max_samples: Optional[int] = None):
         rgb_dir = osp.join(self.root, "rgb")
         depth_dir = osp.join(self.root, "depth")
         items = []
@@ -116,6 +117,8 @@ class PanoCityPairedPinholeDataset(BaseDataset):
             if depth_path is None:
                 continue
             items.append({"rgb_path": rgb_path, "depth_path": depth_path, "name": osp.splitext(osp.basename(rgb_path))[0]})
+            if max_samples is not None and len(items) >= int(max_samples):
+                break
         return items
 
 

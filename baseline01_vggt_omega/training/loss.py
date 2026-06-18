@@ -275,6 +275,8 @@ def compute_depth_loss(
     valid_range=-1,
     mode="vggt",
     pred_depth_scale=1.0,
+    log_huber_delta=0.2,
+    log_error_clip=0.5,
     **kwargs,
 ):
     """
@@ -304,8 +306,15 @@ def compute_depth_loss(
                     f"loss_grad_depth": dummy_loss,}
         return loss_dict
 
-    if mode == "log_l1":
-        loss_log = masked_log_l1_depth(pred_depth, gt_depth, gt_depth_mask)
+    if mode in {"log_l1", "log_huber", "clipped_log_l1"}:
+        loss_log = masked_log_depth_loss(
+            pred_depth,
+            gt_depth,
+            gt_depth_mask,
+            mode=mode,
+            huber_delta=log_huber_delta,
+            error_clip=log_error_clip,
+        )
         dummy_loss = (0.0 * pred_depth).mean()
         return {
             "loss_conf_depth": dummy_loss,
@@ -329,6 +338,17 @@ def compute_depth_loss(
 
 
 def masked_log_l1_depth(pred_depth, target_depth, valid_mask=None):
+    return masked_log_depth_loss(pred_depth, target_depth, valid_mask, mode="log_l1")
+
+
+def masked_log_depth_loss(
+    pred_depth,
+    target_depth,
+    valid_mask=None,
+    mode="log_l1",
+    huber_delta=0.2,
+    error_clip=0.5,
+):
     pred_depth = pred_depth.float()
     target_depth = target_depth.to(device=pred_depth.device, dtype=torch.float32)
     valid = torch.isfinite(pred_depth) & torch.isfinite(target_depth) & (target_depth > 0)
@@ -338,7 +358,19 @@ def masked_log_l1_depth(pred_depth, target_depth, valid_mask=None):
         return torch.nan_to_num(pred_depth, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
     pred = pred_depth[valid].clamp_min(1e-4)
     target = target_depth[valid].clamp_min(1e-4)
-    return (torch.log(pred) - torch.log(target)).abs().mean()
+    log_abs_error = (torch.log(pred) - torch.log(target)).abs()
+    if mode == "log_l1":
+        return log_abs_error.mean()
+    if mode == "log_huber":
+        delta = max(float(huber_delta), 1e-6)
+        return torch.where(
+            log_abs_error < delta,
+            0.5 * log_abs_error.square() / delta,
+            log_abs_error - 0.5 * delta,
+        ).mean()
+    if mode == "clipped_log_l1":
+        return log_abs_error.clamp_max(max(float(error_clip), 1e-6)).mean()
+    raise ValueError(f"Unknown log-depth loss mode: {mode}")
 
 
 def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0, alpha=0.2, valid_range=-1):
