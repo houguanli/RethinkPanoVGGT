@@ -144,7 +144,7 @@ model:
 distributed:
   backend: nccl
   comms_dtype: null
-  find_unused_parameters: false
+  find_unused_parameters: true
   timeout_mins: 30
   gradient_as_bucket_view: true
   bucket_cap_mb: 25
