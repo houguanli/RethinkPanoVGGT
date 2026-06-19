@@ -14,8 +14,7 @@ budget:
   max_epochs: 20
   reference: luna
 finetune:
-  supported: false
-  unsupported_reason: DAP checkout has inference/evaluation configs but no public training entrypoint.
-  command: [python, finetune_panocity.py, --stage, smoke]
+  supported: true
+  command: [torchrun, --standalone, --nproc_per_node=4, train_panocity.py, --config, config/train_panocity_4rtx5000.yaml, --output-dir, outputs/panocity_4rtx5000]
 evaluate:
   command: [python, evaluate_panocity.py, --stage, smoke]

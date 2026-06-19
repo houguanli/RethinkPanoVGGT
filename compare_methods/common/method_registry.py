@@ -83,9 +83,8 @@ METHODS: Dict[str, MethodSpec] = {
         env_name="cmp_dap",
         requirements=[COMPARE_ROOT / "depth_geometry" / "DAP" / "requirements.txt"],
         config=COMPARE_ROOT / "configs" / "dap_panocity_4rtx5000.yaml",
-        finetune_command=["python", "finetune_panocity.py"],
+        finetune_command=["torchrun", "--standalone", "--nproc_per_node=4", "train_panocity.py", "--config", "config/train_panocity_4rtx5000.yaml", "--output-dir", "outputs/panocity_4rtx5000"],
         evaluate_command=["python", "evaluate_panocity.py"],
-        supports_native_finetune=False,
     ),
     "panda": MethodSpec(
         name="panda",
