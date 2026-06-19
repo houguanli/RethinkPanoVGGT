@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-METHODS="${1:-panovggt_camera,reloc3r,vggt_omega_camera,dap,panda}"
+METHODS="${1:-panovggt_camera,panovggt_depth,reloc3r,vggt_omega_camera,vggt_omega_depth,dap,panda}"
 STAGE="${STAGE:-both}"
 DRY_RUN="${DRY_RUN:-0}"
 ALLOW_UNSUPPORTED="${ALLOW_UNSUPPORTED:-0}"
+WALLTIME_HOURS="${WALLTIME_HOURS:-}"
+FINETUNE_TIMEOUT_SECONDS="${FINETUNE_TIMEOUT_SECONDS:-}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPARE_ROOT="${ROOT}/compare_methods"
@@ -46,6 +48,22 @@ resolve_conda_sh() {
 
 source "$(resolve_conda_sh)"
 
+resolve_finetune_timeout_seconds() {
+  if [[ -n "${FINETUNE_TIMEOUT_SECONDS}" ]]; then
+    printf '%s\n' "${FINETUNE_TIMEOUT_SECONDS}"
+    return 0
+  fi
+  if [[ -n "${WALLTIME_HOURS}" ]]; then
+    awk -v hours="${WALLTIME_HOURS}" 'BEGIN {
+      if (hours <= 0) {
+        print "WALLTIME_HOURS must be positive" > "/dev/stderr"
+        exit 2
+      }
+      printf "%d\n", hours * 3600
+    }'
+  fi
+}
+
 env_for_method() {
   case "$1" in
     panovggt_camera|panovggt_depth) echo cmp_panovggt;;
@@ -58,13 +76,14 @@ env_for_method() {
 }
 
 IFS=',' read -ra METHOD_ARRAY <<< "${METHODS}"
+finetune_timeout_seconds="$(resolve_finetune_timeout_seconds)"
 for method in "${METHOD_ARRAY[@]}"; do
   env_name="$(env_for_method "${method}")"
   if [[ "${env_name}" == "unknown" ]]; then
     echo "Unknown method: ${method}" >&2
     exit 2
   fi
-  echo "[pipeline] method=${method} env=${env_name} stage=${STAGE}"
+  echo "[pipeline] method=${method} env=${env_name} stage=${STAGE} finetune_timeout_seconds=${finetune_timeout_seconds:-none}"
   conda activate "${env_name}"
   args=(--method "${method}" --stage "${STAGE}")
   if [[ "${DRY_RUN}" == "1" ]]; then
@@ -72,6 +91,9 @@ for method in "${METHOD_ARRAY[@]}"; do
   fi
   if [[ "${ALLOW_UNSUPPORTED}" == "1" ]]; then
     args+=(--allow-unsupported-finetune)
+  fi
+  if [[ -n "${finetune_timeout_seconds}" ]]; then
+    args+=(--finetune-timeout-seconds "${finetune_timeout_seconds}")
   fi
   PYTHONPATH="${ROOT}:${PYTHONPATH:-}" python -m compare_methods.common.run_compare_method "${args[@]}"
   conda deactivate
