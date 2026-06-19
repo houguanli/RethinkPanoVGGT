@@ -14,8 +14,14 @@ budget:
   max_epochs: 20
   reference: luna
 finetune:
-  supported: false
-  unsupported_reason: VGGT-Omega public checkout contains inference/demo code but no finetune trainer or loss implementation.
-  command: [python, finetune_panocity.py, --stage, smoke]
+  supported: true
+  command: [torchrun, --standalone, --nproc_per_node=4, train_panocity.py, --config, ../../configs/vggt_omega_depth_panocity_4rtx5000.yaml, --checkpoint, ../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt, --output-dir, outputs/panocity_4rtx5000]
 evaluate:
   command: [python, evaluate_panocity.py, --stage, smoke]
+train:
+  image_size: 512
+  batch_size: 1
+  num_workers: 4
+  lr: 1.0e-5
+  weight_decay: 0.01
+  max_depth_meters: 100.0

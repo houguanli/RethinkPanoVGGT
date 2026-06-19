@@ -14,8 +14,8 @@ budget:
   max_epochs: 20
   reference: luna
 finetune:
-  supported: false
-  unsupported_reason: Reloc3r requires relative camera-pose labels; PanoCity_paired pairs.csv only provides RGB/depth paths.
-  command: [python, train.py, --train_dataset, "PanoCityReloc3r(split='train')", --test_dataset, "PanoCityReloc3r(split='test')", --epochs, "20", --batch_size, "8", --num_workers, "8", --pretrained, "../../ckpt/Reloc3r-512/Reloc3r-512.pth", --output_dir, "outputs/panocity_4rtx5000"]
+  supported: true
+  note: PanoCity_paired has no calibrated camera-pose labels; PanoCityReloc3r uses identity pose placeholders until labels are available.
+  command: [torchrun, --standalone, --nproc_per_node=4, train.py, --train_dataset, "PanoCityReloc3r(split='train', resolution=512)", --test_dataset, "PanoCityReloc3r(split='test', resolution=512)", --epochs, "20", --batch_size, "8", --num_workers, "8", --pretrained, "../../ckpt/Reloc3r-512/Reloc3r-512.pth", --output_dir, "outputs/panocity_4rtx5000"]
 evaluate:
   command: [python, evaluate_panocity.py, --stage, smoke]

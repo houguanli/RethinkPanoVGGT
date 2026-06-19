@@ -1,4 +1,4 @@
-"""PanoCity paired dataset adapter for Reloc3r."""
+"""PanoCity paired dataset adapter for Reloc3r training."""
 
 from __future__ import annotations
 
@@ -6,10 +6,9 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import torch
 from PIL import Image
-from torch.utils import data
-from torchvision import transforms
+
+from reloc3r.datasets.base.base_stereo_view_dataset import BaseStereoViewDataset
 
 COMPARE_ROOT = Path(__file__).resolve().parents[4]
 if str(COMPARE_ROOT) not in sys.path:
@@ -18,42 +17,47 @@ if str(COMPARE_ROOT) not in sys.path:
 from common.panocity_paired import PanoCityPairedIndex  # noqa: E402
 
 
-class PanoCityReloc3r(data.Dataset):
-    """Adjacent-pair RGB adapter for Reloc3r smoke/finetune scheduling.
+class PanoCityReloc3r(BaseStereoViewDataset):
+    """Adjacent-pair PanoCity loader matching Reloc3r's two-view contract.
 
-    PanoCity paired data has no camera pose annotations in pairs.csv, so this
-    adapter returns identity relative pose placeholders and explicit metadata.
-    Real pose-supervised Reloc3r finetuning should replace `relpose` with
-    calibrated labels if they become available.
+    PanoCity_paired currently provides RGB/depth paths, not calibrated camera
+    poses. For finetune plumbing and weak pose adaptation, this dataset supplies
+    identity cam2world placeholders and centered pinhole intrinsics. Replace
+    `camera_pose` with calibrated labels when available.
     """
 
-    def __init__(self, root=None, split="train", size=512, max_samples=None):
-        self.index = PanoCityPairedIndex(root=root, split=split, max_samples=max_samples)
-        self.size = int(size)
-        self.to_tensor = transforms.ToTensor()
-        self.normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    def __init__(self, root=None, split="train", ROOT=None, resolution=512, max_samples=None, **kwargs):
+        self.index = PanoCityPairedIndex(root=root or ROOT, split=split, max_samples=max_samples)
+        super().__init__(split=split, resolution=resolution, **kwargs)
 
     def __len__(self):
         return max(0, len(self.index) - 1)
 
-    def __getitem__(self, idx):
-        rec1 = self.index[idx]
-        rec2 = self.index[idx + 1]
-        img1 = Image.open(rec1.rgb_path).convert("RGB").resize((self.size, self.size), Image.BICUBIC)
-        img2 = Image.open(rec2.rgb_path).convert("RGB").resize((self.size, self.size), Image.BICUBIC)
-        return {
-            "img1": self.normalize(self.to_tensor(img1)),
-            "img2": self.normalize(self.to_tensor(img2)),
-            "relpose": torch.eye(4, dtype=torch.float32),
-            "valid_pose": torch.tensor(False),
-            "label": f"{rec1.num_id}_{rec2.num_id}",
-            "instance": rec1.block,
-            "metadata": {
-                "rgb1": str(rec1.rgb_path),
-                "rgb2": str(rec2.rgb_path),
-                "note": "PanoCity pairs.csv does not provide relative camera pose labels.",
-            },
-        }
+    def _get_views(self, idx, resolution, rng):
+        records = [self.index[idx], self.index[idx + 1]]
+        views = []
+        for rec in records:
+            image = Image.open(rec.rgb_path).convert("RGB")
+            width, height = image.size
+            focal = 0.5 * min(width, height)
+            intrinsics = np.array(
+                [[focal, 0.0, width * 0.5], [0.0, focal, height * 0.5], [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            )
+            image, intrinsics = self._crop_resize_if_necessary(
+                image, intrinsics, resolution, rng=rng, info=(rec.block, rec.num_id)
+            )
+            views.append(
+                dict(
+                    img=image,
+                    camera_pose=np.eye(4, dtype=np.float32),
+                    camera_intrinsics=intrinsics.astype(np.float32),
+                    dataset="PanoCity",
+                    label=rec.block,
+                    instance=rec.num_id,
+                )
+            )
+        return views
 
 
 def smoke(root=None):
@@ -61,7 +65,7 @@ def smoke(root=None):
     sample = ds[0]
     return {
         "length": len(ds),
-        "img1_shape": tuple(sample["img1"].shape),
-        "img2_shape": tuple(sample["img2"].shape),
-        "valid_pose": bool(sample["valid_pose"]),
+        "view_count": len(sample),
+        "img_shape": tuple(sample[0]["img"].shape),
+        "camera_pose_shape": tuple(sample[0]["camera_pose"].shape),
     }

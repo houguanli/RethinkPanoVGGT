@@ -62,9 +62,8 @@ METHODS: Dict[str, MethodSpec] = {
         requirements=[COMPARE_ROOT / "camera_pose" / "VGGT-Omega" / "requirements.txt"],
         editable=True,
         config=COMPARE_ROOT / "configs" / "vggt_omega_camera_panocity_4rtx5000.yaml",
-        finetune_command=["python", "finetune_panocity.py"],
+        finetune_command=["torchrun", "--standalone", "--nproc_per_node=4", "train_panocity.py", "--config", "../../configs/vggt_omega_camera_panocity_4rtx5000.yaml", "--checkpoint", "../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt", "--output-dir", "outputs/panocity_4rtx5000"],
         evaluate_command=["python", "evaluate_panocity.py"],
-        supports_native_finetune=False,
     ),
     "vggt_omega_depth": MethodSpec(
         name="vggt_omega_depth",
@@ -73,9 +72,8 @@ METHODS: Dict[str, MethodSpec] = {
         requirements=[COMPARE_ROOT / "depth_geometry" / "VGGT-Omega" / "requirements.txt"],
         editable=True,
         config=COMPARE_ROOT / "configs" / "vggt_omega_depth_panocity_4rtx5000.yaml",
-        finetune_command=["python", "finetune_panocity.py"],
+        finetune_command=["torchrun", "--standalone", "--nproc_per_node=4", "train_panocity.py", "--config", "../../configs/vggt_omega_depth_panocity_4rtx5000.yaml", "--checkpoint", "../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt", "--output-dir", "outputs/panocity_4rtx5000"],
         evaluate_command=["python", "evaluate_panocity.py"],
-        supports_native_finetune=False,
     ),
     "dap": MethodSpec(
         name="dap",
