@@ -15,6 +15,9 @@ hardware:
   gpu_model: rtx_5000
   walltime_hours: 24
 
+logging:
+  log_dir: logs
+
 data:
   train:
     common_config:

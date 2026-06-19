@@ -14,6 +14,40 @@ from .method_registry import get_group, get_method, is_group, runnable_names
 from .panocity_paired import smoke_summary
 
 
+FORBIDDEN_RUNTIME_PATHS = ("/public/home/", "/home/tione/", "/hpc2hdd/home/")
+
+
+def _runtime_config_paths(spec) -> list[Path]:
+    paths = [spec.config]
+    if spec.name.startswith("panovggt_"):
+        paths.extend(
+            [
+                spec.path / "training" / "config" / "default.yaml",
+                spec.path / "training" / "config" / "panocity_4rtx5000.yaml",
+            ]
+        )
+    elif spec.name == "dap":
+        paths.append(spec.path / "config" / "train_panocity_4rtx5000.yaml")
+    elif spec.name == "panda":
+        paths.append(spec.path / "config" / "metric_depth" / "train_panocity_4rtx5000.yaml")
+    return list(dict.fromkeys(path for path in paths if path and path.exists()))
+
+
+def _validate_runtime_paths(spec) -> None:
+    offenders = []
+    for path in _runtime_config_paths(spec):
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for forbidden in FORBIDDEN_RUNTIME_PATHS:
+            if forbidden in text:
+                offenders.append(f"{path}: contains {forbidden}")
+    if offenders:
+        raise SystemExit(
+            "Refusing to run with hard-coded external runtime paths:\n"
+            + "\n".join(offenders)
+            + "\nUse project-relative paths or environment variables in the PanoCity configs."
+        )
+
+
 def _run(cmd, cwd: Path, dry_run: bool, timeout_seconds: int | None = None) -> None:
     print(f"[cmd] cwd={cwd} {' '.join(cmd)}", flush=True)
     if dry_run:
@@ -37,6 +71,7 @@ def _run(cmd, cwd: Path, dry_run: bool, timeout_seconds: int | None = None) -> N
 
 
 def _run_finetune(spec, dry_run: bool, allow_unsupported: bool, timeout_seconds: int | None) -> None:
+    _validate_runtime_paths(spec)
     if not spec.supports_native_finetune and not allow_unsupported:
         raise SystemExit(
             f"{spec.name} has no native public finetune implementation in this checkout. "
@@ -49,6 +84,7 @@ def _run_finetune(spec, dry_run: bool, allow_unsupported: bool, timeout_seconds:
 
 
 def _run_evaluate(spec, dry_run: bool) -> None:
+    _validate_runtime_paths(spec)
     if not spec.evaluate_command:
         raise SystemExit(f"No evaluate command configured for {spec.name}")
     print(f"[evaluate] method={spec.name}", flush=True)
@@ -76,6 +112,8 @@ def main() -> int:
     summary = smoke_summary(args.panocity_root, split="train")
     if is_group(args.method):
         group = get_group(args.method)
+        for method_name in {group.finetune_method, *group.evaluate_methods}:
+            _validate_runtime_paths(get_method(method_name))
         print(
             json.dumps(
                 {
@@ -104,6 +142,7 @@ def main() -> int:
         return 0
 
     spec = get_method(args.method)
+    _validate_runtime_paths(spec)
     print(json.dumps({"method": spec.name, "panocity": summary}, indent=2), flush=True)
 
     if args.stage == "smoke":

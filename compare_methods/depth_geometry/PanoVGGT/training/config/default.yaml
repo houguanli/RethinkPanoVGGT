@@ -32,22 +32,22 @@ data:
       dataset_configs:
         - _target_: data.datasets.stanford2d3ds.Stanford2D3DSDataset
           split: train
-          Stanford2D3DS_DIR: /public/home/shiyj2-group/yijing/panorama/2d3ds/no_xyz
+          Stanford2D3DS_DIR: ${oc.env:STANFORD2D3DS_DIR,data/stanford2d3ds}
           len_train: 2400
           get_nearby: False
         - _target_: data.datasets.matterport3d.Matterport3DDataset
           split: train
-          Matterport3D_DIR: /public/home/shiyj2-group/yijing/panorama/matterport3D
+          Matterport3D_DIR: ${oc.env:MATTERPORT3D_DIR,data/matterport3d}
           len_train: 4800
           get_nearby: False
         - _target_: data.datasets.structured3d.Structured3DDataset
           split: train
-          Structured3D_DIR: /public/home/shiyj2-group/yijing/panorama/Structured3D_Dataset/Structured3D
+          Structured3D_DIR: ${oc.env:STRUCTURED3D_DIR,data/structured3d}
           len_train: 2400
           get_nearby: False
         - _target_: data.datasets.panocity.PanoCityDataset
           split: train
-          PanoCity_DIR: /public/home/shiyj2-group/yijing/panorama/panocity
+          PanoCity_DIR: ${oc.env:PANOCITY_ROOT,../PanoCity_paired}
           len_train: 16800
           get_nearby: True
           
@@ -63,24 +63,24 @@ data:
       dataset_configs:
         - _target_: data.datasets.stanford2d3ds.Stanford2D3DSDataset
           split: test
-          Stanford2D3DS_DIR: /public/home/shiyj2-group/yijing/panorama/2d3ds/no_xyz
+          Stanford2D3DS_DIR: ${oc.env:STANFORD2D3DS_DIR,data/stanford2d3ds}
           len_test: 240
         - _target_: data.datasets.matterport3d.Matterport3DDataset
           split: test
-          Matterport3D_DIR: /public/home/shiyj2-group/yijing/panorama/matterport3D
+          Matterport3D_DIR: ${oc.env:MATTERPORT3D_DIR,data/matterport3d}
           len_test: 480
         - _target_: data.datasets.structured3d.Structured3DDataset
           split: test
-          Structured3D_DIR: /public/home/shiyj2-group/yijing/panorama/Structured3D_Dataset/Structured3D
+          Structured3D_DIR: ${oc.env:STRUCTURED3D_DIR,data/structured3d}
           len_test: 1400
         - _target_: data.datasets.panocity.PanoCityDataset
           split: test
-          PanoCity_DIR: /public/home/shiyj2-group/yijing/panorama/panocity
+          PanoCity_DIR: ${oc.env:PANOCITY_ROOT,../PanoCity_paired}
           len_test: 2400
 
 
 logging:
-  log_dir: /public/home/v-guoyj/workspace/panopd/logs
+  log_dir: logs
   log_exp: ${exp_name}
   log_visuals: False
   log_freq: 1
@@ -114,7 +114,7 @@ logging:
 
 
 checkpoint:
-  save_dir: /public/home/v-guoyj/workspace/panopd/logs/${exp_name}/ckpts
+  save_dir: logs/${exp_name}/ckpts
   save_freq: 5
   resume_checkpoint_path: null
   strict: False
