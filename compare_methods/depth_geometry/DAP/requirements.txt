@@ -13,10 +13,9 @@ PyYAML
 tqdm
 scipy
 plyfile
-utils3d
 einops
 safetensors
-open3d
+open3d==0.19.0
 tensorboardX
 mmengine
 pyexr
