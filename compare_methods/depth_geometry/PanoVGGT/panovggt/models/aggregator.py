@@ -6,6 +6,7 @@ from functools import partial
 import logging
 import os
 import math
+import re
 from typing import List, Tuple, Optional
 from pathlib import Path
 
@@ -217,22 +218,10 @@ class Aggregator(nn.Module):
         # Method 0: explicit local checkpoint
         if weights_path:
             try:
-                local_path = Path(os.path.expanduser(os.path.expandvars(weights_path)))
+                local_path = self._resolve_local_dinov2_path(weights_path)
                 logger.info(f"Loading DINOv2 weights for {hub_name} from {local_path}")
-                state = torch.load(local_path, map_location="cpu")
-                if "teacher" in state:
-                    state = state["teacher"]
-                if "model" in state:
-                    state = state["model"]
-                if "state_dict" in state:
-                    state = state["state_dict"]
-                state = {
-                    k.removeprefix("module.")
-                    .removeprefix("backbone.")
-                    .removeprefix("patch_embed.")
-                    .removeprefix("aggregator.patch_embed."): v
-                    for k, v in state.items()
-                }
+                state = self._load_local_dinov2_state(local_path)
+                state = self._normalize_local_dinov2_state(state)
                 matched = {k: v for k, v in state.items() if k in model_dict and v.shape == model_dict[k].shape}
                 logger.info(f"Matched {len(matched)}/{len(model_dict)} layers from local DINOv2 weights")
                 model_dict.update(matched)
@@ -296,6 +285,118 @@ class Aggregator(nn.Module):
             logger.info("DINOv2 weights loaded; parameters set to trainable")
         else:
             logger.warning("Could not load DINOv2 pretrained weights; using random init")
+
+    @staticmethod
+    def _resolve_local_dinov2_path(weights_path: str) -> Path:
+        path = Path(os.path.expanduser(os.path.expandvars(weights_path)))
+        if path.is_dir():
+            preferred = [
+                path / "model.safetensors",
+                path / "pytorch_model.bin",
+                path / "dinov2_vitl14_pretrain.pth",
+            ]
+            for candidate in preferred:
+                if candidate.exists():
+                    return candidate
+            for pattern in ("*.safetensors", "*.pth", "*.pt", "*.bin"):
+                matches = sorted(path.glob(pattern))
+                if matches:
+                    return matches[0]
+            raise FileNotFoundError(f"No supported DINOv2 weight file found in {path}")
+        if not path.exists():
+            raise FileNotFoundError(f"DINOv2 weight file not found: {path}")
+        return path
+
+    @staticmethod
+    def _load_local_dinov2_state(path: Path):
+        if path.suffix == ".safetensors":
+            from safetensors.torch import load_file
+
+            return load_file(str(path), device="cpu")
+        return torch.load(path, map_location="cpu")
+
+    @classmethod
+    def _normalize_local_dinov2_state(cls, state):
+        for key in ("teacher", "model", "state_dict"):
+            if isinstance(state, dict) and key in state:
+                state = state[key]
+        if not isinstance(state, dict):
+            raise TypeError(f"Unsupported DINOv2 checkpoint payload: {type(state).__name__}")
+
+        stripped = {}
+        for key, value in state.items():
+            if not torch.is_tensor(value):
+                continue
+            stripped[cls._strip_dinov2_prefixes(str(key))] = value
+        stripped.update(cls._convert_hf_dinov2_state(stripped))
+        return stripped
+
+    @staticmethod
+    def _strip_dinov2_prefixes(key: str) -> str:
+        for prefix in ("module.", "teacher.", "student.", "backbone.", "aggregator.patch_embed."):
+            while key.startswith(prefix):
+                key = key[len(prefix):]
+        return key
+
+    @staticmethod
+    def _convert_hf_dinov2_state(state):
+        converted = {}
+        simple_map = {
+            "embeddings.cls_token": "cls_token",
+            "embeddings.mask_token": "mask_token",
+            "embeddings.position_embeddings": "pos_embed",
+            "embeddings.register_tokens": "register_tokens",
+            "embeddings.patch_embeddings.projection.weight": "patch_embed.proj.weight",
+            "embeddings.patch_embeddings.projection.bias": "patch_embed.proj.bias",
+            "layernorm.weight": "norm.weight",
+            "layernorm.bias": "norm.bias",
+        }
+        for src, dst in simple_map.items():
+            if src in state:
+                converted[dst] = state[src]
+
+        layer_ids = sorted(
+            {
+                int(match.group(1))
+                for key in state
+                for match in [re.match(r"encoder\.layer\.(\d+)\.", key)]
+                if match
+            }
+        )
+        for idx in layer_ids:
+            prefix = f"encoder.layer.{idx}"
+            direct_map = {
+                f"{prefix}.norm1.weight": f"blocks.{idx}.norm1.weight",
+                f"{prefix}.norm1.bias": f"blocks.{idx}.norm1.bias",
+                f"{prefix}.norm2.weight": f"blocks.{idx}.norm2.weight",
+                f"{prefix}.norm2.bias": f"blocks.{idx}.norm2.bias",
+                f"{prefix}.attention.output.dense.weight": f"blocks.{idx}.attn.proj.weight",
+                f"{prefix}.attention.output.dense.bias": f"blocks.{idx}.attn.proj.bias",
+                f"{prefix}.layer_scale1.lambda1": f"blocks.{idx}.ls1.gamma",
+                f"{prefix}.layer_scale2.lambda1": f"blocks.{idx}.ls2.gamma",
+                f"{prefix}.mlp.fc1.weight": f"blocks.{idx}.mlp.fc1.weight",
+                f"{prefix}.mlp.fc1.bias": f"blocks.{idx}.mlp.fc1.bias",
+                f"{prefix}.mlp.fc2.weight": f"blocks.{idx}.mlp.fc2.weight",
+                f"{prefix}.mlp.fc2.bias": f"blocks.{idx}.mlp.fc2.bias",
+            }
+            for src, dst in direct_map.items():
+                if src in state:
+                    converted[dst] = state[src]
+
+            qkv_sources = [
+                f"{prefix}.attention.attention.query",
+                f"{prefix}.attention.attention.key",
+                f"{prefix}.attention.attention.value",
+            ]
+            if all(f"{src}.weight" in state for src in qkv_sources):
+                converted[f"blocks.{idx}.attn.qkv.weight"] = torch.cat(
+                    [state[f"{src}.weight"] for src in qkv_sources], dim=0
+                )
+            if all(f"{src}.bias" in state for src in qkv_sources):
+                converted[f"blocks.{idx}.attn.qkv.bias"] = torch.cat(
+                    [state[f"{src}.bias"] for src in qkv_sources], dim=0
+                )
+        return converted
 
     # ------------------------------------------------------------------ #
     #                           Decode                                     #
