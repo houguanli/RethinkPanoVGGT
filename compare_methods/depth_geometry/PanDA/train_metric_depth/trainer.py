@@ -22,6 +22,15 @@ from networks.models import *
 from metrics import compute_depth_metrics, Evaluator
 from losses import *
 
+
+def _dataset_options(dataset_config, is_training):
+    args = dataset_config['args']
+    options = {'is_training': is_training}
+    for key in ('split', 'max_samples', 'depth_scale', 'max_depth_meters'):
+        if key in args:
+            options[key] = args[key]
+    return options
+
 class LossManager:
     def __init__(self, config):
         self.config = config
@@ -82,7 +91,7 @@ class Trainer:
                                      cf_train['args']['augment_flip'],
                                      cf_train['args']['augment_rotation'],
                                      cf_train['args']['repeat'],
-                                     is_training=True)
+                                     **_dataset_options(cf_train, is_training=True))
         self.train_loader = DataLoader(train_dataset, 
                                        cf_train['batch_size'], 
                                        True,
@@ -102,7 +111,7 @@ class Trainer:
                                      cf_val['args']['augment_flip'],
                                      cf_val['args']['augment_rotation'],
                                      cf_val['args']['repeat'],
-                                     is_training=False)
+                                     **_dataset_options(cf_val, is_training=False))
         self.val_loader = DataLoader(val_dataset, 
                                      cf_val['batch_size'], 
                                      False,
@@ -152,10 +161,12 @@ class Trainer:
         self.start_time = time.time()
         
         for self.epoch in range(self.config['epoch_max']):
-            self.train_one_epoch()
+            stop_training = self.train_one_epoch()
             if (self.epoch + 1) % self.config['epoch_save'] == 0:
                 self.save_model(if_best=False)
             self.validate()
+            if stop_training:
+                break
 
     def train_one_epoch(self):
         """Run a single epoch of training
@@ -190,10 +201,14 @@ class Trainer:
                 self.log("train", inputs, outputs, losses)
 
             self.step += 1
+            if self.config.get('max_steps') is not None and self.step >= int(self.config['max_steps']):
+                return True
+        return False
 
     def process_batch(self, inputs, val):
         for key, ipt in inputs.items():
-            inputs[key] = ipt.cuda()
+            if torch.is_tensor(ipt):
+                inputs[key] = ipt.cuda()
 
         losses = {}
 
@@ -230,6 +245,8 @@ class Trainer:
 
         with torch.no_grad():
             for batch_idx, inputs in enumerate(pbar):
+                if self.config.get('max_val_steps') is not None and batch_idx >= int(self.config['max_val_steps']):
+                    break
                 outputs, losses = self.process_batch(inputs, val=True)
                 pred_depth = outputs["pred_depth"].detach()
                 gt_depth = inputs["gt_depth"]

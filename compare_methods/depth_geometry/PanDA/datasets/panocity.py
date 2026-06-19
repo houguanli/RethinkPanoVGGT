@@ -15,4 +15,7 @@ from common.panocity_paired import PanoCityDepthTorchDataset  # noqa: E402
 class PanoCity(PanoCityDepthTorchDataset):
     """PanDA-compatible PanoCity depth dataset."""
 
-    pass
+    def __init__(self, *args, **kwargs):
+        if "split" not in kwargs:
+            kwargs["split"] = "train" if kwargs.get("is_training", False) else "test"
+        super().__init__(*args, **kwargs)

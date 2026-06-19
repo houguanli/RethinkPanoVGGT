@@ -7,6 +7,8 @@ DRY_RUN="${DRY_RUN:-0}"
 ALLOW_UNSUPPORTED="${ALLOW_UNSUPPORTED:-0}"
 WALLTIME_HOURS="${WALLTIME_HOURS:-}"
 FINETUNE_TIMEOUT_SECONDS="${FINETUNE_TIMEOUT_SECONDS:-}"
+MIN_WSL_C_FREE_GB="${MIN_WSL_C_FREE_GB:-20}"
+ALLOW_LOW_WSL_C_SPACE="${ALLOW_LOW_WSL_C_SPACE:-0}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPARE_ROOT="${ROOT}/compare_methods"
@@ -47,6 +49,50 @@ resolve_conda_sh() {
 }
 
 source "$(resolve_conda_sh)"
+
+ensure_wsl_cuda_library_path() {
+  if [[ ! -d /usr/lib/wsl/lib ]]; then
+    return 0
+  fi
+  case ":${LD_LIBRARY_PATH:-}:" in
+    *:/usr/lib/wsl/lib:*) ;;
+    *) export LD_LIBRARY_PATH="/usr/lib/wsl/lib:${LD_LIBRARY_PATH:-}" ;;
+  esac
+}
+
+ensure_wsl_cuda_library_path
+
+check_wsl_host_space() {
+  if [[ "${ALLOW_LOW_WSL_C_SPACE}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    return 0
+  fi
+  if [[ ! -d /mnt/c ]]; then
+    return 0
+  fi
+  if [[ "${STAGE}" != "deep_smoke" && "${STAGE}" != "finetune" && "${STAGE}" != "both" ]]; then
+    return 0
+  fi
+  local avail_kb avail_gb
+  avail_kb="$(df -Pk /mnt/c 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [[ -z "${avail_kb}" ]]; then
+    return 0
+  fi
+  avail_gb="$((avail_kb / 1024 / 1024))"
+  if (( avail_gb < MIN_WSL_C_FREE_GB )); then
+    cat >&2 <<EOF
+Refusing to run ${STAGE}: /mnt/c has only ${avail_gb}GB free.
+WSL2 may need host C: space to grow/flush its virtual disk; low space can show up
+as TensorBoard I/O errors, SIGBUS, or WSL CreateInstance/E_UNEXPECTED failures.
+Free at least ${MIN_WSL_C_FREE_GB}GB on C:, or set ALLOW_LOW_WSL_C_SPACE=1 to override.
+EOF
+    exit 3
+  fi
+}
+
+check_wsl_host_space
 
 resolve_finetune_timeout_seconds() {
   if [[ -n "${FINETUNE_TIMEOUT_SECONDS}" ]]; then

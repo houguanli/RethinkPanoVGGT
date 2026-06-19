@@ -27,6 +27,7 @@ hydra-core
 omegaconf
 
 yacs
+fvcore
 
 tensorboard
 

@@ -4,7 +4,7 @@ set -euo pipefail
 METHOD="${1:-}"
 if [[ -z "${METHOD}" ]]; then
   echo "Usage: $0 <method|all>"
-  echo "Methods: panovggt_camera panovggt_depth reloc3r vggt_omega_camera vggt_omega_depth dap panda"
+  echo "Methods: panovggt panovggt_camera panovggt_depth reloc3r vggt_omega vggt_omega_camera vggt_omega_depth dap panda all"
   exit 2
 fi
 
@@ -48,6 +48,97 @@ resolve_conda_sh() {
 
 source "$(resolve_conda_sh)"
 
+check_submodules() {
+  if [[ -f "${ROOT}/.gitmodules" ]]; then
+    echo "[git] initializing submodules"
+    git -C "${ROOT}" submodule update --init --recursive
+  else
+    echo "[git] no git submodules declared"
+  fi
+}
+
+post_install_check() {
+  local method="$1"
+  local method_dir="$2"
+  echo "[env] validating imports for ${method}"
+  case "${method}" in
+    panovggt_camera|panovggt_depth)
+      (cd "${method_dir}" && PYTHONPATH="${COMPARE_ROOT}:${method_dir}:${PYTHONPATH:-}" python - <<'PY'
+import cv2  # noqa: F401
+import hydra  # noqa: F401
+import iopath  # noqa: F401
+import omegaconf  # noqa: F401
+import safetensors  # noqa: F401
+import torch  # noqa: F401
+import torchvision  # noqa: F401
+import fvcore  # noqa: F401
+import panovggt  # noqa: F401
+from training.data.datasets.panocity_paired import PanoCityPairedDataset  # noqa: F401
+print("ok panovggt imports")
+PY
+      )
+      ;;
+    reloc3r)
+      (cd "${method_dir}" && PYTHONPATH="${COMPARE_ROOT}:${method_dir}:${PYTHONPATH:-}" python - <<'PY'
+import cv2  # noqa: F401
+import open3d  # noqa: F401
+import PIL  # noqa: F401
+import torch  # noqa: F401
+import torchvision  # noqa: F401
+import croco  # noqa: F401
+import reloc3r  # noqa: F401
+from reloc3r.datasets.panocity import PanoCityReloc3r  # noqa: F401
+print("ok reloc3r imports")
+PY
+      )
+      ;;
+    vggt_omega_camera|vggt_omega_depth)
+      (cd "${method_dir}" && PYTHONPATH="${COMPARE_ROOT}:${method_dir}:${PYTHONPATH:-}" python - <<'PY'
+import cv2  # noqa: F401
+import safetensors  # noqa: F401
+import torch  # noqa: F401
+import torchvision  # noqa: F401
+import vggt_omega  # noqa: F401
+from common.panocity_paired import PanoCityDepthTorchDataset  # noqa: F401
+from panocity import PanoCityOmegaDataset  # noqa: F401
+print("ok vggt_omega imports")
+PY
+      )
+      ;;
+    dap)
+      (cd "${method_dir}" && PYTHONPATH="${COMPARE_ROOT}:${method_dir}:${PYTHONPATH:-}" python - <<'PY'
+import cv2  # noqa: F401
+import mmengine  # noqa: F401
+import open3d  # noqa: F401
+import pyexr  # noqa: F401
+import safetensors  # noqa: F401
+import tensorboardX  # noqa: F401
+import torch  # noqa: F401
+import torchvision  # noqa: F401
+import networks.dap  # noqa: F401
+from datasets.panocity import PanoCity  # noqa: F401
+print("ok dap imports")
+PY
+      )
+      ;;
+    panda)
+      (cd "${method_dir}" && PYTHONPATH="${COMPARE_ROOT}:${method_dir}:${PYTHONPATH:-}" python - <<'PY'
+import cv2  # noqa: F401
+import mmengine  # noqa: F401
+import open3d  # noqa: F401
+import safetensors  # noqa: F401
+import tensorboardX  # noqa: F401
+import torch  # noqa: F401
+import torchvision  # noqa: F401
+import networks.panda  # noqa: F401
+from datasets.panocity import PanoCity  # noqa: F401
+print("ok panda imports")
+PY
+      )
+      ;;
+  esac
+}
+
 create_env() {
   local method="$1"
   local env_name python_version method_dir
@@ -85,6 +176,7 @@ create_env() {
   if [[ "${method}" == vggt_omega_* ]]; then
     python -m pip install -e "${method_dir}"
   fi
+  post_install_check "${method}" "${method_dir}"
   python - <<'PY'
 import sys
 print("python", sys.version)
@@ -92,10 +184,16 @@ PY
   conda deactivate
 }
 
+check_submodules
+
 if [[ "${METHOD}" == "all" ]]; then
   for m in panovggt_camera reloc3r vggt_omega_camera dap panda; do
     create_env "${m}"
   done
+elif [[ "${METHOD}" == "panovggt" ]]; then
+  create_env panovggt_camera
+elif [[ "${METHOD}" == "vggt_omega" ]]; then
+  create_env vggt_omega_camera
 else
   create_env "${METHOD}"
 fi

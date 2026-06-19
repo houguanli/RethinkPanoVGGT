@@ -55,6 +55,7 @@ def main():
         width=image_size * 2,
         split="smoke" if args.smoke else "train",
         is_training=True,
+        max_samples=8 if args.smoke else train_cfg.get("max_samples"),
         max_depth_meters=float(train_cfg.get("max_depth_meters", 100.0)),
     )
     loader = DataLoader(dataset, batch_size=1 if args.smoke else int(train_cfg.get("batch_size", 1)), shuffle=True, num_workers=0 if args.smoke else int(train_cfg.get("num_workers", 4)))

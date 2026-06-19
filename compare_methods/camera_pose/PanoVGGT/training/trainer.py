@@ -75,6 +75,7 @@ class Trainer:
             loss: Optional[Dict[str, Any]] = None,
             env_variables: Optional[Dict[str, Any]] = None,
             accum_steps: int = 1,
+            run_val_after_train: bool = True,
             **kwargs,
     ):
         """
@@ -96,6 +97,7 @@ class Trainer:
         self.max_epochs = max_epochs
         self.mode = mode
         self.val_epoch_freq = val_epoch_freq
+        self.run_val_after_train = run_val_after_train
         self.limit_train_batches = limit_train_batches
         self.limit_val_batches = limit_val_batches
         self.seed_value = seed_value
@@ -347,7 +349,8 @@ class Trainer:
         assert self.mode in ["train", "val"], f"Invalid mode: {self.mode}"
         if self.mode == "train":
             self.run_train()
-            self.run_val()
+            if self.run_val_after_train:
+                self.run_val()
         elif self.mode == "val":
             self.run_val()
         else:
@@ -443,7 +446,7 @@ class Trainer:
         limit_val_batches = iters_per_epoch if self.limit_val_batches is None else self.limit_val_batches
 
         for data_iter, batch in enumerate(val_loader):
-            if data_iter > limit_val_batches:
+            if data_iter >= limit_val_batches:
                 break
 
             data_time.update(time.time() - end)
@@ -505,7 +508,7 @@ class Trainer:
             self.gradient_clipper.setup_clipping(self.model)
 
         for data_iter, batch in enumerate(train_loader):
-            if data_iter > limit_train_batches:
+            if data_iter >= limit_train_batches:
                 break
 
             data_time.update(time.time() - end)

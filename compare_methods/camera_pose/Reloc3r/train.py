@@ -84,6 +84,8 @@ def get_args_parser():
                         type=int, help='frequence (number of epochs) to save checkpoint in checkpoint-%d.pth')
     parser.add_argument('--print_freq', default=20, 
                         type=int, help='frequence (number of iterations) to print infos while training')
+    parser.add_argument('--max_steps', default=None, type=int,
+                        help='optional maximum number of train iterations for smoke runs')
 
     parser.add_argument('--freeze_encoder', action="store_true", help='freeze encoder')
     
@@ -348,6 +350,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             log_writer.add_scalar('train_iter', epoch_1000x, epoch_1000x)
             for name, val in loss_details.items():
                 log_writer.add_scalar('train_'+name, val, epoch_1000x)
+
+        if args.max_steps is not None and data_iter_step + 1 >= args.max_steps:
+            break
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

@@ -229,17 +229,24 @@ class PanoCityDepthTorchDataset:
         repeat: int = 1,
         is_training: bool = False,
         split: str = "train",
+        max_samples: Optional[int] = None,
         depth_scale: float = 1000.0,
         max_depth_meters: float = 100.0,
     ) -> None:
         import torch
         from torchvision import transforms
 
-        self.index = PanoCityPairedIndex(root=root_dir, split=split if list_file is None else "all")
+        self.index = PanoCityPairedIndex(
+            root=root_dir,
+            split=split if list_file is None else "all",
+            max_samples=max_samples,
+        )
         if list_file:
             self.records = self._records_from_list(root_dir, list_file)
         else:
             self.records = self.index.records
+        if max_samples is not None:
+            self.records = self.records[: int(max_samples)]
         self.records = self.records * max(1, int(repeat))
         self.height = int(height)
         self.width = int(width)

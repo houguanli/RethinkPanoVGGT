@@ -70,31 +70,35 @@ def _run(cmd, cwd: Path, dry_run: bool, timeout_seconds: int | None = None) -> N
         raise subprocess.CalledProcessError(return_code, cmd)
 
 
-def _run_finetune(spec, dry_run: bool, allow_unsupported: bool, timeout_seconds: int | None) -> None:
+def _run_finetune(spec, dry_run: bool, allow_unsupported: bool, timeout_seconds: int | None, smoke: bool = False) -> None:
     _validate_runtime_paths(spec)
     if not spec.supports_native_finetune and not allow_unsupported:
         raise SystemExit(
             f"{spec.name} has no native public finetune implementation in this checkout. "
             "Run with --allow-unsupported-finetune to execute its adapter stub."
         )
-    if not spec.finetune_command:
+    command = spec.smoke_finetune_command if smoke and spec.smoke_finetune_command else spec.finetune_command
+    if not command:
         raise SystemExit(f"No finetune command configured for {spec.name}")
-    print(f"[finetune] method={spec.name}", flush=True)
-    _run(spec.finetune_command, spec.path, dry_run, timeout_seconds)
+    label = "deep_smoke_finetune" if smoke else "finetune"
+    print(f"[{label}] method={spec.name}", flush=True)
+    _run(command, spec.path, dry_run, timeout_seconds)
 
 
-def _run_evaluate(spec, dry_run: bool) -> None:
+def _run_evaluate(spec, dry_run: bool, smoke: bool = False) -> None:
     _validate_runtime_paths(spec)
-    if not spec.evaluate_command:
+    command = spec.smoke_evaluate_command if smoke and spec.smoke_evaluate_command else spec.evaluate_command
+    if not command:
         raise SystemExit(f"No evaluate command configured for {spec.name}")
-    print(f"[evaluate] method={spec.name}", flush=True)
-    _run(spec.evaluate_command, spec.path, dry_run)
+    label = "deep_smoke_evaluate" if smoke else "evaluate"
+    print(f"[{label}] method={spec.name}", flush=True)
+    _run(command, spec.path, dry_run)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", required=True, choices=runnable_names())
-    parser.add_argument("--stage", choices=["finetune", "evaluate", "both", "smoke"], default="both")
+    parser.add_argument("--stage", choices=["finetune", "evaluate", "both", "smoke", "deep_smoke"], default="both")
     parser.add_argument("--panocity-root", default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-unsupported-finetune", action="store_true")
@@ -129,6 +133,18 @@ def main() -> int:
         if args.stage == "smoke":
             return 0
 
+        if args.stage == "deep_smoke":
+            _run_finetune(
+                get_method(group.finetune_method),
+                args.dry_run,
+                args.allow_unsupported_finetune,
+                args.finetune_timeout_seconds,
+                smoke=True,
+            )
+            for method_name in group.evaluate_methods:
+                _run_evaluate(get_method(method_name), args.dry_run, smoke=True)
+            return 0
+
         if args.stage in {"finetune", "both"}:
             _run_finetune(
                 get_method(group.finetune_method),
@@ -146,6 +162,11 @@ def main() -> int:
     print(json.dumps({"method": spec.name, "panocity": summary}, indent=2), flush=True)
 
     if args.stage == "smoke":
+        return 0
+
+    if args.stage == "deep_smoke":
+        _run_finetune(spec, args.dry_run, args.allow_unsupported_finetune, args.finetune_timeout_seconds, smoke=True)
+        _run_evaluate(spec, args.dry_run, smoke=True)
         return 0
 
     if args.stage in {"finetune", "both"}:

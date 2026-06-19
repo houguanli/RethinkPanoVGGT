@@ -21,6 +21,8 @@ class MethodSpec:
     config: Path = Path()
     finetune_command: Optional[List[str]] = None
     evaluate_command: Optional[List[str]] = None
+    smoke_finetune_command: Optional[List[str]] = None
+    smoke_evaluate_command: Optional[List[str]] = None
     supports_native_finetune: bool = True
 
 
@@ -40,7 +42,14 @@ METHODS: Dict[str, MethodSpec] = {
         requirements=[COMPARE_ROOT / "camera_pose" / "PanoVGGT" / "requirements.txt"],
         config=COMPARE_ROOT / "configs" / "panovggt_camera_panocity_4rtx5000.yaml",
         finetune_command=["torchrun", "--standalone", "--nproc_per_node=4", "training/launch.py", "--config", "panocity_4rtx5000"],
-        evaluate_command=["python", "evaluate_panocity.py"],
+        evaluate_command=[
+            "python", "evaluate_panocity.py",
+            "--config", "panocity_4rtx5000",
+            "--checkpoint", "logs/panocity_4rtx5000/ckpts/checkpoint.pt",
+            "--output-dir", "outputs/panocity_4rtx5000/eval",
+        ],
+        smoke_finetune_command=["torchrun", "--standalone", "--nproc_per_node=1", "training/launch.py", "--config", "panocity_smoke"],
+        smoke_evaluate_command=["python", "evaluate_panocity.py", "--stage", "smoke", "--config", "panocity_smoke", "--output-dir", "outputs/panocity_deep_smoke/eval"],
     ),
     "panovggt_depth": MethodSpec(
         name="panovggt_depth",
@@ -49,7 +58,20 @@ METHODS: Dict[str, MethodSpec] = {
         requirements=[COMPARE_ROOT / "depth_geometry" / "PanoVGGT" / "requirements.txt"],
         config=COMPARE_ROOT / "configs" / "panovggt_depth_panocity_4rtx5000.yaml",
         finetune_command=["torchrun", "--standalone", "--nproc_per_node=4", "training/launch.py", "--config", "panocity_4rtx5000"],
-        evaluate_command=["python", "evaluate_panocity.py"],
+        evaluate_command=[
+            "python", "evaluate_panocity.py",
+            "--config", "panocity_4rtx5000",
+            "--checkpoint", "../../camera_pose/PanoVGGT/logs/panocity_4rtx5000/ckpts/checkpoint.pt",
+            "--output-dir", "outputs/panocity_4rtx5000/eval",
+        ],
+        smoke_finetune_command=["torchrun", "--standalone", "--nproc_per_node=1", "training/launch.py", "--config", "panocity_smoke"],
+        smoke_evaluate_command=[
+            "python", "evaluate_panocity.py",
+            "--stage", "smoke",
+            "--config", "panocity_smoke",
+            "--checkpoint", "../../camera_pose/PanoVGGT/outputs/panocity_deep_smoke/ckpts/checkpoint.pt",
+            "--output-dir", "outputs/panocity_deep_smoke/eval",
+        ],
     ),
     "reloc3r": MethodSpec(
         name="reloc3r",
@@ -62,6 +84,17 @@ METHODS: Dict[str, MethodSpec] = {
         config=COMPARE_ROOT / "configs" / "reloc3r_panocity_4rtx5000.yaml",
         finetune_command=["python", "finetune_panocity.py"],
         evaluate_command=["python", "evaluate_panocity.py"],
+        smoke_finetune_command=[
+            "python", "train.py",
+            "--train_dataset", "PanoCityReloc3r(split='smoke', resolution=512, max_samples=8)",
+            "--test_dataset", "PanoCityReloc3r(split='smoke', resolution=512, max_samples=4)",
+            "--epochs", "1", "--batch_size", "1", "--num_workers", "0",
+            "--eval_freq", "0", "--save_freq", "1", "--keep_freq", "0", "--print_freq", "1",
+            "--max_steps", "2",
+            "--pretrained", "../../../ckpt/Reloc3r-512/Reloc3r-512.pth",
+            "--output_dir", "outputs/panocity_deep_smoke",
+        ],
+        smoke_evaluate_command=["python", "evaluate_panocity.py", "--stage", "smoke"],
     ),
     "vggt_omega_camera": MethodSpec(
         name="vggt_omega_camera",
@@ -72,6 +105,8 @@ METHODS: Dict[str, MethodSpec] = {
         config=COMPARE_ROOT / "configs" / "vggt_omega_camera_panocity_4rtx5000.yaml",
         finetune_command=["torchrun", "--standalone", "--nproc_per_node=4", "train_panocity.py", "--config", "../../configs/vggt_omega_camera_panocity_4rtx5000.yaml", "--checkpoint", "../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt", "--output-dir", "outputs/panocity_4rtx5000"],
         evaluate_command=["python", "evaluate_panocity.py"],
+        smoke_finetune_command=["python", "train_panocity.py", "--config", "../../configs/vggt_omega_camera_panocity_4rtx5000.yaml", "--checkpoint", "../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt", "--output-dir", "outputs/panocity_deep_smoke", "--smoke", "--max-steps", "2"],
+        smoke_evaluate_command=["python", "evaluate_panocity.py", "--stage", "smoke"],
     ),
     "vggt_omega_depth": MethodSpec(
         name="vggt_omega_depth",
@@ -82,6 +117,8 @@ METHODS: Dict[str, MethodSpec] = {
         config=COMPARE_ROOT / "configs" / "vggt_omega_depth_panocity_4rtx5000.yaml",
         finetune_command=["torchrun", "--standalone", "--nproc_per_node=4", "train_panocity.py", "--config", "../../configs/vggt_omega_depth_panocity_4rtx5000.yaml", "--checkpoint", "../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt", "--output-dir", "outputs/panocity_4rtx5000"],
         evaluate_command=["python", "evaluate_panocity.py"],
+        smoke_finetune_command=["python", "train_panocity.py", "--config", "../../configs/vggt_omega_depth_panocity_4rtx5000.yaml", "--checkpoint", "../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt", "--output-dir", "outputs/panocity_deep_smoke", "--smoke", "--max-steps", "2"],
+        smoke_evaluate_command=["python", "evaluate_panocity.py", "--stage", "smoke"],
     ),
     "dap": MethodSpec(
         name="dap",
@@ -91,6 +128,8 @@ METHODS: Dict[str, MethodSpec] = {
         config=COMPARE_ROOT / "configs" / "dap_panocity_4rtx5000.yaml",
         finetune_command=["torchrun", "--standalone", "--nproc_per_node=4", "train_panocity.py", "--config", "config/train_panocity_4rtx5000.yaml", "--output-dir", "outputs/panocity_4rtx5000"],
         evaluate_command=["python", "evaluate_panocity.py"],
+        smoke_finetune_command=["python", "train_panocity.py", "--config", "config/train_panocity_4rtx5000.yaml", "--output-dir", "outputs/panocity_deep_smoke", "--smoke", "--max-steps", "2"],
+        smoke_evaluate_command=["python", "evaluate_panocity.py", "--stage", "smoke"],
     ),
     "panda": MethodSpec(
         name="panda",
@@ -100,6 +139,8 @@ METHODS: Dict[str, MethodSpec] = {
         config=COMPARE_ROOT / "configs" / "panda_panocity_4rtx5000.yaml",
         finetune_command=["python", "train_metric_depth/train.py", "--config", "config/metric_depth/train_panocity_4rtx5000.yaml", "--name", "panocity_4rtx5000", "--gpu", "0,1,2,3"],
         evaluate_command=["python", "evaluate_panocity.py"],
+        smoke_finetune_command=["python", "train_metric_depth/train.py", "--config", "config/metric_depth/train_panocity_4rtx5000.yaml", "--name", "panocity_deep_smoke", "--gpu", "0", "--smoke", "--max-steps", "2", "--output-dir", "outputs/panocity_deep_smoke"],
+        smoke_evaluate_command=["python", "evaluate_panocity.py", "--stage", "smoke"],
     ),
 }
 

@@ -1,0 +1,53 @@
+defaults:
+  - panocity_4rtx5000
+  - _self_
+
+exp_name: panocity_deep_smoke
+num_workers: 0
+max_epochs: 1
+limit_train_batches: 1
+limit_val_batches: 1
+run_val_after_train: false
+max_img_per_gpu: 2
+max_img_per_gpu_val: 2
+accum_steps: 1
+val_epoch_freq: 1
+
+logging:
+  log_dir: outputs/panocity_deep_smoke/logs
+
+checkpoint:
+  resume_checkpoint_path: ../../../ckpt/PanoVGGT/model.pt
+  save_dir: outputs/panocity_deep_smoke/ckpts
+  save_freq: 0
+  strict: False
+
+optim:
+  amp:
+    enabled: false
+
+model:
+  aggregator:
+    load_dinov2_pretrained: false
+    allow_dinov2_download: false
+
+data:
+  train:
+    common_config:
+      img_nums: [2, 2]
+      max_img_per_gpu: 2
+    dataset:
+      dataset_configs:
+        - _target_: training.data.datasets.panocity_paired.PanoCityPairedDataset
+          root: ${oc.env:PANOCITY_ROOT,../PanoCity_paired}
+          split: smoke
+          max_samples: 8
+  val:
+    common_config:
+      img_nums: [2, 2]
+    dataset:
+      dataset_configs:
+        - _target_: training.data.datasets.panocity_paired.PanoCityPairedDataset
+          root: ${oc.env:PANOCITY_ROOT,../PanoCity_paired}
+          split: smoke
+          max_samples: 8

@@ -55,6 +55,7 @@ def build_dataset(config: Dict, split: str, smoke: bool = False):
         repeat=args.get("repeat", 1),
         is_training=(split == "train"),
         split="smoke" if smoke else ("train" if split == "train" else "test"),
+        max_samples=8 if smoke else args.get("max_samples"),
         depth_scale=args.get("depth_scale", 1000.0),
         max_depth_meters=args.get("max_depth_meters", 100.0),
     )

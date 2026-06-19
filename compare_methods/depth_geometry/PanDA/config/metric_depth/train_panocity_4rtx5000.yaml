@@ -3,8 +3,8 @@ train_dataset:
   root_path:
   list_path:
   args:
-    height: 512
-    width: 1024
+    height: 518
+    width: 1036
     repeat: 1
     augment_color: True
     augment_flip: True
@@ -17,8 +17,8 @@ val_dataset:
   root_path:
   list_path:
   args:
-    height: 512
-    width: 1024
+    height: 518
+    width: 1036
     repeat: 1
     augment_color: False
     augment_flip: False
