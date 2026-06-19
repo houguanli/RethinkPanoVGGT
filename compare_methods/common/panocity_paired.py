@@ -22,6 +22,9 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 
+DEFAULT_TRAIN_COUNT = 200_000
+
+
 @dataclass(frozen=True)
 class PanoCityRecord:
     pair_idx: int
@@ -67,30 +70,46 @@ def resolve_panocity_root(root: Optional[str] = None, start: Optional[Path] = No
 
 
 class PanoCityPairedIndex:
-    """Lightweight CSV-backed index for PanoCity paired samples."""
+    """Lightweight CSV-backed index for PanoCity paired samples.
+
+    Split policy is shared by all compare-method adapters: records are ordered
+    by pair_idx, the first PANOCITY_TRAIN_COUNT samples are train, and the
+    remaining samples are test/validation.
+    """
 
     def __init__(
         self,
         root: Optional[str] = None,
         pairs_file: str = "pairs.csv",
         split: str = "train",
-        train_ratio: float = 0.9,
-        val_ratio: float = 0.05,
-        split_seed: int = 42,
+        train_count: Optional[int] = None,
+        train_ratio: Optional[float] = None,
+        val_ratio: Optional[float] = None,
+        split_seed: Optional[int] = None,
         max_samples: Optional[int] = None,
         start: Optional[Path] = None,
     ) -> None:
         self.root = resolve_panocity_root(root, start=start)
         self.pairs_path = self.root / pairs_file
         self.split = split
+        self.train_count = self._resolve_train_count(train_count)
+        # Kept for compatibility with older configs; split is now count-based.
+        self.train_ratio = train_ratio
+        self.val_ratio = val_ratio
+        self.split_seed = split_seed
         quick_limit = int(max_samples) if max_samples is not None and split in {"smoke", "all"} else None
         self.records = self._load_records(limit=quick_limit)
+        self.total_records = len(self.records)
         if quick_limit is None:
-            self.records = self._select_split(self.records, split, train_ratio, val_ratio, split_seed)
+            self.records = self._select_split(self.records, split, self.train_count)
             if max_samples is not None:
                 self.records = self.records[: int(max_samples)]
         if not self.records:
-            raise RuntimeError(f"No PanoCity records selected for split={split} from {self.pairs_path}")
+            raise RuntimeError(
+                f"No PanoCity records selected for split={split} from {self.pairs_path}. "
+                f"total_records={self.total_records}, train_count={self.train_count}. "
+                "For smaller local copies, set PANOCITY_TRAIN_COUNT below the total record count."
+            )
 
     def __len__(self) -> int:
         return len(self.records)
@@ -127,28 +146,27 @@ class PanoCityPairedIndex:
         return records
 
     @staticmethod
-    def _select_split(
-        records: Sequence[PanoCityRecord],
-        split: str,
-        train_ratio: float,
-        val_ratio: float,
-        seed: int,
-    ) -> List[PanoCityRecord]:
-        indices = list(range(len(records)))
-        random.Random(seed).shuffle(indices)
-        n_train = int(len(indices) * train_ratio)
-        n_val = int(len(indices) * val_ratio)
+    def _resolve_train_count(train_count: Optional[int]) -> int:
+        raw_value = os.environ.get("PANOCITY_TRAIN_COUNT")
+        value = int(raw_value) if raw_value else (DEFAULT_TRAIN_COUNT if train_count is None else int(train_count))
+        if value <= 0:
+            raise ValueError("PANOCITY_TRAIN_COUNT/train_count must be positive")
+        return value
+
+    @staticmethod
+    def _select_split(records: Sequence[PanoCityRecord], split: str, train_count: int) -> List[PanoCityRecord]:
+        ordered = sorted(records, key=lambda record: record.pair_idx)
+        n_train = min(int(train_count), len(ordered))
         if split == "train":
-            selected = indices[:n_train]
+            return list(ordered[:n_train])
         elif split in {"val", "valid", "validation", "test"}:
-            selected = indices[n_train : n_train + n_val]
+            return list(ordered[n_train:])
         elif split in {"test_final", "holdout"}:
-            selected = indices[n_train + n_val :]
+            return list(ordered[n_train:])
         elif split in {"all", "smoke"}:
-            selected = indices
+            return list(ordered)
         else:
             raise ValueError(f"Unsupported PanoCity split: {split}")
-        return [records[i] for i in selected]
 
     def write_list_file(self, path: str | Path) -> Path:
         """Write `rgb_rel depth_rel` lines for methods that expect list files."""

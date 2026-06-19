@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-METHODS="${1:-panovggt_camera,panovggt_depth,reloc3r,vggt_omega_camera,vggt_omega_depth,dap,panda}"
+METHODS="${1:-panovggt,reloc3r,vggt_omega,dap,panda}"
 STAGE="${STAGE:-both}"
 DRY_RUN="${DRY_RUN:-0}"
 ALLOW_UNSUPPORTED="${ALLOW_UNSUPPORTED:-0}"
@@ -66,9 +66,9 @@ resolve_finetune_timeout_seconds() {
 
 env_for_method() {
   case "$1" in
-    panovggt_camera|panovggt_depth) echo cmp_panovggt;;
+    panovggt|panovggt_camera|panovggt_depth) echo cmp_panovggt;;
     reloc3r) echo cmp_reloc3r;;
-    vggt_omega_camera|vggt_omega_depth) echo cmp_vggt_omega;;
+    vggt_omega|vggt_omega_camera|vggt_omega_depth) echo cmp_vggt_omega;;
     dap) echo cmp_dap;;
     panda) echo cmp_panda;;
     *) echo "unknown";;

@@ -24,6 +24,14 @@ class MethodSpec:
     supports_native_finetune: bool = True
 
 
+@dataclass(frozen=True)
+class MethodGroup:
+    name: str
+    env_name: str
+    finetune_method: str
+    evaluate_methods: List[str]
+
+
 METHODS: Dict[str, MethodSpec] = {
     "panovggt_camera": MethodSpec(
         name="panovggt_camera",
@@ -32,7 +40,7 @@ METHODS: Dict[str, MethodSpec] = {
         requirements=[COMPARE_ROOT / "camera_pose" / "PanoVGGT" / "requirements.txt"],
         config=COMPARE_ROOT / "configs" / "panovggt_camera_panocity_4rtx5000.yaml",
         finetune_command=["torchrun", "--standalone", "--nproc_per_node=4", "training/launch.py", "--config", "panocity_4rtx5000"],
-        evaluate_command=["python", "inference.py", "--help"],
+        evaluate_command=["python", "evaluate_panocity.py"],
     ),
     "panovggt_depth": MethodSpec(
         name="panovggt_depth",
@@ -41,7 +49,7 @@ METHODS: Dict[str, MethodSpec] = {
         requirements=[COMPARE_ROOT / "depth_geometry" / "PanoVGGT" / "requirements.txt"],
         config=COMPARE_ROOT / "configs" / "panovggt_depth_panocity_4rtx5000.yaml",
         finetune_command=["torchrun", "--standalone", "--nproc_per_node=4", "training/launch.py", "--config", "panocity_4rtx5000"],
-        evaluate_command=["python", "inference.py", "--help"],
+        evaluate_command=["python", "evaluate_panocity.py"],
     ),
     "reloc3r": MethodSpec(
         name="reloc3r",
@@ -96,8 +104,50 @@ METHODS: Dict[str, MethodSpec] = {
 }
 
 
+GROUPS: Dict[str, MethodGroup] = {
+    "panovggt": MethodGroup(
+        name="panovggt",
+        env_name="cmp_panovggt",
+        finetune_method="panovggt_camera",
+        evaluate_methods=["panovggt_camera", "panovggt_depth"],
+    ),
+    "reloc3r": MethodGroup(
+        name="reloc3r",
+        env_name="cmp_reloc3r",
+        finetune_method="reloc3r",
+        evaluate_methods=["reloc3r"],
+    ),
+    "vggt_omega": MethodGroup(
+        name="vggt_omega",
+        env_name="cmp_vggt_omega",
+        finetune_method="vggt_omega_camera",
+        evaluate_methods=["vggt_omega_camera", "vggt_omega_depth"],
+    ),
+    "dap": MethodGroup(
+        name="dap",
+        env_name="cmp_dap",
+        finetune_method="dap",
+        evaluate_methods=["dap"],
+    ),
+    "panda": MethodGroup(
+        name="panda",
+        env_name="cmp_panda",
+        finetune_method="panda",
+        evaluate_methods=["panda"],
+    ),
+}
+
+
 def method_names() -> List[str]:
     return sorted(METHODS)
+
+
+def group_names() -> List[str]:
+    return sorted(GROUPS)
+
+
+def runnable_names() -> List[str]:
+    return sorted(set(method_names()) | set(group_names()))
 
 
 def get_method(name: str) -> MethodSpec:
@@ -105,3 +155,14 @@ def get_method(name: str) -> MethodSpec:
         return METHODS[name]
     except KeyError as exc:
         raise SystemExit(f"Unknown method '{name}'. Available: {', '.join(method_names())}") from exc
+
+
+def get_group(name: str) -> MethodGroup:
+    try:
+        return GROUPS[name]
+    except KeyError as exc:
+        raise SystemExit(f"Unknown method group '{name}'. Available: {', '.join(group_names())}") from exc
+
+
+def is_group(name: str) -> bool:
+    return name in GROUPS
