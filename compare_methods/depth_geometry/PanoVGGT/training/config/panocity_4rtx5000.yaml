@@ -1,5 +1,6 @@
 defaults:
   - default.yaml
+  - _self_
 
 exp_name: panocity_4rtx5000
 img_size: 518
@@ -17,6 +18,11 @@ hardware:
 
 logging:
   log_dir: logs
+
+model:
+  aggregator:
+    dinov2_weights_path: ${oc.env:DINOV2_WEIGHTS_PATH,''}
+    allow_dinov2_download: false
 
 data:
   train:

@@ -51,6 +51,9 @@ class Aggregator(nn.Module):
         num_dec_blk_not_to_checkpoint: int = 4,
         use_checkpoint: bool = True,
         patch_embed: str = "dinov2_vitl14_reg",
+        dinov2_weights_path: Optional[str] = None,
+        load_dinov2_pretrained: bool = True,
+        allow_dinov2_download: bool = True,
         use_pano_pos: bool = True,
         pos_mlp_hidden: int = 1024,
     ):
@@ -71,6 +74,9 @@ class Aggregator(nn.Module):
             patch_size=patch_size,
             num_register_tokens=num_register_tokens,
             embed_dim=embed_dim,
+            dinov2_weights_path=dinov2_weights_path,
+            load_dinov2_pretrained=load_dinov2_pretrained,
+            allow_dinov2_download=allow_dinov2_download,
         )
 
         # 2) RoPE (relative position encoding within attention)
@@ -140,6 +146,9 @@ class Aggregator(nn.Module):
         interpolate_offset: float = 0.0,
         block_chunks: int = 0,
         init_values: float = 1.0,
+        dinov2_weights_path: Optional[str] = None,
+        load_dinov2_pretrained: bool = True,
+        allow_dinov2_download: bool = True,
     ):
         if "conv" in patch_embed:
             self.patch_embed = PatchEmbed(
@@ -173,8 +182,16 @@ class Aggregator(nn.Module):
             init_values=init_values,
         )
 
-        # Attempt to load DINOv2 pretrained weights
-        self._try_load_dinov2(hub_name, vit_url_map.get(patch_embed), patch_embed)
+        if load_dinov2_pretrained:
+            self._try_load_dinov2(
+                hub_name,
+                vit_url_map.get(patch_embed),
+                patch_embed,
+                dinov2_weights_path,
+                allow_dinov2_download=allow_dinov2_download,
+            )
+        else:
+            logger.info("Skipping DINOv2 pretrained weight loading by config")
 
         self.patch_embed_dim = vit_dim
         self.needs_projection = vit_dim != self.dec_embed_dim
@@ -184,25 +201,70 @@ class Aggregator(nn.Module):
         if hasattr(self.patch_embed, "mask_token"):
             delattr(self.patch_embed, "mask_token")
 
-    def _try_load_dinov2(self, hub_name: str, url: Optional[str], patch_embed_key: str):
-        """Try loading DINOv2 weights via torch.hub, then fallback to direct download."""
+    def _try_load_dinov2(
+        self,
+        hub_name: str,
+        url: Optional[str],
+        patch_embed_key: str,
+        weights_path: Optional[str] = None,
+        allow_dinov2_download: bool = True,
+    ):
+        """Try loading DINOv2 weights from local path, torch.hub, then direct download."""
         success = False
         model_dict = self.patch_embed.state_dict()
+        weights_path = weights_path or os.environ.get("DINOV2_WEIGHTS_PATH")
+
+        # Method 0: explicit local checkpoint
+        if weights_path:
+            try:
+                local_path = Path(os.path.expanduser(os.path.expandvars(weights_path)))
+                logger.info(f"Loading DINOv2 weights for {hub_name} from {local_path}")
+                state = torch.load(local_path, map_location="cpu")
+                if "teacher" in state:
+                    state = state["teacher"]
+                if "model" in state:
+                    state = state["model"]
+                if "state_dict" in state:
+                    state = state["state_dict"]
+                state = {
+                    k.removeprefix("module.")
+                    .removeprefix("backbone.")
+                    .removeprefix("patch_embed.")
+                    .removeprefix("aggregator.patch_embed."): v
+                    for k, v in state.items()
+                }
+                matched = {k: v for k, v in state.items() if k in model_dict and v.shape == model_dict[k].shape}
+                logger.info(f"Matched {len(matched)}/{len(model_dict)} layers from local DINOv2 weights")
+                model_dict.update(matched)
+                self.patch_embed.load_state_dict(model_dict)
+                success = bool(matched)
+            except Exception as e:
+                logger.warning(f"Local DINOv2 load failed from {weights_path}: {e}")
+                if not allow_dinov2_download:
+                    raise
+
+        if weights_path and not success and not allow_dinov2_download:
+            raise RuntimeError(f"No compatible DINOv2 weights matched from {weights_path}")
+
+        if not success and not allow_dinov2_download:
+            logger.info("Skipping DINOv2 torch.hub/direct download by config")
+            return
 
         # Method 1: torch.hub
-        try:
-            logger.info(f"Loading DINOv2 weights for {hub_name} via torch.hub")
-            pretrained = torch.hub.load("facebookresearch/dinov2", hub_name)
-            matched = {
-                k: v for k, v in pretrained.state_dict().items()
-                if k in model_dict and v.shape == model_dict[k].shape
-            }
-            logger.info(f"Matched {len(matched)}/{len(model_dict)} layers from torch.hub")
-            model_dict.update(matched)
-            self.patch_embed.load_state_dict(model_dict)
-            success = True
-        except Exception as e:
-            logger.warning(f"torch.hub load failed: {e}")
+        if not success:
+            try:
+                logger.info(f"Loading DINOv2 weights for {hub_name} via torch.hub")
+                pretrained = torch.hub.load("facebookresearch/dinov2", hub_name)
+                matched = {
+                    k: v for k, v in pretrained.state_dict().items()
+                    if k in model_dict and v.shape == model_dict[k].shape
+                }
+                logger.info(f"Matched {len(matched)}/{len(model_dict)} layers from torch.hub")
+                model_dict.update(matched)
+                self.patch_embed.load_state_dict(model_dict)
+                success = True
+            except Exception as e:
+                logger.warning(f"torch.hub load failed: {e}")
 
         # Method 2: Direct download
         if not success and url:
