@@ -22,7 +22,7 @@ logging:
 model:
   aggregator:
     dinov2_weights_path: ${oc.env:DINOV2_WEIGHTS_PATH,''}
-    allow_dinov2_download: false
+    allow_dinov2_download: ${oc.env:DINOV2_ALLOW_DOWNLOAD,false}
 
 data:
   train:

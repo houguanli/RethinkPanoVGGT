@@ -161,16 +161,16 @@ class Aggregator(nn.Module):
             return
 
         vit_registry = {
-            "dinov2_vitl14_reg": (vit_large, 1024, "dinov2_vitl14"),
-            "dinov2_vitb14_reg": (vit_base, 768, "dinov2_vitb14"),
-            "dinov2_vits14_reg": (vit_small, 384, "dinov2_vits14"),
-            "dinov2_vitg2_reg": (vit_giant2, 1536, "dinov2_vitg14"),
+            "dinov2_vitl14_reg": (vit_large, 1024, "dinov2_vitl14_reg"),
+            "dinov2_vitb14_reg": (vit_base, 768, "dinov2_vitb14_reg"),
+            "dinov2_vits14_reg": (vit_small, 384, "dinov2_vits14_reg"),
+            "dinov2_vitg2_reg": (vit_giant2, 1536, "dinov2_vitg14_reg"),
         }
         vit_url_map = {
-            "dinov2_vitl14_reg": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth",
-            "dinov2_vitb14_reg": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_pretrain.pth",
-            "dinov2_vits14_reg": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth",
-            "dinov2_vitg2_reg": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitg14/dinov2_vitg14_pretrain.pth",
+            "dinov2_vitl14_reg": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_reg4_pretrain.pth",
+            "dinov2_vitb14_reg": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth",
+            "dinov2_vits14_reg": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_reg4_pretrain.pth",
+            "dinov2_vitg2_reg": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitg14/dinov2_vitg14_reg4_pretrain.pth",
         }
 
         vit_fn, vit_dim, hub_name = vit_registry[patch_embed]
@@ -214,6 +214,9 @@ class Aggregator(nn.Module):
         success = False
         model_dict = self.patch_embed.state_dict()
         weights_path = weights_path or os.environ.get("DINOV2_WEIGHTS_PATH")
+        allow_dinov2_download = self._as_bool(
+            os.environ.get("DINOV2_ALLOW_DOWNLOAD", allow_dinov2_download)
+        )
 
         # Method 0: explicit local checkpoint
         if weights_path:
@@ -264,11 +267,11 @@ class Aggregator(nn.Module):
                 local_path = weights_dir / f"{patch_embed_key}_pretrain.pth"
                 if not local_path.exists():
                     r = requests.get(url, allow_redirects=True)
+                    r.raise_for_status()
                     with open(local_path, "wb") as f:
                         f.write(r.content)
                 state = torch.load(local_path, map_location="cpu")
-                if "teacher" in state:
-                    state = state["teacher"]
+                state = self._normalize_local_dinov2_state(state)
                 matched = {
                     k: v for k, v in state.items()
                     if k in model_dict and v.shape == model_dict[k].shape
@@ -285,6 +288,17 @@ class Aggregator(nn.Module):
             logger.info("DINOv2 weights loaded; parameters set to trainable")
         else:
             logger.warning("Could not load DINOv2 pretrained weights; using random init")
+
+    @staticmethod
+    def _as_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        value = str(value).strip().lower()
+        return value in {"1", "true", "yes", "y", "on"}
 
     @staticmethod
     def _resolve_local_dinov2_path(weights_path: str) -> Path:
