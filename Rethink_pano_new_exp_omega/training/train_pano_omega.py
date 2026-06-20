@@ -100,10 +100,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fov-degrees", type=float, default=75.0)
     parser.add_argument("--pano-height", type=int, default=0, help="Optional resize height before sampling.")
     parser.add_argument("--pano-width", type=int, default=0, help="Optional resize width before sampling.")
+    parser.add_argument(
+        "--luna-patch-layers",
+        type=str,
+        default="second_half",
+        help="LUNA patch adapter layers: second_half, final, none, or comma-separated layer indices.",
+    )
+    parser.add_argument(
+        "--luna-camera-layers",
+        type=str,
+        default="23",
+        help="LUNA camera adapter layers: final, none, or comma-separated layer indices.",
+    )
 
     parser.add_argument(
         "--trainable",
-        choices=["luna", "dense", "camera", "heads", "luna_dense", "luna_heads", "all"],
+        choices=[
+            "luna",
+            "dense",
+            "camera",
+            "heads",
+            "luna_dense",
+            "luna_heads",
+            "luna_dense_tail",
+            "luna_residual",
+            "luna_residual_dense",
+            "luna_residual_dense_tail",
+            "all",
+        ],
         default="luna_heads",
     )
     parser.add_argument("--strict-checkpoint", action="store_true")
@@ -149,6 +173,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Optional learning rate for --learn-pred-depth-scale; defaults to --lr.",
+    )
+    parser.add_argument(
+        "--depth-residual-mode",
+        choices=["none", "log_conv"],
+        default="none",
+        help="Optional residual depth adapter: final_depth = raw_depth * exp(delta_log_depth).",
+    )
+    parser.add_argument(
+        "--depth-residual-hidden",
+        type=int,
+        default=32,
+        help="Hidden channels for --depth-residual-mode=log_conv.",
+    )
+    parser.add_argument(
+        "--depth-residual-max-log",
+        type=float,
+        default=0.5,
+        help="Clamp residual log-depth correction to +/- this value.",
     )
     parser.add_argument(
         "--gt-depth-semantics",
@@ -294,9 +336,17 @@ def train(args: argparse.Namespace) -> None:
             load_checkpoint(model, args.checkpoint, strict=args.strict_checkpoint)
 
         trainable_count, frozen_count = configure_trainable(model, args.trainable)
-        if args.learn_pred_depth_scale:
-            model = LearnablePredDepthScale(model, initial_scale=args.pred_depth_scale).to(device)
-            trainable_count += 1
+        if args.learn_pred_depth_scale or args.depth_residual_mode != "none":
+            model = DepthPredictionAdapter(
+                model,
+                initial_scale=args.pred_depth_scale,
+                learn_scale=args.learn_pred_depth_scale,
+                residual_mode=args.depth_residual_mode,
+                residual_hidden=args.depth_residual_hidden,
+                residual_max_log=args.depth_residual_max_log,
+            ).to(device)
+            trainable_count = sum(param.numel() for param in model.parameters() if param.requires_grad)
+            frozen_count = sum(param.numel() for param in model.parameters() if not param.requires_grad)
         if dist_state["distributed"]:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
@@ -310,8 +360,12 @@ def train(args: argparse.Namespace) -> None:
         rank0_print(f"[INFO] dataset_format = {args.dataset_format}", dist_state)
         rank0_print(f"[INFO] samples = {len(dataset)}", dist_state)
         rank0_print(
-            "[INFO] pano_sampling = "
-            f"{args.pano_sample_mode} min={args.pano_min_count} max={args.pano_max_count} grouping={args.pano_grouping}",
+        "[INFO] pano_sampling = "
+        f"{args.pano_sample_mode} min={args.pano_min_count} max={args.pano_max_count} grouping={args.pano_grouping}",
+        dist_state,
+        )
+        rank0_print(
+            f"[INFO] luna_layers = patch:{args.luna_patch_layers} camera:{args.luna_camera_layers}",
             dist_state,
         )
         rank0_print(
@@ -322,6 +376,12 @@ def train(args: argparse.Namespace) -> None:
         )
         rank0_print(f"[INFO] pred_depth_scale = {args.pred_depth_scale}", dist_state)
         rank0_print(f"[INFO] learn_pred_depth_scale = {args.learn_pred_depth_scale}", dist_state)
+        rank0_print(
+            "[INFO] depth_residual = "
+            f"{args.depth_residual_mode} hidden={args.depth_residual_hidden} "
+            f"max_log={args.depth_residual_max_log}",
+            dist_state,
+        )
         rank0_print(
             "[INFO] depth_loss = "
             f"{args.depth_loss_mode} huber_delta={args.depth_log_huber_delta} "
@@ -438,19 +498,77 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
     raise ValueError(f"Unknown dataset_format: {args.dataset_format}")
 
 
-class LearnablePredDepthScale(torch.nn.Module):
-    """Wrap a VGGT-Omega model with a learnable positive depth scale."""
+class DepthPredictionAdapter(torch.nn.Module):
+    """Wrap VGGT-Omega with optional positive scale and log-depth residual.
 
-    def __init__(self, model: VGGTOmega_LUNA, initial_scale: float) -> None:
+    The residual path is initialized to identity:
+
+        final_depth = raw_depth * exp(clamp(delta_log_depth)).
+
+    It uses sampled pano windows plus raw predicted log depth, so it learns a
+    small correction around the pretrained Omega depth instead of replacing it.
+    """
+
+    def __init__(
+        self,
+        model: VGGTOmega_LUNA,
+        initial_scale: float,
+        learn_scale: bool = False,
+        residual_mode: str = "none",
+        residual_hidden: int = 32,
+        residual_max_log: float = 0.5,
+    ) -> None:
         super().__init__()
         if initial_scale <= 0:
             raise ValueError(f"initial pred_depth_scale must be positive, got {initial_scale}")
         self.model = model
-        self.pred_depth_log_scale = torch.nn.Parameter(torch.tensor(math.log(float(initial_scale)), dtype=torch.float32))
+        self.learn_scale = bool(learn_scale)
+        self.residual_mode = residual_mode
+        self.residual_max_log = float(residual_max_log)
+        log_scale = torch.tensor(math.log(float(initial_scale)), dtype=torch.float32)
+        if self.learn_scale:
+            self.pred_depth_log_scale = torch.nn.Parameter(log_scale)
+        else:
+            self.register_buffer("pred_depth_log_scale", log_scale)
+
+        if residual_mode == "none":
+            self.depth_residual_head = None
+        elif residual_mode == "log_conv":
+            hidden = max(4, int(residual_hidden))
+            self.depth_residual_head = torch.nn.Sequential(
+                torch.nn.Conv2d(4, hidden, kernel_size=3, padding=1),
+                torch.nn.SiLU(inplace=True),
+                torch.nn.Conv2d(hidden, hidden, kernel_size=3, padding=1),
+                torch.nn.SiLU(inplace=True),
+                torch.nn.Conv2d(hidden, 1, kernel_size=1),
+            )
+            final = self.depth_residual_head[-1]
+            torch.nn.init.zeros_(final.weight)
+            torch.nn.init.zeros_(final.bias)
+        else:
+            raise ValueError(f"Unknown depth residual mode: {residual_mode}")
 
     def forward(self, *args, **kwargs) -> Dict:
         predictions = dict(self.model(*args, **kwargs))
         predictions["_pred_depth_scale"] = self.pred_depth_scale()
+        if self.depth_residual_head is None:
+            return predictions
+
+        raw_depth = predictions["depth"].float().clamp_min(1e-4)
+        windows = predictions.get("pano_windows")
+        if windows is None:
+            return predictions
+        batch_size, num_views, _, height, width = windows.shape
+        rgb = windows.reshape(batch_size * num_views, 3, height, width).float()
+        log_depth = torch.log(raw_depth).permute(0, 1, 4, 2, 3).reshape(batch_size * num_views, 1, height, width)
+        residual_input = torch.cat([rgb, log_depth], dim=1)
+        delta = self.depth_residual_head(residual_input)
+        if self.residual_max_log > 0:
+            delta = torch.tanh(delta) * self.residual_max_log
+        delta = delta.reshape(batch_size, num_views, 1, height, width).permute(0, 1, 3, 4, 2)
+        predictions["raw_depth"] = predictions["depth"]
+        predictions["depth_log_residual"] = delta
+        predictions["depth"] = raw_depth * torch.exp(delta.float())
         return predictions
 
     def pred_depth_scale(self) -> torch.Tensor:
@@ -462,6 +580,9 @@ class LearnablePredDepthScale(torch.nn.Module):
     @property
     def pano_sampler(self):
         return self.model.pano_sampler
+
+
+LearnablePredDepthScale = DepthPredictionAdapter
 
 
 def build_optimizer(model: torch.nn.Module, args: argparse.Namespace) -> torch.optim.Optimizer:
@@ -544,8 +665,8 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
             enable_alignment=False,
             enable_pano_global_token=True,
             enable_luna=True,
-            luna_patch_layers=[23],
-            luna_camera_layers=[23],
+            luna_patch_layers=args.luna_patch_layers,
+            luna_camera_layers=args.luna_camera_layers,
             sampler=sampler,
             aggregator_kwargs={
                 "depth": 24,
@@ -578,8 +699,8 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
         enable_alignment=False,
         enable_pano_global_token=True,
         enable_luna=True,
-        luna_patch_layers="second_half",
-        luna_camera_layers=[23],
+        luna_patch_layers=args.luna_patch_layers,
+        luna_camera_layers=args.luna_camera_layers,
         sampler=sampler,
         checkpoint_path=None,
     )
@@ -651,7 +772,7 @@ def train_step(
     optimizer.step()
     logged_pred_depth_scale = pred_depth_scale.detach()
     unwrapped_model = unwrap_model(model)
-    if isinstance(unwrapped_model, LearnablePredDepthScale):
+    if isinstance(unwrapped_model, DepthPredictionAdapter):
         logged_pred_depth_scale = unwrapped_model.pred_depth_scale().detach()
     return {
         "loss": loss.detach(),
@@ -936,7 +1057,15 @@ def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace
     pred_depth_scale = current_pred_depth_scale(model, args)
     args_payload = vars(args).copy()
     args_payload["pred_depth_scale"] = pred_depth_scale
-    checkpoint_model = model.model if isinstance(model, LearnablePredDepthScale) else model
+    adapter_state = None
+    checkpoint_model = model
+    if isinstance(model, DepthPredictionAdapter):
+        checkpoint_model = model.model
+        adapter_state = {
+            key: value.detach().cpu()
+            for key, value in model.state_dict().items()
+            if not key.startswith("model.")
+        }
     if args.checkpoint_format == "trainable_delta":
         delta = {
             name: param.detach().cpu()
@@ -951,6 +1080,8 @@ def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace
                 "trainable": args.trainable,
                 "pred_depth_scale": pred_depth_scale,
                 "learn_pred_depth_scale": bool(args.learn_pred_depth_scale),
+                "depth_residual_mode": args.depth_residual_mode,
+                "adapter_state": adapter_state,
                 "args": args_payload,
                 "step": step,
             },
@@ -966,6 +1097,8 @@ def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace
             "base_checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
             "pred_depth_scale": pred_depth_scale,
             "learn_pred_depth_scale": bool(args.learn_pred_depth_scale),
+            "depth_residual_mode": args.depth_residual_mode,
+            "adapter_state": adapter_state,
             "args": args_payload,
             "step": step,
         },
@@ -974,7 +1107,7 @@ def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace
 
 
 def current_pred_depth_scale(model: torch.nn.Module, args: argparse.Namespace) -> float:
-    if isinstance(model, LearnablePredDepthScale):
+    if isinstance(model, DepthPredictionAdapter):
         return float(model.pred_depth_scale().detach().cpu())
     return float(args.pred_depth_scale)
 
@@ -1273,8 +1406,17 @@ def configure_trainable(model: torch.nn.Module, mode: str) -> Tuple[int, int]:
         for param in model.parameters():
             param.requires_grad_(False)
 
-        train_luna = mode in {"luna", "luna_dense", "luna_heads"}
-        train_dense = mode in {"dense", "heads", "luna_dense", "luna_heads"}
+        train_luna = mode in {
+            "luna",
+            "luna_dense",
+            "luna_heads",
+            "luna_dense_tail",
+            "luna_residual",
+            "luna_residual_dense",
+            "luna_residual_dense_tail",
+        }
+        train_dense = mode in {"dense", "heads", "luna_dense", "luna_heads", "luna_residual_dense"}
+        train_dense_tail = mode in {"luna_dense_tail", "luna_residual_dense_tail"}
         train_camera = mode in {"camera", "heads", "luna_heads"}
         for name, param in model.named_parameters():
             if train_luna and (
@@ -1282,6 +1424,8 @@ def configure_trainable(model: torch.nn.Module, mode: str) -> Tuple[int, int]:
             ):
                 param.requires_grad_(True)
             if train_dense and "dense_head" in name:
+                param.requires_grad_(True)
+            if train_dense_tail and is_dense_tail_parameter(name):
                 param.requires_grad_(True)
             if train_camera and "camera_head" in name:
                 param.requires_grad_(True)
@@ -1291,6 +1435,18 @@ def configure_trainable(model: torch.nn.Module, mode: str) -> Tuple[int, int]:
     if trainable == 0:
         raise ValueError(f"No trainable parameters selected for mode {mode!r}")
     return trainable, frozen
+
+
+def is_dense_tail_parameter(name: str) -> bool:
+    if "dense_head" not in name:
+        return False
+    tail_markers = (
+        "dense_head.scratch.refinenet1",
+        "dense_head.scratch.refinenet2",
+        "dense_head.proj.",
+        "dense_head.proj_conf.",
+    )
+    return any(marker in name for marker in tail_markers)
 
 
 def move_batch_to_device(batch: Dict, device: torch.device) -> Dict:

@@ -1,0 +1,76 @@
+# Single-pano PanoCity-100 12h hybrid LUNA ablation for one RTX 4090.
+# Tests Omega depth + LUNA token adapters + dense-head finetune +
+# identity-initialized log-depth residual + learnable global depth scale.
+data:
+  dataset_root: ../../panovggt/PanoCity_paired
+  dataset_format: panocity_paired
+  dataset_max_samples: 100
+  checkpoint: ../ckpt/vggt_omega_1b_512.pt
+  pano_sample_mode: single
+  pano_min_count: 1
+  pano_max_count: 1
+  pano_grouping: nearest
+  output_depth_scale: 1000.0
+  invalid_depth_value: 65535.0
+  pano_position_step_m: 1.0
+
+sampler:
+  patch_size: 16
+  window_size: 512
+  num_yaw: 8
+  pitch_degrees: "-15"
+  fov_degrees: 75.0
+  pano_height: 0
+  pano_width: 0
+  luna_patch_layers: final
+  luna_camera_layers: none
+
+supervision:
+  gt_depth_semantics: range
+  depth_max_m: 80.0
+  depth_loss_mode: clipped_log_l1
+  depth_log_error_clip: 0.5
+  depth_log_huber_delta: 0.2
+  pred_depth_scale: 5.491308212280273
+  learn_pred_depth_scale: true
+  pred_depth_scale_lr: 5.0e-5
+  depth_residual_mode: log_conv
+  depth_residual_hidden: 32
+  depth_residual_max_log: 0.5
+  enable_camera_head: false
+  camera_supervision_mode: none
+  camera_loss_weight: 0.0
+  camera_translation_weight: 0.0
+  camera_rotation_weight: 0.0
+  camera_fov_weight: 0.0
+  pano_translation_consistency_weight: 0.1
+  camera_position_mode: local_zero
+
+optimization:
+  trainable: luna_residual_dense
+  lr: 5.0e-5
+  weight_decay: 0.05
+  grad_clip: 1.0
+  batch_size: 1
+
+runtime:
+  device: cuda
+  distributed: none
+  dist_backend: nccl
+  find_unused_parameters: true
+  amp_dtype: bfloat16
+  epochs: 100000
+  max_steps: 1000000
+  num_workers: 2
+  seed: 42
+  max_duration_minutes: 720.0
+  save_every_steps: 0
+  save_last: true
+  checkpoint_format: trainable_delta
+  debug_depth_dump: false
+  debug_depth_threshold: 0.3
+  debug_depth_max_dumps_per_step: 0
+  debug_dir: logs/debug_panocity_paired_100_luna_residual_dense_final_4090_12h
+
+output:
+  output_dir: logs/panocity_paired_100_luna_residual_dense_final_4090_12h
