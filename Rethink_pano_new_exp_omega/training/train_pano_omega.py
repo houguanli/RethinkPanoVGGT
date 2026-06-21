@@ -13,7 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Iterable, Sequence, Tuple
+from typing import Any, Dict, Iterable, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -91,6 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--optimizer-type", choices=["adamw", "adafactor"], default="adamw")
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--patch-size", type=int, default=16)
@@ -111,6 +112,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="23",
         help="LUNA camera adapter layers: final, none, or comma-separated layer indices.",
+    )
+    parser.add_argument("--enable-pano-global-token", dest="enable_pano_global_token", action="store_true", default=True)
+    parser.add_argument("--disable-pano-global-token", dest="enable_pano_global_token", action="store_false")
+    parser.add_argument(
+        "--training-stages",
+        default=None,
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
@@ -310,6 +318,7 @@ def train(args: argparse.Namespace) -> None:
     normalize_pano_sampling_args(args)
     normalize_camera_supervision_args(args)
     normalize_pred_depth_scale_args(args)
+    args.training_stages = normalize_training_stages(args.training_stages)
     if args.pano_sample_mode == "variable_neighborhood" and args.batch_size != 1:
         raise ValueError("variable_neighborhood uses variable-length inputs and currently requires batch_size=1.")
     try:
@@ -335,7 +344,6 @@ def train(args: argparse.Namespace) -> None:
         if args.checkpoint is not None:
             load_checkpoint(model, args.checkpoint, strict=args.strict_checkpoint)
 
-        trainable_count, frozen_count = configure_trainable(model, args.trainable)
         if args.learn_pred_depth_scale or args.depth_residual_mode != "none":
             model = DepthPredictionAdapter(
                 model,
@@ -345,8 +353,30 @@ def train(args: argparse.Namespace) -> None:
                 residual_hidden=args.depth_residual_hidden,
                 residual_max_log=args.depth_residual_max_log,
             ).to(device)
-            trainable_count = sum(param.numel() for param in model.parameters() if param.requires_grad)
-            frozen_count = sum(param.numel() for param in model.parameters() if not param.requires_grad)
+
+        active_stage_index = None
+        active_stage_name = "default"
+        active_stage = None
+        if args.training_stages:
+            active_stage_index, active_stage = select_training_stage(
+                args.training_stages,
+                next_step=1,
+                elapsed_minutes=0.0,
+            )
+            active_stage_name = str(active_stage.get("name", f"stage{active_stage_index + 1}"))
+            trainable_count, frozen_count = configure_trainable_for_stage(model, args, active_stage)
+        else:
+            if isinstance(model, DepthPredictionAdapter):
+                configure_trainable(model.model, args.trainable)
+                if isinstance(model.pred_depth_log_scale, torch.nn.Parameter):
+                    model.pred_depth_log_scale.requires_grad_(bool(args.learn_pred_depth_scale))
+                if model.depth_residual_head is not None:
+                    for param in model.depth_residual_head.parameters():
+                        param.requires_grad_(True)
+                trainable_count = sum(param.numel() for param in model.parameters() if param.requires_grad)
+                frozen_count = sum(param.numel() for param in model.parameters() if not param.requires_grad)
+            else:
+                trainable_count, frozen_count = configure_trainable(model, args.trainable)
         if dist_state["distributed"]:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
@@ -354,7 +384,7 @@ def train(args: argparse.Namespace) -> None:
                 output_device=dist_state["local_rank"] if device.type == "cuda" else None,
                 find_unused_parameters=args.find_unused_parameters,
             )
-        optimizer = build_optimizer(model, args)
+        optimizer = build_optimizer_for_stage(model, args, active_stage)
 
         rank0_print(f"[INFO] dataset_root = {dataset.root}", dist_state)
         rank0_print(f"[INFO] dataset_format = {args.dataset_format}", dist_state)
@@ -368,6 +398,7 @@ def train(args: argparse.Namespace) -> None:
             f"[INFO] luna_layers = patch:{args.luna_patch_layers} camera:{args.luna_camera_layers}",
             dist_state,
         )
+        rank0_print(f"[INFO] enable_pano_global_token = {args.enable_pano_global_token}", dist_state)
         rank0_print(
             "[INFO] camera_supervision = "
             f"{args.camera_supervision_mode} position={args.camera_position_mode} "
@@ -395,6 +426,12 @@ def train(args: argparse.Namespace) -> None:
         )
         rank0_print(f"[INFO] device = {device}", dist_state)
         rank0_print(f"[INFO] trainable_params = {trainable_count:,}; frozen_params = {frozen_count:,}", dist_state)
+        if args.training_stages:
+            rank0_print(f"[INFO] training_stages = {format_training_stages(args.training_stages)}", dist_state)
+            rank0_print(
+                f"[INFO] active_stage = {format_stage_status(active_stage_index, active_stage, trainable_count, frozen_count)}",
+                dist_state,
+            )
 
         if is_main_process(dist_state):
             args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -416,6 +453,28 @@ def train(args: argparse.Namespace) -> None:
                     stop_reason = "max_duration"
                     break
 
+                elapsed_before_step = time.time() - started_at
+                if args.training_stages:
+                    next_stage_index, next_stage = select_training_stage(
+                        args.training_stages,
+                        next_step=global_step + 1,
+                        elapsed_minutes=elapsed_before_step / 60.0,
+                    )
+                    if next_stage_index != active_stage_index:
+                        active_stage_index = next_stage_index
+                        active_stage = next_stage
+                        active_stage_name = str(active_stage.get("name", f"stage{active_stage_index + 1}"))
+                        trainable_count, frozen_count = configure_trainable_for_stage(
+                            unwrap_model(model),
+                            args,
+                            active_stage,
+                        )
+                        optimizer = build_optimizer_for_stage(model, args, active_stage)
+                        rank0_print(
+                            f"[INFO] active_stage = {format_stage_status(active_stage_index, active_stage, trainable_count, frozen_count)}",
+                            dist_state,
+                        )
+
                 global_step += 1
                 batch = move_batch_to_device(batch, device)
                 loss_dict = train_step(model, batch, optimizer, args, global_step=global_step)
@@ -435,6 +494,7 @@ def train(args: argparse.Namespace) -> None:
                         loss_dict.get("loss_camera_consistency", torch.tensor(0.0)).item()
                     ),
                     "pred_depth_scale": float(loss_dict["pred_depth_scale"].item()),
+                    "stage": active_stage_name,
                     "lr": optimizer.param_groups[0]["lr"],
                 }
                 if is_main_process(dist_state):
@@ -442,7 +502,7 @@ def train(args: argparse.Namespace) -> None:
                     append_loss_csv(log_csv, metrics)
                     print(
                         f"[TRAIN] epoch={epoch + 1} step={global_step} "
-                        f"elapsed={elapsed_seconds / 60.0:.2f}m "
+                        f"stage={active_stage_name} elapsed={elapsed_seconds / 60.0:.2f}m "
                         f"loss={metrics['loss']:.6f} depth={metrics['loss_depth']:.6f} "
                         f"camera={metrics['loss_camera']:.6f} scale={metrics['pred_depth_scale']:.6f}",
                         flush=True,
@@ -525,6 +585,7 @@ class DepthPredictionAdapter(torch.nn.Module):
         self.learn_scale = bool(learn_scale)
         self.residual_mode = residual_mode
         self.residual_max_log = float(residual_max_log)
+        self.depth_residual_enabled = residual_mode != "none"
         log_scale = torch.tensor(math.log(float(initial_scale)), dtype=torch.float32)
         if self.learn_scale:
             self.pred_depth_log_scale = torch.nn.Parameter(log_scale)
@@ -555,6 +616,8 @@ class DepthPredictionAdapter(torch.nn.Module):
             return predictions
 
         raw_depth = predictions["depth"].float().clamp_min(1e-4)
+        if not self.depth_residual_enabled:
+            return predictions
         windows = predictions.get("pano_windows")
         if windows is None:
             return predictions
@@ -585,7 +648,40 @@ class DepthPredictionAdapter(torch.nn.Module):
 LearnablePredDepthScale = DepthPredictionAdapter
 
 
-def build_optimizer(model: torch.nn.Module, args: argparse.Namespace) -> torch.optim.Optimizer:
+def build_optimizer_for_stage(
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+    stage: Dict[str, Any] | None = None,
+) -> torch.optim.Optimizer:
+    lr = float(stage.get("lr", args.lr)) if stage is not None else args.lr
+    weight_decay = float(stage.get("weight_decay", args.weight_decay)) if stage is not None else args.weight_decay
+    optimizer_type = str(stage.get("optimizer_type", args.optimizer_type)) if stage is not None else args.optimizer_type
+    pred_depth_scale_lr = (
+        float(stage["pred_depth_scale_lr"])
+        if stage is not None and stage.get("pred_depth_scale_lr") is not None
+        else args.pred_depth_scale_lr
+    )
+    return build_optimizer(
+        model,
+        args,
+        lr=lr,
+        weight_decay=weight_decay,
+        pred_depth_scale_lr=pred_depth_scale_lr,
+        optimizer_type=optimizer_type,
+    )
+
+
+def build_optimizer(
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+    lr: float | None = None,
+    weight_decay: float | None = None,
+    pred_depth_scale_lr: float | None = None,
+    optimizer_type: str | None = None,
+) -> torch.optim.Optimizer:
+    lr = args.lr if lr is None else float(lr)
+    weight_decay = args.weight_decay if weight_decay is None else float(weight_decay)
+    optimizer_type = args.optimizer_type if optimizer_type is None else str(optimizer_type)
     scale_params = []
     regular_params = []
     for name, param in model.named_parameters():
@@ -597,13 +693,17 @@ def build_optimizer(model: torch.nn.Module, args: argparse.Namespace) -> torch.o
             regular_params.append(param)
     param_groups = []
     if regular_params:
-        param_groups.append({"params": regular_params, "lr": args.lr, "weight_decay": args.weight_decay})
+        param_groups.append({"params": regular_params, "lr": lr, "weight_decay": weight_decay})
     if scale_params:
-        scale_lr = args.pred_depth_scale_lr if args.pred_depth_scale_lr is not None else args.lr
+        scale_lr = pred_depth_scale_lr if pred_depth_scale_lr is not None else lr
         param_groups.append({"params": scale_params, "lr": scale_lr, "weight_decay": 0.0})
     if not param_groups:
         raise ValueError("No trainable parameters for optimizer.")
-    return torch.optim.AdamW(param_groups)
+    if optimizer_type == "adamw":
+        return torch.optim.AdamW(param_groups)
+    if optimizer_type == "adafactor":
+        return torch.optim.Adafactor(param_groups, foreach=False)
+    raise ValueError(f"Unknown optimizer_type: {optimizer_type}")
 
 
 def normalize_pano_sampling_args(args: argparse.Namespace) -> None:
@@ -645,6 +745,140 @@ def normalize_pred_depth_scale_args(args: argparse.Namespace) -> None:
         print(f"[INFO] using PanoCity pred_depth_scale = {args.pred_depth_scale}")
 
 
+def normalize_training_stages(raw_stages) -> list[Dict[str, Any]]:
+    if raw_stages in (None, "", False):
+        return []
+    if isinstance(raw_stages, str):
+        parsed = yaml.safe_load(raw_stages)
+    else:
+        parsed = raw_stages
+    if parsed in (None, "", False):
+        return []
+    if not isinstance(parsed, list):
+        raise ValueError("training_stages must be a list of stage mappings.")
+
+    stages: list[Dict[str, Any]] = []
+    previous_until_minutes = -math.inf
+    previous_until_steps = -math.inf
+    for idx, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            raise ValueError(f"training_stages[{idx}] must be a mapping, got {type(item).__name__}.")
+        stage = dict(item)
+        stage.setdefault("name", f"stage{idx + 1}")
+        if "until_minutes" in stage and stage["until_minutes"] is not None:
+            stage["until_minutes"] = float(stage["until_minutes"])
+            if stage["until_minutes"] <= previous_until_minutes:
+                raise ValueError("training_stages until_minutes values must be strictly increasing.")
+            previous_until_minutes = stage["until_minutes"]
+        if "until_steps" in stage and stage["until_steps"] is not None:
+            stage["until_steps"] = int(stage["until_steps"])
+            if stage["until_steps"] <= previous_until_steps:
+                raise ValueError("training_stages until_steps values must be strictly increasing.")
+            previous_until_steps = stage["until_steps"]
+        stages.append(stage)
+    return stages
+
+
+def select_training_stage(
+    stages: Sequence[Dict[str, Any]],
+    next_step: int,
+    elapsed_minutes: float,
+) -> tuple[int, Dict[str, Any]]:
+    if not stages:
+        raise ValueError("select_training_stage requires at least one stage.")
+    for idx, stage in enumerate(stages):
+        until_minutes = stage.get("until_minutes")
+        until_steps = stage.get("until_steps")
+        within_minutes = until_minutes is None or elapsed_minutes < float(until_minutes)
+        within_steps = until_steps is None or next_step <= int(until_steps)
+        if within_minutes and within_steps:
+            return idx, stage
+    return len(stages) - 1, stages[-1]
+
+
+def format_training_stages(stages: Sequence[Dict[str, Any]]) -> str:
+    parts = []
+    for idx, stage in enumerate(stages):
+        boundary = []
+        if stage.get("until_minutes") is not None:
+            boundary.append(f"until={float(stage['until_minutes']):.1f}m")
+        if stage.get("until_steps") is not None:
+            boundary.append(f"until_step={int(stage['until_steps'])}")
+        parts.append(f"{idx + 1}:{stage.get('name', f'stage{idx + 1}')}({','.join(boundary) or 'final'})")
+    return "; ".join(parts)
+
+
+def format_stage_status(
+    stage_index: int | None,
+    stage: Dict[str, Any] | None,
+    trainable_count: int,
+    frozen_count: int,
+) -> str:
+    if stage is None:
+        return f"default trainable={trainable_count:,} frozen={frozen_count:,}"
+    return (
+        f"{stage_index + 1}:{stage.get('name', f'stage{stage_index + 1}')} "
+        f"trainable_mode={stage.get('trainable', 'default')} "
+        f"lr={stage.get('lr', 'default')} "
+        f"optimizer={stage.get('optimizer_type', 'default')} "
+        f"luna_forward={stage.get('enable_luna_forward', 'default')} "
+        f"depth_residual={stage.get('enable_depth_residual', 'default')} "
+        f"trainable={trainable_count:,} frozen={frozen_count:,}"
+    )
+
+
+def configure_trainable_for_stage(
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+    stage: Dict[str, Any],
+) -> Tuple[int, int]:
+    unwrapped = unwrap_model(model)
+    adapter = unwrapped if isinstance(unwrapped, DepthPredictionAdapter) else None
+    base_model = adapter.model if adapter is not None else unwrapped
+
+    trainable_mode = str(stage.get("trainable", args.trainable))
+    configure_trainable(base_model, trainable_mode)
+
+    enable_luna_forward = bool(stage.get("enable_luna_forward", True))
+    set_luna_forward_enabled(base_model, enable_luna_forward)
+    if not enable_luna_forward or bool(stage.get("freeze_luna_parameters", False)):
+        set_luna_parameters_trainable(base_model, False)
+
+    if adapter is not None:
+        enable_depth_residual = bool(stage.get("enable_depth_residual", adapter.depth_residual_head is not None))
+        adapter.depth_residual_enabled = enable_depth_residual
+        train_depth_residual = bool(stage.get("train_depth_residual", enable_depth_residual))
+        train_scale = bool(stage.get("learn_pred_depth_scale", args.learn_pred_depth_scale))
+
+        if isinstance(adapter.pred_depth_log_scale, torch.nn.Parameter):
+            adapter.pred_depth_log_scale.requires_grad_(train_scale)
+        if adapter.depth_residual_head is not None:
+            for param in adapter.depth_residual_head.parameters():
+                param.requires_grad_(enable_depth_residual and train_depth_residual)
+
+    trainable = sum(param.numel() for param in unwrapped.parameters() if param.requires_grad)
+    frozen = sum(param.numel() for param in unwrapped.parameters() if not param.requires_grad)
+    if trainable == 0:
+        raise ValueError(f"No trainable parameters selected for stage {stage.get('name')!r}.")
+    return trainable, frozen
+
+
+def set_luna_forward_enabled(model: torch.nn.Module, enabled: bool) -> None:
+    aggregator = getattr(model, "aggregator", None)
+    if aggregator is not None and hasattr(aggregator, "enable_luna"):
+        aggregator.enable_luna = bool(enabled)
+
+
+def set_luna_parameters_trainable(model: torch.nn.Module, enabled: bool) -> None:
+    for name, param in model.named_parameters():
+        if is_luna_parameter_name(name):
+            param.requires_grad_(enabled)
+
+
+def is_luna_parameter_name(name: str) -> bool:
+    return "luna_" in name or "pano_global" in name or "pano_geometry" in name
+
+
 def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
     pitch_degrees = parse_pitch_degrees(args.pitch_degrees)
     sampler = {
@@ -663,7 +897,7 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
             enable_camera=True,
             enable_depth=True,
             enable_alignment=False,
-            enable_pano_global_token=True,
+            enable_pano_global_token=args.enable_pano_global_token,
             enable_luna=True,
             luna_patch_layers=args.luna_patch_layers,
             luna_camera_layers=args.luna_camera_layers,
@@ -697,7 +931,7 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
         enable_camera=args.enable_camera_head,
         enable_depth=True,
         enable_alignment=False,
-        enable_pano_global_token=True,
+        enable_pano_global_token=args.enable_pano_global_token,
         enable_luna=True,
         luna_patch_layers=args.luna_patch_layers,
         luna_camera_layers=args.luna_camera_layers,
