@@ -34,6 +34,7 @@ import torch.nn as nn
 import torchvision
 from hydra.utils import instantiate
 from iopath.common.file_io import g_pathmgr
+from tqdm.auto import tqdm
 
 try:
     from .train_utils.checkpoint import DDPCheckpointSaver
@@ -139,6 +140,8 @@ class Trainer:
         self.normalize_scene_scale = bool(normalize_scene_scale)
         self.save_checkpoint_on_exit = bool(save_checkpoint_on_exit)
         self.stop_requested = False
+        self.progress_bar_enabled = bool(self.logging_conf.get("progress_bar", True))
+        self.progress_log_every = int(self.logging_conf.get("progress_log_every", 50))
         
         # 'where' tracks training progress from 0.0 to 1.0 for schedulers
         self.where = 0.0
@@ -331,6 +334,16 @@ class Trainer:
         if self.mode in ["train"]:
             self.train_dataset = instantiate(self.data_conf.train, _recursive_=False)
             self.train_dataset.seed = self.seed_value
+            if self.rank == 0 and hasattr(self.train_dataset, "dataset"):
+                dataset = self.train_dataset.dataset
+                logging.info(
+                    "Train dataset: %s split=%s samples=%s train_fraction=%s split_seed=%s",
+                    dataset.__class__.__name__,
+                    getattr(dataset, "split", "n/a"),
+                    len(dataset),
+                    getattr(dataset, "train_split_fraction", "n/a"),
+                    getattr(dataset, "split_seed", "n/a"),
+                )
 
     def _setup_ddp_distributed_training(self, distributed_conf: Dict, device: str):
         """Wraps the model with DistributedDataParallel (DDP)."""
@@ -593,6 +606,28 @@ class Trainer:
             # setup gradient clipping at the beginning of training
             self.gradient_clipper.setup_clipping(self.model)
 
+        progress_bar = None
+        last_progress_elapsed = float(self.time_elapsed_meter.val)
+        if self.rank == 0 and self.progress_bar_enabled:
+            if self.max_duration_seconds > 0:
+                progress_bar = tqdm(
+                    total=int(self.max_duration_seconds),
+                    desc="Full warmup",
+                    unit="s",
+                    dynamic_ncols=True,
+                    leave=True,
+                )
+                if last_progress_elapsed > 0:
+                    progress_bar.update(min(int(last_progress_elapsed), int(self.max_duration_seconds)))
+            else:
+                progress_bar = tqdm(
+                    total=int(limit_train_batches),
+                    desc="Full warmup",
+                    unit="step",
+                    dynamic_ncols=True,
+                    leave=True,
+                )
+
         for data_iter, batch in enumerate(train_loader):
             if data_iter > limit_train_batches:
                 break
@@ -685,7 +720,23 @@ class Trainer:
             mem.update(torch.cuda.max_memory_allocated() // 1e9)
 
             if data_iter % self.logging_conf.log_freq == 0:
-                progress.display(data_iter)
+                if progress_bar is None or (self.progress_log_every > 0 and data_iter % self.progress_log_every == 0):
+                    progress.display(data_iter)
+
+            if progress_bar is not None:
+                if self.max_duration_seconds > 0:
+                    elapsed = float(self.time_elapsed_meter.val)
+                    update = max(0, int(elapsed) - int(last_progress_elapsed))
+                    if update:
+                        progress_bar.update(update)
+                        last_progress_elapsed = elapsed
+                else:
+                    progress_bar.update(1)
+                loss_meter = loss_meters.get("Loss/train_loss_objective")
+                postfix = {"step": self.steps[phase]}
+                if loss_meter is not None:
+                    postfix["loss"] = f"{float(loss_meter.val):.4f}"
+                progress_bar.set_postfix(**postfix)
 
             if self._duration_limit_reached():
                 self.stop_requested = True
@@ -694,6 +745,9 @@ class Trainer:
                     f"{self.max_duration_seconds / 60.0:.2f}"
                 )
                 break
+
+        if progress_bar is not None:
+            progress_bar.close()
 
         return True
 

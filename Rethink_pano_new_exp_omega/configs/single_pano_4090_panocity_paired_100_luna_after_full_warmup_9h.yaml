@@ -5,6 +5,9 @@ data:
   dataset_root: ../../panovggt/PanoCity_paired
   dataset_format: panocity_paired
   dataset_max_samples: 100
+  dataset_split: train
+  train_split_fraction: 0.95
+  split_seed: 42
   checkpoint: ../baseline01_vggt_omega/logs/panocity_paired_100_full_warmup_4090_3h_for_luna/ckpts/checkpoint.pt
   pano_sample_mode: single
   pano_min_count: 1
@@ -96,6 +99,8 @@ runtime:
   debug_depth_threshold: 0.3
   debug_depth_max_dumps_per_step: 0
   debug_dir: logs/debug_panocity_paired_100_luna_after_full_warmup_4090_9h
+  progress_bar: true
+  progress_log_every: 50
 
 output:
   output_dir: logs/panocity_paired_100_luna_after_full_warmup_4090_9h

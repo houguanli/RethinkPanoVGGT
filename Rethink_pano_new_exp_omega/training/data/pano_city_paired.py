@@ -46,6 +46,9 @@ class PanoCityPairedOmegaDataset(Dataset):
         invalid_depth_value: Optional[float] = 65535.0,
         position_step_m: float = 1.0,
         strict: bool = True,
+        split: str = "train",
+        train_split_fraction: float = 0.95,
+        split_seed: int = 42,
     ) -> None:
         if panos_per_sample is not None:
             pano_sample_mode = "single" if panos_per_sample == 1 else "fixed_neighborhood"
@@ -74,6 +77,9 @@ class PanoCityPairedOmegaDataset(Dataset):
         self.output_depth_scale = float(output_depth_scale)
         self.invalid_depth_value = None if invalid_depth_value is None else float(invalid_depth_value)
         self.position_step_m = float(position_step_m)
+        self.split = str(split)
+        self.train_split_fraction = float(train_split_fraction)
+        self.split_seed = int(split_seed)
         self.items = self._build_index(max_samples=max_samples)
         self.groups = self._build_groups()
         if strict and not self.items:
@@ -182,9 +188,34 @@ class PanoCityPairedOmegaDataset(Dataset):
                     "pano_position_m": [float(ordinal) * self.position_step_m, 0.0, 0.0],
                 }
             )
-            if max_samples is not None and len(items) >= max_samples:
-                return items
+        items = _split_items(
+            items,
+            split=self.split,
+            train_fraction=self.train_split_fraction,
+            seed=self.split_seed,
+        )
+        if max_samples is not None:
+            items = items[: int(max_samples)]
         return items
+
+
+def _split_items(items: List[Dict], split: str, train_fraction: float, seed: int) -> List[Dict]:
+    if not items:
+        return []
+    train_fraction = min(max(float(train_fraction), 0.0), 1.0)
+    order = list(range(len(items)))
+    random.Random(int(seed)).shuffle(order)
+    train_count = int(round(len(order) * train_fraction))
+    if len(order) > 1:
+        train_count = min(max(train_count, 1), len(order) - 1)
+    split_name = str(split).lower()
+    if split_name == "train":
+        keep = set(order[:train_count])
+    elif split_name in {"val", "valid", "validation", "test"}:
+        keep = set(order[train_count:])
+    else:
+        raise ValueError(f"Unknown PanoCity split: {split}")
+    return [item for idx, item in enumerate(items) if idx in keep]
 
 
 def _iter_image_files(folder: Path) -> Iterable[Path]:

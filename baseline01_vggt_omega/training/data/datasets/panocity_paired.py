@@ -2,6 +2,7 @@ import glob
 import math
 import os
 import os.path as osp
+import random
 from typing import Optional
 
 import cv2
@@ -26,11 +27,16 @@ class PanoCityPairedPinholeDataset(BaseDataset):
         pitch_degrees: float = 0.0,
         fov_degrees: float = 75.0,
         max_samples: Optional[int] = None,
+        train_split_fraction: float = 0.95,
+        split_seed: int = 42,
     ):
         super().__init__(common_conf=common_conf)
         self.root = root
+        self.split = str(split)
         self.training = common_conf.training
         self.len_train = len_train if split == "train" else len_test
+        self.train_split_fraction = float(train_split_fraction)
+        self.split_seed = int(split_seed)
         self.output_depth_scale = float(output_depth_scale)
         self.invalid_depth_value = None if invalid_depth_value is None else float(invalid_depth_value)
         self.depth_max_m = float(depth_max_m)
@@ -117,9 +123,34 @@ class PanoCityPairedPinholeDataset(BaseDataset):
             if depth_path is None:
                 continue
             items.append({"rgb_path": rgb_path, "depth_path": depth_path, "name": osp.splitext(osp.basename(rgb_path))[0]})
-            if max_samples is not None and len(items) >= int(max_samples):
-                break
+        items = _split_items(
+            items,
+            split=self.split,
+            train_fraction=self.train_split_fraction,
+            seed=self.split_seed,
+        )
+        if max_samples is not None:
+            items = items[: int(max_samples)]
         return items
+
+
+def _split_items(items: list[dict], split: str, train_fraction: float, seed: int) -> list[dict]:
+    if not items:
+        return []
+    train_fraction = min(max(float(train_fraction), 0.0), 1.0)
+    order = list(range(len(items)))
+    random.Random(int(seed)).shuffle(order)
+    train_count = int(round(len(order) * train_fraction))
+    if len(order) > 1:
+        train_count = min(max(train_count, 1), len(order) - 1)
+    split_name = str(split).lower()
+    if split_name == "train":
+        keep = set(order[:train_count])
+    elif split_name in {"val", "valid", "validation", "test"}:
+        keep = set(order[train_count:])
+    else:
+        raise ValueError(f"Unknown PanoCity split: {split}")
+    return [item for idx, item in enumerate(items) if idx in keep]
 
 
 def _depth_path_for_rgb(rgb_path: str, depth_dir: str) -> Optional[str]:

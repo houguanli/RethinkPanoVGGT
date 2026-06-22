@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from tqdm.auto import tqdm
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--panos-per-sample", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--pano-grouping", choices=["nearest", "sequential"], default="nearest")
     parser.add_argument("--dataset-max-samples", type=int, default=None, help="Optional dataset cap for debugging.")
+    parser.add_argument("--dataset-split", choices=["train", "val", "test"], default="train")
+    parser.add_argument("--train-split-fraction", type=float, default=0.95)
+    parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument(
         "--output-depth-scale",
         type=float,
@@ -235,6 +239,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use trainable_delta on 24GB GPUs; full stores every model tensor.",
     )
     parser.add_argument("--max-duration-minutes", type=float, default=0.0)
+    parser.add_argument("--progress-bar", dest="progress_bar", action="store_true", default=True)
+    parser.add_argument("--no-progress-bar", dest="progress_bar", action="store_false")
+    parser.add_argument("--progress-log-every", type=int, default=50)
     parser.add_argument("--log-csv", type=Path, default=None)
     parser.add_argument("--loss-plot", type=Path, default=None)
     parser.add_argument("--debug-depth-dump", dest="debug_depth_dump", action="store_true", default=True)
@@ -388,6 +395,13 @@ def train(args: argparse.Namespace) -> None:
 
         rank0_print(f"[INFO] dataset_root = {dataset.root}", dist_state)
         rank0_print(f"[INFO] dataset_format = {args.dataset_format}", dist_state)
+        if hasattr(dataset, "split"):
+            rank0_print(
+                f"[INFO] dataset_split = {dataset.split} "
+                f"train_fraction={getattr(dataset, 'train_split_fraction', 'n/a')} "
+                f"split_seed={getattr(dataset, 'split_seed', 'n/a')}",
+                dist_state,
+            )
         rank0_print(f"[INFO] samples = {len(dataset)}", dist_state)
         rank0_print(
         "[INFO] pano_sampling = "
@@ -445,6 +459,19 @@ def train(args: argparse.Namespace) -> None:
         model.train()
         global_step = 0
         stop_reason = "max_steps"
+        progress = None
+        last_progress_elapsed = 0.0
+        if is_main_process(dist_state) and args.progress_bar:
+            if max_duration_seconds is not None:
+                progress = tqdm(
+                    total=int(max_duration_seconds),
+                    desc="LUNA train",
+                    unit="s",
+                    dynamic_ncols=True,
+                    leave=True,
+                )
+            else:
+                progress = tqdm(total=int(args.max_steps), desc="LUNA train", unit="step", dynamic_ncols=True, leave=True)
         for epoch in range(args.epochs):
             if sampler is not None:
                 sampler.set_epoch(epoch)
@@ -500,13 +527,30 @@ def train(args: argparse.Namespace) -> None:
                 if is_main_process(dist_state):
                     metrics_history.append(metrics)
                     append_loss_csv(log_csv, metrics)
-                    print(
+                    message = (
                         f"[TRAIN] epoch={epoch + 1} step={global_step} "
                         f"stage={active_stage_name} elapsed={elapsed_seconds / 60.0:.2f}m "
                         f"loss={metrics['loss']:.6f} depth={metrics['loss_depth']:.6f} "
-                        f"camera={metrics['loss_camera']:.6f} scale={metrics['pred_depth_scale']:.6f}",
-                        flush=True,
+                        f"camera={metrics['loss_camera']:.6f} scale={metrics['pred_depth_scale']:.6f}"
                     )
+                    if progress is not None:
+                        if max_duration_seconds is not None:
+                            update = max(0, int(elapsed_seconds) - int(last_progress_elapsed))
+                            if update:
+                                progress.update(update)
+                                last_progress_elapsed = elapsed_seconds
+                        else:
+                            progress.update(1)
+                        progress.set_postfix(
+                            step=global_step,
+                            stage=active_stage_name,
+                            loss=f"{metrics['loss']:.4f}",
+                            scale=f"{metrics['pred_depth_scale']:.3f}",
+                        )
+                        if args.progress_log_every > 0 and global_step % args.progress_log_every == 0:
+                            progress.write(message)
+                    else:
+                        print(message, flush=True)
 
                 if (
                     is_main_process(dist_state)
@@ -525,6 +569,8 @@ def train(args: argparse.Namespace) -> None:
         else:
             stop_reason = "epochs_complete"
     finally:
+        if "progress" in locals() and progress is not None:
+            progress.close()
         if "metrics_history" in locals() and is_main_process(dist_state):
             if metrics_history:
                 save_loss_plot(loss_plot, metrics_history)
@@ -554,6 +600,9 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
             output_depth_scale=args.output_depth_scale,
             invalid_depth_value=args.invalid_depth_value,
             position_step_m=args.pano_position_step_m,
+            split=args.dataset_split,
+            train_split_fraction=args.train_split_fraction,
+            split_seed=args.split_seed,
         )
     raise ValueError(f"Unknown dataset_format: {args.dataset_format}")
 

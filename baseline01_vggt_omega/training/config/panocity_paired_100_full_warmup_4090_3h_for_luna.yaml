@@ -60,6 +60,8 @@ data:
           output_depth_scale: 1000.0
           invalid_depth_value: 65535.0
           depth_max_m: 80.0
+          train_split_fraction: 0.95
+          split_seed: 42
           num_yaw: 8
           pitch_degrees: -15.0
           fov_degrees: 75.0
@@ -69,6 +71,8 @@ logging:
   log_dir: logs/${exp_name}
   log_visuals: false
   log_freq: 1
+  progress_bar: true
+  progress_log_every: 50
   log_level_primary: DEBUG
   log_level_secondary: WARNING
   all_ranks: false
