@@ -175,23 +175,26 @@ require_method_relative_file() {
 check_method_assets() {
   local method="$1"
   case "${method}" in
-    panovggt|panovggtcamera|panovggt_camera|panovggtdepth|panovggt_depth)
+    panovggt|panovggtcamera|panovggt_camera)
       require_method_relative_file "${COMPARE_ROOT}/camera_pose/PanoVGGT" "../../../ckpt/PanoVGGT/model.pt" "PanoVGGT checkpoint"
+      ;;
+    panovggtdepth|panovggt_depth)
+      require_method_relative_file "${COMPARE_ROOT}/depth_geometry/PanoVGGT" "../../../ckpt/PanoVGGT/model.pt" "PanoVGGT checkpoint"
       ;;
     reloc3r|relo3r)
       require_method_relative_file "${COMPARE_ROOT}/camera_pose/Reloc3r" "../../../ckpt/Reloc3r-512/Reloc3r-512.pth" "Reloc3r checkpoint"
       ;;
-    vggt_omega|vggtomega|vggt_omega_camera|vggtomegacamera|vggt_omega_depth|vggtomegadepth)
+    vggt_omega|vggtomega|vggt_omega_camera|vggtomegacamera)
       require_method_relative_file "${COMPARE_ROOT}/camera_pose/VGGT-Omega" "../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt" "VGGT-Omega checkpoint"
+      ;;
+    vggt_omega_depth|vggtomegadepth)
+      require_method_relative_file "${COMPARE_ROOT}/depth_geometry/VGGT-Omega" "../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt" "VGGT-Omega checkpoint"
       ;;
     dap)
       require_method_relative_file "${COMPARE_ROOT}/depth_geometry/DAP" "../../../ckpt/DAP/model.pth" "DAP checkpoint"
       ;;
     panda)
-      if [[ ! -f "${ROOT}/ckpt/PanDA/panda_small.pth" && ! -f "${ROOT}/ckpt/PanDA/panda_base.pth" && ! -f "${ROOT}/ckpt/PanDA/panda_large.pth" ]]; then
-        echo "Missing PanDA checkpoint: expected one of ${ROOT}/ckpt/PanDA/panda_{small,base,large}.pth" >&2
-        return 1
-      fi
+      require_method_relative_file "${COMPARE_ROOT}/depth_geometry/PanDA" "../../../ckpt/PanDA/panda_small.pth" "PanDA checkpoint"
       ;;
   esac
 }

@@ -51,4 +51,4 @@ loss:
   gradient_weight: 1.0
 
 amp: True
-load_weights_dir:
+load_weights_dir: ../../../ckpt/DAP/model.pth

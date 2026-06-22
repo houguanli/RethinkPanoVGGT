@@ -30,9 +30,51 @@ PATH_FLAGS = {
     "--pretrained",
     "--resume",
 }
+CONFIG_ASSET_KEYS = {"resume_checkpoint_path", "load_weights_dir"}
 
 
-def _resolve_command_paths(command, cwd: Path) -> list[str]:
+def _iter_config_assets(value: Any):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in CONFIG_ASSET_KEYS and child:
+                yield key, str(child)
+            yield from _iter_config_assets(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_config_assets(child)
+
+
+def _looks_generated_path(path: Path) -> bool:
+    return bool({"logs", "outputs", "tmp"}.intersection(set(path.parts)))
+
+
+def _check_command_path(label: str, value: str, cwd: Path, *, allow_missing_generated: bool) -> None:
+    if "${" in value:
+        print(f"[asset] {label}: {value} (deferred interpolation)", flush=True)
+        return
+    path = Path(os.path.expandvars(os.path.expanduser(value)))
+    resolved = path if path.is_absolute() else (cwd / path).resolve()
+    print(f"[asset] {label}: {value} -> {resolved}", flush=True)
+    if resolved.exists():
+        return
+    if allow_missing_generated and _looks_generated_path(resolved):
+        print(f"[asset] {label}: missing now; expected to be produced by a prior finetune stage", flush=True)
+        return
+    raise SystemExit(f"Missing asset for {label}: {value} -> {resolved}")
+
+
+def _validate_config_asset_paths(config_path: Path, cwd: Path, *, allow_missing_generated: bool) -> None:
+    if config_path.suffix not in {".yaml", ".yml"} or not config_path.exists():
+        return
+    try:
+        cfg = _load_yaml(config_path)
+    except Exception:
+        return
+    for key, value in _iter_config_assets(cfg):
+        _check_command_path(f"{config_path.name}:{key}", value, cwd, allow_missing_generated=allow_missing_generated)
+
+
+def _resolve_command_paths(command, cwd: Path, *, allow_missing_generated: bool = False) -> list[str]:
     resolved_command = [str(part) for part in command]
     for index, part in enumerate(resolved_command[:-1]):
         if part not in PATH_FLAGS:
@@ -42,19 +84,18 @@ def _resolve_command_paths(command, cwd: Path) -> list[str]:
             continue
         if part == "--config" and "/" not in value and "\\" not in value and not Path(value).suffix:
             print(f"[asset] command {part}: {value} (config name)", flush=True)
+            _validate_config_asset_paths(cwd / "training" / "config" / f"{value}.yaml", cwd, allow_missing_generated=allow_missing_generated)
             continue
-        path = Path(os.path.expandvars(os.path.expanduser(value)))
-        resolved = path if path.is_absolute() else (cwd / path).resolve()
-        print(f"[asset] command {part}: {value} -> {resolved}", flush=True)
-        if part != "--config" and not resolved.exists():
-            raise SystemExit(f"Missing command asset for {part}: {value} -> {resolved}")
-        if part == "--config" and not resolved.exists():
-            raise SystemExit(f"Missing command config for {part}: {value} -> {resolved}")
+        _check_command_path(f"command {part}", value, cwd, allow_missing_generated=allow_missing_generated)
+        if part == "--config":
+            config_path = Path(os.path.expandvars(os.path.expanduser(value)))
+            config_path = config_path if config_path.is_absolute() else (cwd / config_path).resolve()
+            _validate_config_asset_paths(config_path, cwd, allow_missing_generated=allow_missing_generated)
     return resolved_command
 
 
 def _run(command, cwd: Path, dry_run: bool) -> None:
-    command = _resolve_command_paths(command, cwd)
+    command = _resolve_command_paths(command, cwd, allow_missing_generated=dry_run)
     print(f"[cmd] cwd={cwd} {' '.join(command)}", flush=True)
     if not dry_run:
         subprocess.run(command, cwd=str(cwd), check=True)

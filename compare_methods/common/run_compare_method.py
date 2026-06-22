@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Iterable
 
 from .method_registry import get_group, get_method, is_group, normalize_name, runnable_names
 from .panocity_paired import smoke_summary
@@ -25,6 +26,7 @@ PATH_FLAGS = {
     "--pretrained",
     "--resume",
 }
+CONFIG_ASSET_KEYS = {"resume_checkpoint_path", "load_weights_dir"}
 
 
 def _runtime_config_paths(spec) -> list[Path]:
@@ -43,6 +45,65 @@ def _runtime_config_paths(spec) -> list[Path]:
     return list(dict.fromkeys(path for path in paths if path and path.exists()))
 
 
+def _iter_config_assets(value: Any, parent_key: str = "") -> Iterable[tuple[str, str]]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in CONFIG_ASSET_KEYS and child:
+                yield key, str(child)
+            yield from _iter_config_assets(child, key)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_config_assets(child, parent_key)
+
+
+def _iter_config_commands(value: Any) -> Iterable[list[Any]]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "command" and isinstance(child, list):
+                yield child
+            yield from _iter_config_commands(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_config_commands(child)
+
+
+def _looks_generated_path(path: Path) -> bool:
+    parts = set(path.parts)
+    return bool({"logs", "outputs", "tmp"}.intersection(parts))
+
+
+def _check_asset_path(label: str, raw_value: str, cwd: Path, *, allow_missing_generated: bool = False) -> None:
+    if "${" in raw_value:
+        print(f"[asset] {label}: {raw_value} (deferred interpolation)", flush=True)
+        return
+    path = Path(os.path.expandvars(os.path.expanduser(raw_value)))
+    resolved = path if path.is_absolute() else (cwd / path).resolve()
+    print(f"[asset] {label}: {raw_value} -> {resolved}", flush=True)
+    if resolved.exists():
+        return
+    if allow_missing_generated and _looks_generated_path(resolved):
+        print(f"[asset] {label}: missing now; expected to be produced by a prior finetune stage", flush=True)
+        return
+    raise SystemExit(f"Missing asset for {label}: {raw_value} -> {resolved}")
+
+
+def _validate_config_assets(spec) -> None:
+    try:
+        import yaml
+    except Exception as exc:
+        raise SystemExit(f"PyYAML is required to validate config assets: {exc}") from exc
+
+    for path in _runtime_config_paths(spec):
+        try:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        for key, value in _iter_config_assets(payload):
+            _check_asset_path(f"{path.relative_to(spec.path) if path.is_relative_to(spec.path) else path}:{key}", value, spec.path)
+        for command in _iter_config_commands(payload):
+            _resolve_command_paths(command, spec.path, allow_missing_generated=True)
+
+
 def _validate_runtime_paths(spec) -> None:
     offenders = []
     for path in _runtime_config_paths(spec):
@@ -56,9 +117,10 @@ def _validate_runtime_paths(spec) -> None:
             + "\n".join(offenders)
             + "\nUse project-relative paths or environment variables in the PanoCity configs."
         )
+    _validate_config_assets(spec)
 
 
-def _resolve_command_paths(cmd, cwd: Path) -> list[str]:
+def _resolve_command_paths(cmd, cwd: Path, *, allow_missing_generated: bool = False) -> list[str]:
     resolved_cmd = [str(part) for part in cmd]
     for index, part in enumerate(resolved_cmd[:-1]):
         if part not in PATH_FLAGS:
@@ -69,16 +131,12 @@ def _resolve_command_paths(cmd, cwd: Path) -> list[str]:
         if part == "--config" and "/" not in value and "\\" not in value and not Path(value).suffix:
             print(f"[asset] command {part}: {value} (config name)", flush=True)
             continue
-        path = Path(os.path.expandvars(os.path.expanduser(value)))
-        resolved = path if path.is_absolute() else (cwd / path).resolve()
-        print(f"[asset] command {part}: {value} -> {resolved}", flush=True)
-        if not resolved.exists():
-            raise SystemExit(f"Missing command asset for {part}: {value} -> {resolved}")
+        _check_asset_path(f"command {part}", value, cwd, allow_missing_generated=allow_missing_generated)
     return resolved_cmd
 
 
 def _run(cmd, cwd: Path, dry_run: bool, timeout_seconds: int | None = None) -> None:
-    cmd = _resolve_command_paths(cmd, cwd)
+    cmd = _resolve_command_paths(cmd, cwd, allow_missing_generated=dry_run)
     print(f"[cmd] cwd={cwd} {' '.join(cmd)}", flush=True)
     if dry_run:
         return

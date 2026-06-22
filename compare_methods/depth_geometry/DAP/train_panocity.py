@@ -104,9 +104,34 @@ def maybe_load_weights(model, config: Dict, device):
     if not path.exists():
         raise FileNotFoundError(f"load_weights_dir/model.pth not found: {path}")
     state = torch.load(path, map_location=device)
+    if isinstance(state, dict):
+        for key in ("model", "state_dict", "model_state_dict"):
+            if key in state and isinstance(state[key], dict):
+                state = state[key]
+                break
+    if not isinstance(state, dict):
+        raise RuntimeError(f"Unsupported DAP checkpoint payload in {path}: {type(state)}")
     target = model.module if hasattr(model, "module") else model
-    missing = target.load_state_dict({k: v for k, v in state.items() if k in target.state_dict()}, strict=False)
-    print(f"Loaded DAP weights from {path}: {missing}")
+    target_state = target.state_dict()
+
+    candidates = state
+    if not any(k in target_state for k in candidates):
+        candidates = {k[len("module."):] if k.startswith("module.") else k: v for k, v in state.items()}
+
+    matched = {
+        k: v
+        for k, v in candidates.items()
+        if k in target_state and hasattr(v, "shape") and v.shape == target_state[k].shape
+    }
+    if not matched:
+        sample_ckpt = list(state.keys())[:5]
+        sample_model = list(target_state.keys())[:5]
+        raise RuntimeError(
+            f"DAP checkpoint {path} did not match any model parameters. "
+            f"checkpoint keys sample={sample_ckpt}; model keys sample={sample_model}"
+        )
+    missing = target.load_state_dict(matched, strict=False)
+    print(f"Loaded DAP weights from {path}: matched={len(matched)}/{len(target_state)} missing={missing}")
 
 
 def save_checkpoint(model, output_dir: Path, epoch: int, step: int, rank: int):

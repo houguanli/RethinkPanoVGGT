@@ -47,4 +47,4 @@ epoch_max: 20
 log_frequency: 40
 epoch_val: 1
 epoch_save: 5
-load_weights_dir:
+load_weights_dir: ../../../ckpt/PanDA/panda_small.pth

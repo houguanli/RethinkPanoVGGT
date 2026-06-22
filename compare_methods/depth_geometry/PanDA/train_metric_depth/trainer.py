@@ -303,13 +303,39 @@ class Trainer:
         """
         load_weights_dir = os.path.expanduser(os.path.expanduser(self.config['load_weights_dir']))
 
-        assert os.path.isdir(load_weights_dir), \
-            "Cannot find folder {}".format(load_weights_dir)
-        print("loading model from folder {}".format(load_weights_dir))
-
-        path = os.path.join(load_weights_dir, "{}.pth".format("model"))
+        if os.path.isfile(load_weights_dir):
+            path = load_weights_dir
+            print("loading model from file {}".format(path))
+        else:
+            assert os.path.isdir(load_weights_dir), \
+                "Cannot find folder or checkpoint file {}".format(load_weights_dir)
+            print("loading model from folder {}".format(load_weights_dir))
+            path = os.path.join(load_weights_dir, "{}.pth".format("model"))
         pretrained_dict = torch.load(path)
+        if isinstance(pretrained_dict, dict):
+            for key in ("model", "state_dict", "model_state_dict"):
+                if key in pretrained_dict and isinstance(pretrained_dict[key], dict):
+                    pretrained_dict = pretrained_dict[key]
+                    break
+        if not isinstance(pretrained_dict, dict):
+            raise RuntimeError("Unsupported PanDA checkpoint payload in {}: {}".format(path, type(pretrained_dict)))
         model_dict = self.model.state_dict()
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
-        model_dict.update(pretrained_dict)
+        candidates = pretrained_dict
+        if not any(k in model_dict for k in candidates):
+            stripped = {k[len("module."):] if k.startswith("module.") else k: v for k, v in pretrained_dict.items()}
+            prefixed = {"module.{}".format(k) if not k.startswith("module.") else k: v for k, v in pretrained_dict.items()}
+            candidates = stripped if any(k in model_dict for k in stripped) else prefixed
+        matched_dict = {
+            k: v for k, v in candidates.items()
+            if k in model_dict and hasattr(v, "shape") and v.shape == model_dict[k].shape
+        }
+        if not matched_dict:
+            sample_ckpt = list(pretrained_dict.keys())[:5]
+            sample_model = list(model_dict.keys())[:5]
+            raise RuntimeError(
+                "PanDA checkpoint {} did not match any model parameters. "
+                "checkpoint keys sample={}; model keys sample={}".format(path, sample_ckpt, sample_model)
+            )
+        print("loaded {} PanDA tensors from {}".format(len(matched_dict), path))
+        model_dict.update(matched_dict)
         self.model.load_state_dict(model_dict)
