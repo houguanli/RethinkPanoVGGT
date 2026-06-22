@@ -143,6 +143,15 @@ resolve_installed_env() {
   return 1
 }
 
+asset_size() {
+  local path="$1"
+  if command -v stat >/dev/null 2>&1; then
+    stat -c '%s bytes' "${path}" 2>/dev/null || wc -c < "${path}"
+  else
+    wc -c < "${path}"
+  fi
+}
+
 require_file() {
   local path="$1"
   local label="$2"
@@ -150,22 +159,33 @@ require_file() {
     echo "Missing ${label}: ${path}" >&2
     return 1
   fi
+  echo "[asset] ${label}: ${path} ($(asset_size "${path}"))"
+}
+
+require_method_relative_file() {
+  local cwd="$1"
+  local rel_path="$2"
+  local label="$3"
+  local resolved
+  resolved="$(cd "${cwd}" && readlink -f "${rel_path}")"
+  require_file "${resolved}" "${label}"
+  echo "[asset] ${label} from cwd=${cwd}: ${rel_path} -> ${resolved}"
 }
 
 check_method_assets() {
   local method="$1"
   case "${method}" in
     panovggt|panovggtcamera|panovggt_camera|panovggtdepth|panovggt_depth)
-      require_file "${ROOT}/ckpt/PanoVGGT/model.pt" "PanoVGGT checkpoint"
+      require_method_relative_file "${COMPARE_ROOT}/camera_pose/PanoVGGT" "../../../ckpt/PanoVGGT/model.pt" "PanoVGGT checkpoint"
       ;;
     reloc3r|relo3r)
-      require_file "${ROOT}/ckpt/Reloc3r-512/Reloc3r-512.pth" "Reloc3r checkpoint"
+      require_method_relative_file "${COMPARE_ROOT}/camera_pose/Reloc3r" "../../../ckpt/Reloc3r-512/Reloc3r-512.pth" "Reloc3r checkpoint"
       ;;
     vggt_omega|vggtomega|vggt_omega_camera|vggtomegacamera|vggt_omega_depth|vggtomegadepth)
-      require_file "${ROOT}/ckpt/VGGT-Omega/vggt_omega_1b_512.pt" "VGGT-Omega checkpoint"
+      require_method_relative_file "${COMPARE_ROOT}/camera_pose/VGGT-Omega" "../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt" "VGGT-Omega checkpoint"
       ;;
     dap)
-      require_file "${ROOT}/ckpt/DAP/model.pth" "DAP checkpoint"
+      require_method_relative_file "${COMPARE_ROOT}/depth_geometry/DAP" "../../../ckpt/DAP/model.pth" "DAP checkpoint"
       ;;
     panda)
       if [[ ! -f "${ROOT}/ckpt/PanDA/panda_small.pth" && ! -f "${ROOT}/ckpt/PanDA/panda_base.pth" && ! -f "${ROOT}/ckpt/PanDA/panda_large.pth" ]]; then
@@ -203,7 +223,7 @@ for method in "${METHOD_ARRAY[@]}"; do
     exit 2
   fi
   env_name="$(resolve_installed_env "${canonical_env_name}")"
-  if [[ "${DRY_RUN}" != "1" && "${STAGE}" != "smoke" ]]; then
+  if [[ "${STAGE}" != "smoke" ]]; then
     check_method_assets "${method}"
   fi
   echo "[pipeline] method=${method} env=${env_name} canonical_env=${canonical_env_name} stage=${STAGE} finetune_timeout_seconds=${finetune_timeout_seconds:-none}"
