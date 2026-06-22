@@ -1,9 +1,11 @@
-# LUNA continuation after a 3h full-finetune warmup on a 4x RTX 5000 server.
-# Launch through scripts/run_stage_full_then_luna_residual_12h_4xrtx5000.sh.
+# LUNA continuation after a 3h full-finetune warmup produced by baseline01.
+# Total sequence runtime is 12h when launched through
+# scripts/run_stage_full_then_luna_residual_12h.sh.
 data:
   dataset_root: ../../panovggt/PanoCity_paired
   dataset_format: panocity_paired
-  checkpoint: ../baseline01_vggt_omega/logs/panocity_paired_4xrtx5000_full_warmup_3h_for_luna/ckpts/checkpoint.pt
+  dataset_max_samples: 100
+  checkpoint: ../baseline01_vggt_omega/logs/panocity_paired_100_full_warmup_4090_3h_for_luna/ckpts/checkpoint.pt
   pano_sample_mode: single
   pano_min_count: 1
   pano_max_count: 1
@@ -78,13 +80,13 @@ optimization:
 
 runtime:
   device: cuda
-  distributed: auto
+  distributed: none
   dist_backend: nccl
   find_unused_parameters: true
   amp_dtype: bfloat16
   epochs: 100000
   max_steps: 1000000
-  num_workers: 4
+  num_workers: 2
   seed: 43
   max_duration_minutes: 540.0
   save_every_steps: 0
@@ -93,7 +95,7 @@ runtime:
   debug_depth_dump: false
   debug_depth_threshold: 0.3
   debug_depth_max_dumps_per_step: 0
-  debug_dir: logs/debug_panocity_paired_4xrtx5000_luna_after_full_warmup_9h
+  debug_dir: logs/debug_panocity_paired_100_luna_after_full_warmup_4090_9h
 
 output:
-  output_dir: logs/panocity_paired_4xrtx5000_luna_after_full_warmup_9h
+  output_dir: logs/panocity_paired_100_luna_after_full_warmup_4090_9h

@@ -26,7 +26,7 @@ from data.dataset_util import depth_to_world_coords_points  # noqa: E402
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="panocity_paired_4xrtx5000_full_warmup_3h_for_luna")
+    parser.add_argument("--config", default="panocity_paired_4xrtx5000_full_warmup_90m_for_luna")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-samples", type=int, default=5)

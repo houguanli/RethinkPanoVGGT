@@ -1,4 +1,4 @@
-exp_name: panocity_paired_4xrtx5000_full_warmup_3h_for_luna
+exp_name: panocity_paired_4xrtx5000_full_warmup_90m_for_luna
 img_size: 512
 num_workers: 4
 seed_value: 42
@@ -10,7 +10,7 @@ max_img_per_gpu: 8
 limit_train_batches: 1000000
 limit_val_batches: 0
 max_epochs: 100000
-max_duration_minutes: 180.0
+max_duration_minutes: 90.0
 normalize_scene_scale: false
 mode: train
 device: cuda

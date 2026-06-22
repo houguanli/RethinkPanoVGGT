@@ -11,13 +11,13 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 BASE_PORT="${BASE_PORT:-29631}"
 LUNA_PORT="${LUNA_PORT:-29632}"
 
-BASE_CONFIG="panocity_paired_4xrtx5000_full_warmup_3h_for_luna"
-BASE_OUT="$BASELINE/logs/panocity_paired_4xrtx5000_full_warmup_3h_for_luna"
+BASE_CONFIG="panocity_paired_4xrtx5000_full_warmup_90m_for_luna"
+BASE_OUT="$BASELINE/logs/panocity_paired_4xrtx5000_full_warmup_90m_for_luna"
 BASE_CKPT="$BASE_OUT/ckpts/checkpoint.pt"
 
-LUNA_CONFIG="configs/single_pano_rtx5000x4_panocity_paired_luna_after_full_warmup_9h.yaml"
-LUNA_OUT="$LUNA/logs/panocity_paired_4xrtx5000_luna_after_full_warmup_9h"
-SEQ_LOG="$LUNA/logs/panocity_paired_4xrtx5000_stage_full_then_luna_residual_12h_sequence.log"
+LUNA_CONFIG="configs/single_pano_rtx5000x4_panocity_paired_luna_after_full_warmup_270m.yaml"
+LUNA_OUT="$LUNA/logs/panocity_paired_4xrtx5000_luna_after_full_warmup_270m"
+SEQ_LOG="$LUNA/logs/panocity_paired_4xrtx5000_stage_full_then_luna_residual_6h_sequence.log"
 
 mkdir -p "$(dirname "$SEQ_LOG")" "$BASE_OUT" "$LUNA_OUT"
 
