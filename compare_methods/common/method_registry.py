@@ -82,7 +82,14 @@ METHODS: Dict[str, MethodSpec] = {
             COMPARE_ROOT / "camera_pose" / "Reloc3r" / "requirements_optional.txt",
         ],
         config=COMPARE_ROOT / "configs" / "reloc3r_panocity_4rtx5000.yaml",
-        finetune_command=["python", "finetune_panocity.py"],
+        finetune_command=[
+            "torchrun", "--standalone", "--nproc_per_node=4", "train.py",
+            "--train_dataset", "PanoCityReloc3r(split='train', resolution=512)",
+            "--test_dataset", "PanoCityReloc3r(split='test', resolution=512)",
+            "--epochs", "20", "--batch_size", "8", "--num_workers", "8",
+            "--pretrained", "../../../ckpt/Reloc3r-512/Reloc3r-512.pth",
+            "--output_dir", "outputs/panocity_4rtx5000",
+        ],
         evaluate_command=["python", "evaluate_panocity.py"],
         smoke_finetune_command=[
             "python", "train.py",

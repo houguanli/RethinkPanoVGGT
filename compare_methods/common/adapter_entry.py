@@ -20,7 +20,41 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
         return yaml.safe_load(handle)
 
 
+PATH_FLAGS = {
+    "--checkpoint",
+    "--config",
+    "--load",
+    "--load-weights",
+    "--load_weights",
+    "--load_weights_dir",
+    "--pretrained",
+    "--resume",
+}
+
+
+def _resolve_command_paths(command, cwd: Path) -> list[str]:
+    resolved_command = [str(part) for part in command]
+    for index, part in enumerate(resolved_command[:-1]):
+        if part not in PATH_FLAGS:
+            continue
+        value = resolved_command[index + 1]
+        if not value or value.startswith("-"):
+            continue
+        if part == "--config" and "/" not in value and "\\" not in value and not Path(value).suffix:
+            print(f"[asset] command {part}: {value} (config name)", flush=True)
+            continue
+        path = Path(os.path.expandvars(os.path.expanduser(value)))
+        resolved = path if path.is_absolute() else (cwd / path).resolve()
+        print(f"[asset] command {part}: {value} -> {resolved}", flush=True)
+        if part != "--config" and not resolved.exists():
+            raise SystemExit(f"Missing command asset for {part}: {value} -> {resolved}")
+        if part == "--config" and not resolved.exists():
+            raise SystemExit(f"Missing command config for {part}: {value} -> {resolved}")
+    return resolved_command
+
+
 def _run(command, cwd: Path, dry_run: bool) -> None:
+    command = _resolve_command_paths(command, cwd)
     print(f"[cmd] cwd={cwd} {' '.join(command)}", flush=True)
     if not dry_run:
         subprocess.run(command, cwd=str(cwd), check=True)

@@ -15,6 +15,16 @@ from .panocity_paired import smoke_summary
 
 
 FORBIDDEN_RUNTIME_PATHS = ("/public/home/", "/home/tione/", "/hpc2hdd/home/")
+PATH_FLAGS = {
+    "--checkpoint",
+    "--config",
+    "--load",
+    "--load-weights",
+    "--load_weights",
+    "--load_weights_dir",
+    "--pretrained",
+    "--resume",
+}
 
 
 def _runtime_config_paths(spec) -> list[Path]:
@@ -48,7 +58,27 @@ def _validate_runtime_paths(spec) -> None:
         )
 
 
+def _resolve_command_paths(cmd, cwd: Path) -> list[str]:
+    resolved_cmd = [str(part) for part in cmd]
+    for index, part in enumerate(resolved_cmd[:-1]):
+        if part not in PATH_FLAGS:
+            continue
+        value = resolved_cmd[index + 1]
+        if not value or value.startswith("-"):
+            continue
+        if part == "--config" and "/" not in value and "\\" not in value and not Path(value).suffix:
+            print(f"[asset] command {part}: {value} (config name)", flush=True)
+            continue
+        path = Path(os.path.expandvars(os.path.expanduser(value)))
+        resolved = path if path.is_absolute() else (cwd / path).resolve()
+        print(f"[asset] command {part}: {value} -> {resolved}", flush=True)
+        if not resolved.exists():
+            raise SystemExit(f"Missing command asset for {part}: {value} -> {resolved}")
+    return resolved_cmd
+
+
 def _run(cmd, cwd: Path, dry_run: bool, timeout_seconds: int | None = None) -> None:
+    cmd = _resolve_command_paths(cmd, cwd)
     print(f"[cmd] cwd={cwd} {' '.join(cmd)}", flush=True)
     if dry_run:
         return
