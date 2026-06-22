@@ -141,16 +141,16 @@ PY
 
 create_env() {
   local method="$1"
-  local env_name python_version method_dir
+  local env_name python_version method_dir check_method
   local -a reqs
   case "${method}" in
-    panovggt_camera) env_name=cmp_panovggt; python_version=3.11; method_dir="${COMPARE_ROOT}/camera_pose/PanoVGGT"; reqs=("${method_dir}/requirements.txt");;
-    panovggt_depth) env_name=cmp_panovggt; python_version=3.11; method_dir="${COMPARE_ROOT}/depth_geometry/PanoVGGT"; reqs=("${method_dir}/requirements.txt");;
-    reloc3r) env_name=cmp_reloc3r; python_version=3.11; method_dir="${COMPARE_ROOT}/camera_pose/Reloc3r"; reqs=("${method_dir}/requirements.txt" "${method_dir}/requirements_optional.txt");;
-    vggt_omega_camera) env_name=cmp_vggt_omega; python_version=3.10; method_dir="${COMPARE_ROOT}/camera_pose/VGGT-Omega"; reqs=("${method_dir}/requirements.txt");;
-    vggt_omega_depth) env_name=cmp_vggt_omega; python_version=3.10; method_dir="${COMPARE_ROOT}/depth_geometry/VGGT-Omega"; reqs=("${method_dir}/requirements.txt");;
-    dap) env_name=cmp_dap; python_version=3.12; method_dir="${COMPARE_ROOT}/depth_geometry/DAP"; reqs=("${method_dir}/requirements.txt");;
-    panda) env_name=cmp_panda; python_version=3.10; method_dir="${COMPARE_ROOT}/depth_geometry/PanDA"; reqs=("${method_dir}/requirements.txt");;
+    panovggt_camera|panovggtcamera) check_method=panovggt_camera; env_name=cmp_panovggt; python_version=3.11; method_dir="${COMPARE_ROOT}/camera_pose/PanoVGGT"; reqs=("${method_dir}/requirements.txt");;
+    panovggt_depth|panovggtdepth) check_method=panovggt_depth; env_name=cmp_panovggt; python_version=3.11; method_dir="${COMPARE_ROOT}/depth_geometry/PanoVGGT"; reqs=("${method_dir}/requirements.txt");;
+    reloc3r|relo3r) check_method=reloc3r; env_name=cmp_reloc3r; python_version=3.11; method_dir="${COMPARE_ROOT}/camera_pose/Reloc3r"; reqs=("${method_dir}/requirements.txt" "${method_dir}/requirements_optional.txt");;
+    vggt_omega_camera|vggtomegacamera) check_method=vggt_omega_camera; env_name=cmp_vggt_omega; python_version=3.10; method_dir="${COMPARE_ROOT}/camera_pose/VGGT-Omega"; reqs=("${method_dir}/requirements.txt");;
+    vggt_omega_depth|vggtomegadepth) check_method=vggt_omega_depth; env_name=cmp_vggt_omega; python_version=3.10; method_dir="${COMPARE_ROOT}/depth_geometry/VGGT-Omega"; reqs=("${method_dir}/requirements.txt");;
+    dap) check_method=dap; env_name=cmp_dap; python_version=3.12; method_dir="${COMPARE_ROOT}/depth_geometry/DAP"; reqs=("${method_dir}/requirements.txt");;
+    panda) check_method=panda; env_name=cmp_panda; python_version=3.10; method_dir="${COMPARE_ROOT}/depth_geometry/PanDA"; reqs=("${method_dir}/requirements.txt");;
     *) echo "Unknown method: ${method}" >&2; return 2;;
   esac
 
@@ -164,7 +164,7 @@ create_env() {
   conda activate "${env_name}"
   python -m pip install --upgrade pip
 
-  if [[ "${method}" == "reloc3r" ]]; then
+  if [[ "${check_method}" == "reloc3r" ]]; then
     conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia -y
   fi
 
@@ -173,10 +173,10 @@ create_env() {
       python -m pip install -r "${req}"
     fi
   done
-  if [[ "${method}" == vggt_omega_* ]]; then
+  if [[ "${check_method}" == vggt_omega_* ]]; then
     python -m pip install -e "${method_dir}"
   fi
-  post_install_check "${method}" "${method_dir}"
+  post_install_check "${check_method}" "${method_dir}"
   python - <<'PY'
 import sys
 print("python", sys.version)
@@ -192,7 +192,7 @@ if [[ "${METHOD}" == "all" ]]; then
   done
 elif [[ "${METHOD}" == "panovggt" ]]; then
   create_env panovggt_camera
-elif [[ "${METHOD}" == "vggt_omega" ]]; then
+elif [[ "${METHOD}" == "vggt_omega" || "${METHOD}" == "vggtomega" ]]; then
   create_env vggt_omega_camera
 else
   create_env "${METHOD}"

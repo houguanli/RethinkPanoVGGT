@@ -10,7 +10,7 @@ tensorboard
 pyglet<2
 huggingface-hub[torch]>=0.22
 imagesize
-open3d
+open3d==0.19.0
 Pillow
 
 # Training-data preprocessing

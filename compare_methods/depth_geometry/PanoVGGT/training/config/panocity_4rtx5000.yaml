@@ -21,6 +21,9 @@ logging:
 
 model:
   aggregator:
+    # Finetuning resumes from ckpt/PanoVGGT/model.pt, so a separate DINOv2
+    # bootstrap is unnecessary by default and can fail on offline clusters.
+    load_dinov2_pretrained: ${oc.env:PANOVGGT_LOAD_DINOV2_PRETRAINED,false}
     dinov2_weights_path: ${oc.env:DINOV2_WEIGHTS_PATH,''}
     allow_dinov2_download: ${oc.env:DINOV2_ALLOW_DOWNLOAD,false}
 

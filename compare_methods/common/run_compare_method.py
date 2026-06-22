@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .method_registry import get_group, get_method, is_group, runnable_names
+from .method_registry import get_group, get_method, is_group, normalize_name, runnable_names
 from .panocity_paired import smoke_summary
 
 
@@ -112,6 +112,7 @@ def main() -> int:
 
     if args.panocity_root:
         os.environ["PANOCITY_ROOT"] = args.panocity_root
+    args.method = normalize_name(args.method)
 
     summary = smoke_summary(args.panocity_root, split="train")
     if is_group(args.method):

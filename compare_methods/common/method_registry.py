@@ -178,6 +178,19 @@ GROUPS: Dict[str, MethodGroup] = {
     ),
 }
 
+ALIASES: Dict[str, str] = {
+    "panovggtcamera": "panovggt_camera",
+    "panovggtdepth": "panovggt_depth",
+    "relo3r": "reloc3r",
+    "vggtomega": "vggt_omega",
+    "vggtomegacamera": "vggt_omega_camera",
+    "vggtomegadepth": "vggt_omega_depth",
+}
+
+
+def normalize_name(name: str) -> str:
+    return ALIASES.get(name, name)
+
 
 def method_names() -> List[str]:
     return sorted(METHODS)
@@ -188,10 +201,11 @@ def group_names() -> List[str]:
 
 
 def runnable_names() -> List[str]:
-    return sorted(set(method_names()) | set(group_names()))
+    return sorted(set(method_names()) | set(group_names()) | set(ALIASES))
 
 
 def get_method(name: str) -> MethodSpec:
+    name = normalize_name(name)
     try:
         return METHODS[name]
     except KeyError as exc:
@@ -199,6 +213,7 @@ def get_method(name: str) -> MethodSpec:
 
 
 def get_group(name: str) -> MethodGroup:
+    name = normalize_name(name)
     try:
         return GROUPS[name]
     except KeyError as exc:
@@ -206,4 +221,5 @@ def get_group(name: str) -> MethodGroup:
 
 
 def is_group(name: str) -> bool:
+    name = normalize_name(name)
     return name in GROUPS

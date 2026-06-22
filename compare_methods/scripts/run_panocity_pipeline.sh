@@ -112,25 +112,102 @@ resolve_finetune_timeout_seconds() {
 
 env_for_method() {
   case "$1" in
-    panovggt|panovggt_camera|panovggt_depth) echo cmp_panovggt;;
-    reloc3r) echo cmp_reloc3r;;
-    vggt_omega|vggt_omega_camera|vggt_omega_depth) echo cmp_vggt_omega;;
+    panovggt|panovggtcamera|panovggt_camera|panovggtdepth|panovggt_depth) echo cmp_panovggt;;
+    reloc3r|relo3r) echo cmp_reloc3r;;
+    vggt_omega|vggtomega|vggt_omega_camera|vggtomegacamera|vggt_omega_depth|vggtomegadepth) echo cmp_vggt_omega;;
     dap) echo cmp_dap;;
     panda) echo cmp_panda;;
     *) echo "unknown";;
   esac
 }
 
+resolve_installed_env() {
+  local canonical="$1"
+  local aliases=("${canonical}")
+  case "${canonical}" in
+    cmp_panovggt) aliases+=("cmppanovggt");;
+    cmp_reloc3r) aliases+=("cmpreloc3r");;
+    cmp_vggt_omega) aliases+=("cmpvggtomega");;
+    cmp_dap) aliases+=("cmpdap");;
+    cmp_panda) aliases+=("cmppanda");;
+  esac
+
+  local env_name
+  for env_name in "${aliases[@]}"; do
+    if conda env list | awk '{print $1}' | grep -qx "${env_name}"; then
+      printf '%s\n' "${env_name}"
+      return 0
+    fi
+  done
+  echo "Cannot find conda env '${canonical}'. Tried: ${aliases[*]}" >&2
+  return 1
+}
+
+require_file() {
+  local path="$1"
+  local label="$2"
+  if [[ ! -f "${path}" ]]; then
+    echo "Missing ${label}: ${path}" >&2
+    return 1
+  fi
+}
+
+check_method_assets() {
+  local method="$1"
+  case "${method}" in
+    panovggt|panovggtcamera|panovggt_camera|panovggtdepth|panovggt_depth)
+      require_file "${ROOT}/ckpt/PanoVGGT/model.pt" "PanoVGGT checkpoint"
+      ;;
+    reloc3r|relo3r)
+      require_file "${ROOT}/ckpt/Reloc3r-512/Reloc3r-512.pth" "Reloc3r checkpoint"
+      ;;
+    vggt_omega|vggtomega|vggt_omega_camera|vggtomegacamera|vggt_omega_depth|vggtomegadepth)
+      require_file "${ROOT}/ckpt/VGGT-Omega/vggt_omega_1b_512.pt" "VGGT-Omega checkpoint"
+      ;;
+    dap)
+      require_file "${ROOT}/ckpt/DAP/model.pth" "DAP checkpoint"
+      ;;
+    panda)
+      if [[ ! -f "${ROOT}/ckpt/PanDA/panda_small.pth" && ! -f "${ROOT}/ckpt/PanDA/panda_base.pth" && ! -f "${ROOT}/ckpt/PanDA/panda_large.pth" ]]; then
+        echo "Missing PanDA checkpoint: expected one of ${ROOT}/ckpt/PanDA/panda_{small,base,large}.pth" >&2
+        return 1
+      fi
+      ;;
+  esac
+}
+
+print_env_context() {
+  local env_name="$1"
+  conda run --no-capture-output -n "${env_name}" python - <<'PY'
+import os
+import sys
+
+print(
+    "[env] active={} prefix={} python={}".format(
+        os.environ.get("CONDA_DEFAULT_ENV", ""),
+        os.environ.get("CONDA_PREFIX", ""),
+        sys.executable,
+    ),
+    flush=True,
+)
+PY
+}
+
 IFS=',' read -ra METHOD_ARRAY <<< "${METHODS}"
 finetune_timeout_seconds="$(resolve_finetune_timeout_seconds)"
 for method in "${METHOD_ARRAY[@]}"; do
-  env_name="$(env_for_method "${method}")"
-  if [[ "${env_name}" == "unknown" ]]; then
+  method="$(echo "${method}" | xargs)"
+  canonical_env_name="$(env_for_method "${method}")"
+  if [[ "${canonical_env_name}" == "unknown" ]]; then
     echo "Unknown method: ${method}" >&2
     exit 2
   fi
-  echo "[pipeline] method=${method} env=${env_name} stage=${STAGE} finetune_timeout_seconds=${finetune_timeout_seconds:-none}"
-  conda activate "${env_name}"
+  env_name="$(resolve_installed_env "${canonical_env_name}")"
+  if [[ "${DRY_RUN}" != "1" && "${STAGE}" != "smoke" ]]; then
+    check_method_assets "${method}"
+  fi
+  echo "[pipeline] method=${method} env=${env_name} canonical_env=${canonical_env_name} stage=${STAGE} finetune_timeout_seconds=${finetune_timeout_seconds:-none}"
+  print_env_context "${env_name}"
   args=(--method "${method}" --stage "${STAGE}")
   if [[ "${DRY_RUN}" == "1" ]]; then
     args+=(--dry-run)
@@ -141,6 +218,7 @@ for method in "${METHOD_ARRAY[@]}"; do
   if [[ -n "${finetune_timeout_seconds}" ]]; then
     args+=(--finetune-timeout-seconds "${finetune_timeout_seconds}")
   fi
-  PYTHONPATH="${ROOT}:${PYTHONPATH:-}" python -m compare_methods.common.run_compare_method "${args[@]}"
-  conda deactivate
+  conda run --no-capture-output -n "${env_name}" \
+    env PYTHONPATH="${ROOT}:${PYTHONPATH:-}" PYTHONUNBUFFERED=1 \
+    python -m compare_methods.common.run_compare_method "${args[@]}"
 done
