@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 
-DEFAULT_TRAIN_COUNT = 200_000
+DEFAULT_TRAIN_COUNT = 100_000
 
 
 @dataclass(frozen=True)
