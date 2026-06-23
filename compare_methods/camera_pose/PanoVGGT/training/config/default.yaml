@@ -101,6 +101,10 @@ logging:
         - loss_grad_point
         - loss_local_point
         - loss_global_point
+        - loss_metric_depth
+        - loss_metric_depth_scaled
+        - loss_metric_point
+        - metric_depth_scale
     val:
       keys_to_log:
         - loss_objective
@@ -111,6 +115,10 @@ logging:
         - loss_grad_point
         - loss_local_point
         - loss_global_point
+        - loss_metric_depth
+        - loss_metric_depth_scaled
+        - loss_metric_point
+        - metric_depth_scale
 
 
 checkpoint:
@@ -123,6 +131,10 @@ checkpoint:
 loss:
   _target_: panovggt.models.loss.Loss
   train_conf: ${model.train_conf}
+  scale_invariant_weight: 1.0
+  camera_weight: 0.1
+  metric_depth_weight: 0.0
+  metric_point_weight: 0.0
 
 
 optim:
@@ -156,6 +168,9 @@ optim:
         norm_type: 2
       - module_name: ["pos"]
         max_norm: 1.0
+        norm_type: 2
+      - module_name: ["log_geometry_output_scale"]
+        max_norm: 0.1
         norm_type: 2
         
   options:

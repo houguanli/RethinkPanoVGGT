@@ -134,6 +134,8 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
         enable_point: bool = True,
         enable_depth: bool = True,
         enable_global_points: bool = True,
+        geometry_output_scale: float = 1.0,
+        train_geometry_output_scale: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -152,6 +154,15 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
         self.enable_point = enable_point
         self.enable_depth = enable_depth
         self.enable_global_points = enable_global_points
+
+        geometry_output_scale = float(geometry_output_scale)
+        if geometry_output_scale <= 0:
+            raise ValueError("geometry_output_scale must be positive")
+        log_scale = torch.tensor(math.log(geometry_output_scale), dtype=torch.float32)
+        if train_geometry_output_scale:
+            self.log_geometry_output_scale = nn.Parameter(log_scale)
+        else:
+            self.register_buffer("log_geometry_output_scale", log_scale)
 
         # 3) Decoder heads
         in_dim_for_decoders = 2 * embed_dim
@@ -275,11 +286,15 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
             self._direction_vectors_cache = self._direction_vectors_cache.to(device)
         return self._direction_vectors_cache
 
+    def _geometry_output_scale(self, device, dtype):
+        return self.log_geometry_output_scale.to(device=device, dtype=dtype).exp()
+
     def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
         if images.dim() == 4:
             images = images.unsqueeze(0)
         B, S, _, H, W = images.shape
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
+        geometry_scale = self._geometry_output_scale(images.device, images.dtype)
 
         # Aggregator forward
         out = self.aggregator(images)
@@ -321,7 +336,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
                 ).reshape(B, S, H, W, 3)
 
                 log_d = ret[..., 2]
-                d_pred = torch.exp(log_d)[..., None]
+                d_pred = torch.exp(log_d)[..., None] * geometry_scale
 
                 directions = self._get_direction_vectors(H, W, d_pred.device, d_pred.dtype)
                 local_points = directions.view(1, 1, H, W, 3) * d_pred
@@ -344,6 +359,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
                 camera_poses = self.camera_head(
                     camera_hidden[:, patch_start_idx:], patch_h, patch_w,
                 ).reshape(B, S, 4, 4)
+                camera_poses[..., :3, 3] *= geometry_scale
             predictions["camera_poses"] = camera_poses
 
             if "local_points" in predictions:
@@ -387,7 +403,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
                 global_point_hidden = global_point_hidden.float()
                 global_points = self.global_point_head(
                     [global_point_hidden[:, patch_start_idx:]], (H, W)
-                ).reshape(B, S, H, W, 3)
+                ).reshape(B, S, H, W, 3) * geometry_scale
             predictions["global_points"] = global_points
         else:
             predictions["global_points"] = None

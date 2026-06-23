@@ -21,6 +21,8 @@ logging:
   log_dir: logs
 
 model:
+  geometry_output_scale: ${oc.env:PANOVGGT_GEOMETRY_OUTPUT_SCALE,1.0}
+  train_geometry_output_scale: ${oc.env:PANOVGGT_TRAIN_GEOMETRY_OUTPUT_SCALE,true}
   aggregator:
     # Finetuning resumes from ckpt/PanoVGGT/model.pt, so a separate DINOv2
     # bootstrap is unnecessary by default and can fail on offline clusters.
@@ -43,6 +45,7 @@ data:
         - _target_: training.data.datasets.panocity_paired.PanoCityPairedDataset
           root: ${oc.env:PANOCITY_ROOT,../PanoCity_paired}
           split: train
+          depth_scale: ${oc.env:PANOCITY_DEPTH_SCALE,100.0}
   val:
     common_config:
       img_size: ${img_size}
@@ -56,7 +59,12 @@ data:
         - _target_: training.data.datasets.panocity_paired.PanoCityPairedDataset
           root: ${oc.env:PANOCITY_ROOT,../PanoCity_paired}
           split: test
+          depth_scale: ${oc.env:PANOCITY_DEPTH_SCALE,100.0}
 
 checkpoint:
   resume_checkpoint_path: ../../../ckpt/PanoVGGT/model.pt
   save_dir: logs/${exp_name}/ckpts
+
+loss:
+  metric_depth_weight: ${oc.env:PANOVGGT_METRIC_DEPTH_WEIGHT,0.25}
+  metric_point_weight: ${oc.env:PANOVGGT_METRIC_POINT_WEIGHT,0.05}

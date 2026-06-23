@@ -42,6 +42,7 @@ data:
           root: ${oc.env:PANOCITY_ROOT,../PanoCity_paired}
           split: smoke
           max_samples: 8
+          depth_scale: ${oc.env:PANOCITY_DEPTH_SCALE,100.0}
   val:
     common_config:
       img_nums: [2, 2]
@@ -51,3 +52,4 @@ data:
           root: ${oc.env:PANOCITY_ROOT,../PanoCity_paired}
           split: smoke
           max_samples: 8
+          depth_scale: ${oc.env:PANOCITY_DEPTH_SCALE,100.0}

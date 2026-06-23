@@ -568,10 +568,113 @@ class Loss(nn.Module):
         train_conf (bool): Whether to train confidence prediction. Default: False.
     """
     
-    def __init__(self, train_conf: bool = False):
+    def __init__(
+        self,
+        train_conf: bool = False,
+        scale_invariant_weight: float = 1.0,
+        camera_weight: float = 0.1,
+        metric_depth_weight: float = 0.0,
+        metric_point_weight: float = 0.0,
+    ):
         super().__init__()
         self.point_loss = PointLoss(train_conf=train_conf)
         self.camera_loss = CameraLoss()
+        self.scale_invariant_weight = float(scale_invariant_weight)
+        self.camera_weight = float(camera_weight)
+        self.metric_depth_weight = float(metric_depth_weight)
+        self.metric_point_weight = float(metric_point_weight)
+
+    @staticmethod
+    def _raw_depth_target(gt_raw: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        target_depth = gt_raw.get('raw_depths', gt_raw.get('depths', None))
+        if target_depth is None:
+            return None
+        if target_depth.dim() == 5 and target_depth.shape[2] == 1:
+            target_depth = target_depth[:, :, 0]
+        return target_depth
+
+    @staticmethod
+    def _squeeze_pred_depth(pred: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        pred_depth = pred.get('depth', None)
+        if pred_depth is None:
+            return None
+        if pred_depth.dim() == 5 and pred_depth.shape[-1] == 1:
+            pred_depth = pred_depth[..., 0]
+        return pred_depth
+
+    def metric_depth_loss(
+        self,
+        pred: Dict[str, torch.Tensor],
+        gt_raw: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Scale-sensitive depth loss against raw metric depth when available."""
+        pred_depth = self._squeeze_pred_depth(pred)
+        target_depth = self._raw_depth_target(gt_raw)
+        if pred_depth is None or target_depth is None:
+            ref = pred.get('local_points')
+            if ref is None:
+                ref = next(iter(pred.values()))
+            zero = ref.new_tensor(0.0)
+            one = ref.new_tensor(1.0)
+            return zero, one, zero
+
+        mask = gt_raw.get('point_masks', None)
+        if mask is None:
+            mask = torch.isfinite(target_depth)
+        valid = (
+            mask.bool()
+            & torch.isfinite(pred_depth)
+            & torch.isfinite(target_depth)
+            & (target_depth > 1e-4)
+            & (pred_depth > 1e-6)
+        )
+        if not valid.any():
+            zero = pred_depth.new_tensor(0.0)
+            one = pred_depth.new_tensor(1.0)
+            return zero, one, zero
+
+        pred_valid = pred_depth[valid].float()
+        target_valid = target_depth[valid].float()
+        denom = target_valid.clamp_min(1e-3)
+        abs_rel = ((pred_valid - target_valid).abs() / denom).mean()
+
+        with torch.no_grad():
+            scale = (
+                (pred_valid * target_valid).sum()
+                / pred_valid.square().sum().clamp_min(1e-8)
+            ).abs().clamp(1e-6, 1e6)
+            scaled_abs_rel = ((scale * pred_valid - target_valid).abs() / denom).mean()
+
+        return abs_rel, scale.to(pred_depth.dtype), scaled_abs_rel.to(pred_depth.dtype)
+
+    def metric_point_loss(
+        self,
+        pred: Dict[str, torch.Tensor],
+        gt_raw: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Scale-sensitive local point loss in the raw camera coordinate scale."""
+        pred_points = pred.get('local_points', None)
+        target_points = gt_raw.get('raw_cam_points', gt_raw.get('cam_points', None))
+        if pred_points is None or target_points is None:
+            ref = pred.get('depth', pred.get('local_points'))
+            return ref.new_tensor(0.0)
+
+        mask = gt_raw.get('point_masks', None)
+        if mask is None:
+            mask = torch.isfinite(target_points).all(dim=-1)
+        valid = (
+            mask.bool()
+            & torch.isfinite(pred_points).all(dim=-1)
+            & torch.isfinite(target_points).all(dim=-1)
+        )
+        if not valid.any():
+            return pred_points.new_tensor(0.0)
+
+        pred_valid = pred_points[valid].float()
+        target_valid = target_points[valid].float()
+        distance_error = torch.linalg.norm(pred_valid - target_valid, dim=-1)
+        target_distance = torch.linalg.norm(target_valid, dim=-1).clamp_min(1e-3)
+        return (distance_error / target_distance).mean()
     
     def prepare_gt(self, gt: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -706,16 +809,25 @@ class Loss(nn.Module):
         """
         # Prepare ground truth
         gt = self.prepare_gt(gt_raw)
+
+        raw_pred = dict(pred)
+        metric_depth, metric_depth_scale, metric_depth_scaled = self.metric_depth_loss(raw_pred, gt_raw)
+        metric_point = self.metric_point_loss(raw_pred, gt_raw)
         
         # Normalize predictions
-        pred = self.normalize_pred(pred, gt)
+        pred = self.normalize_pred(dict(pred), gt)
         
         # Compute point and camera losses
         point_loss, point_details, scale = self.point_loss(pred, gt)
         cam_loss, cam_details = self.camera_loss(pred, gt, scale)
         
         # Total objective loss
-        loss_objective = point_loss + 0.1 * cam_loss
+        loss_objective = (
+            self.scale_invariant_weight * point_loss
+            + self.camera_weight * cam_loss
+            + self.metric_depth_weight * metric_depth
+            + self.metric_point_weight * metric_point
+        )
         
         # Helper to convert to tensor
         def as_tensor(x):
@@ -751,6 +863,10 @@ class Loss(nn.Module):
             'loss_grad_point': as_tensor(point_details.get('normal_loss', zero)),
             'loss_local_point': as_tensor(point_details.get('local_pts_loss', zero)),
             'loss_global_point': as_tensor(point_details.get('global_pts_loss', zero)),
+            'loss_metric_depth': as_tensor(metric_depth),
+            'loss_metric_depth_scaled': as_tensor(metric_depth_scaled),
+            'loss_metric_point': as_tensor(metric_point),
+            'metric_depth_scale': as_tensor(metric_depth_scale),
         }
         
         return loss_dict

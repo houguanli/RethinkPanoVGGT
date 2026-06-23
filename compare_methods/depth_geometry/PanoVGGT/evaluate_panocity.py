@@ -48,6 +48,8 @@ def _build_model(cfg) -> PanoVGGTModel:
         enable_camera=model_cfg.enable_camera,
         enable_depth=model_cfg.enable_depth,
         enable_point=model_cfg.enable_point,
+        geometry_output_scale=float(getattr(model_cfg, "geometry_output_scale", 1.0)),
+        train_geometry_output_scale=bool(getattr(model_cfg, "train_geometry_output_scale", False)),
         aggregator=aggregator_cfg,
     )
 

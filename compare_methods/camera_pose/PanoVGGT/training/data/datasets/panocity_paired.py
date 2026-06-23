@@ -35,7 +35,7 @@ class PanoCityPairedDataset(BaseDataset):
         len_train: int | None = None,
         len_test: int | None = None,
         max_samples: int | None = None,
-        depth_scale: float = 1000.0,
+        depth_scale: float = 100.0,
         depth_max: float = 100.0,
         **_: object,
     ) -> None:

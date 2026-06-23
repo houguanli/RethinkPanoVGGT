@@ -23,6 +23,19 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 
 DEFAULT_TRAIN_COUNT = 100_000
+DEFAULT_DEPTH_SCALE = 100.0
+
+
+def resolve_depth_scale(depth_scale: Optional[float] = None) -> float:
+    """Resolve PanoCity paired depth scale.
+
+    The official PanoCity reader converts centimeters to meters. Keep an
+    environment override because some local exports may already be converted.
+    """
+    if depth_scale is not None:
+        return float(depth_scale)
+    raw_value = os.environ.get("PANOCITY_DEPTH_SCALE")
+    return float(raw_value) if raw_value else DEFAULT_DEPTH_SCALE
 
 
 @dataclass(frozen=True)
@@ -196,7 +209,7 @@ def read_rgb(path: Path, size: Optional[Tuple[int, int]] = None) -> np.ndarray:
     return image
 
 
-def read_depth(path: Path, depth_scale: float = 1000.0, size: Optional[Tuple[int, int]] = None) -> np.ndarray:
+def read_depth(path: Path, depth_scale: Optional[float] = None, size: Optional[Tuple[int, int]] = None) -> np.ndarray:
     import cv2
     import numpy as np
 
@@ -209,6 +222,7 @@ def read_depth(path: Path, depth_scale: float = 1000.0, size: Optional[Tuple[int
         width, height = size
         depth = cv2.resize(depth, (width, height), interpolation=cv2.INTER_NEAREST)
     depth = depth.astype(np.float32)
+    depth_scale = resolve_depth_scale(depth_scale)
     if depth_scale:
         depth = depth / float(depth_scale)
     return depth
@@ -230,7 +244,7 @@ class PanoCityDepthTorchDataset:
         is_training: bool = False,
         split: str = "train",
         max_samples: Optional[int] = None,
-        depth_scale: float = 1000.0,
+        depth_scale: Optional[float] = None,
         max_depth_meters: float = 100.0,
     ) -> None:
         import torch
@@ -250,7 +264,7 @@ class PanoCityDepthTorchDataset:
         self.records = self.records * max(1, int(repeat))
         self.height = int(height)
         self.width = int(width)
-        self.depth_scale = float(depth_scale)
+        self.depth_scale = resolve_depth_scale(depth_scale)
         self.max_depth_meters = float(max_depth_meters)
         self.is_training = bool(is_training)
         self.color_augmentation = bool(color_augmentation)

@@ -633,6 +633,11 @@ class Trainer:
         if self.data_conf.train.common_config.repeat_batch:
             batch = self._apply_batch_repetition(batch)
 
+        batch["raw_depths"] = batch["depths"].clone()
+        batch["raw_cam_points"] = batch["cam_points"].clone()
+        batch["raw_world_points"] = batch["world_points"].clone()
+        batch["raw_extrinsics"] = batch["extrinsics"].clone()
+
         normalized_extrinsics, normalized_cam_points, normalized_world_points, normalized_depths, avg_scale = \
             normalize_camera_extrinsics_and_points_batch(
                 extrinsics=batch["extrinsics"],
