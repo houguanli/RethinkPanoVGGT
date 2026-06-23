@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
+from .dinov2_assets import prepare_panovggt_dinov2_asset
 from .panocity_paired import smoke_summary
 
 
@@ -118,6 +119,7 @@ def run_adapter(default_config: Path, default_stage: str = "finetune") -> int:
     raw_method_root = Path(cfg["method"]["path"]).expanduser()
     method_root = raw_method_root if raw_method_root.is_absolute() else (config_path.parents[1] / raw_method_root)
     method_root = method_root.resolve()
+    repo_root = config_path.parents[2]
     print(json.dumps({"config": str(config_path), "summary": smoke_summary(args.panocity_root)}, indent=2), flush=True)
 
     if args.stage == "smoke":
@@ -130,6 +132,8 @@ def run_adapter(default_config: Path, default_stage: str = "finetune") -> int:
     command = stage_cfg.get("command")
     if not command:
         raise SystemExit(f"No command configured for stage={args.stage} in {config_path}")
+    if args.stage == "finetune" and str(cfg["method"]["name"]).startswith("panovggt"):
+        prepare_panovggt_dinov2_asset(repo_root, dry_run=args.dry_run)
     _run([str(part) for part in command], method_root, args.dry_run)
     return 0
 

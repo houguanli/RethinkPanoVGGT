@@ -307,6 +307,7 @@ class Aggregator(nn.Module):
             preferred = [
                 path / "model.safetensors",
                 path / "pytorch_model.bin",
+                path / "dinov2_vitl14_reg4_pretrain.pth",
                 path / "dinov2_vitl14_pretrain.pth",
             ]
             for candidate in preferred:

@@ -11,7 +11,8 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
-from .method_registry import get_group, get_method, is_group, normalize_name, runnable_names
+from .dinov2_assets import prepare_panovggt_dinov2_asset
+from .method_registry import REPO_ROOT, get_group, get_method, is_group, normalize_name, runnable_names
 from .panocity_paired import smoke_summary
 
 
@@ -160,6 +161,8 @@ def _run(cmd, cwd: Path, dry_run: bool, timeout_seconds: int | None = None) -> N
 
 def _run_finetune(spec, dry_run: bool, allow_unsupported: bool, timeout_seconds: int | None, smoke: bool = False) -> None:
     _validate_runtime_paths(spec)
+    if spec.name.startswith("panovggt_"):
+        prepare_panovggt_dinov2_asset(REPO_ROOT, dry_run=dry_run)
     if not spec.supports_native_finetune and not allow_unsupported:
         raise SystemExit(
             f"{spec.name} has no native public finetune implementation in this checkout. "
