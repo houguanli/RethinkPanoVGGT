@@ -40,7 +40,15 @@ from vggt_omega.utils.rotation import mat_to_quat  # noqa: E402
 
 DEFAULT_DATASET_ROOT = Path("whitehole/AOKI/datasets/PANO_LUNA_omega")
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "ckpt" / "vggt_omega_1b_512.pt"
-CONFIG_PATH_KEYS = {"dataset_root", "checkpoint", "output_dir", "log_csv", "loss_plot", "debug_dir"}
+CONFIG_PATH_KEYS = {
+    "dataset_root",
+    "checkpoint",
+    "output_dir",
+    "log_csv",
+    "loss_plot",
+    "tensorboard_dir",
+    "debug_dir",
+}
 DEFAULT_PANOCITY_PRED_DEPTH_SCALE = 5.491308212280273
 
 
@@ -244,6 +252,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--progress-log-every", type=int, default=50)
     parser.add_argument("--log-csv", type=Path, default=None)
     parser.add_argument("--loss-plot", type=Path, default=None)
+    parser.add_argument("--tensorboard-dir", type=Path, default=None)
+    parser.add_argument("--tensorboard", dest="tensorboard", action="store_true", default=True)
+    parser.add_argument("--no-tensorboard", dest="tensorboard", action="store_false")
     parser.add_argument("--debug-depth-dump", dest="debug_depth_dump", action="store_true", default=True)
     parser.add_argument("--no-debug-depth-dump", dest="debug_depth_dump", action="store_false")
     parser.add_argument(
@@ -452,6 +463,8 @@ def train(args: argparse.Namespace) -> None:
         barrier(dist_state)
         log_csv = args.log_csv or (args.output_dir / "loss.csv")
         loss_plot = args.loss_plot or (args.output_dir / "loss_curve.png")
+        tensorboard_dir = args.tensorboard_dir or (args.output_dir / "tensorboard")
+        tensorboard_writer = create_tensorboard_writer(tensorboard_dir, dist_state, enabled=args.tensorboard)
         max_duration_seconds = args.max_duration_minutes * 60.0 if args.max_duration_minutes > 0 else None
         started_at = time.time()
         metrics_history = []
@@ -522,11 +535,13 @@ def train(args: argparse.Namespace) -> None:
                     ),
                     "pred_depth_scale": float(loss_dict["pred_depth_scale"].item()),
                     "stage": active_stage_name,
+                    "stage_index": int(active_stage_index + 1) if active_stage_index is not None else 0,
                     "lr": optimizer.param_groups[0]["lr"],
                 }
                 if is_main_process(dist_state):
                     metrics_history.append(metrics)
                     append_loss_csv(log_csv, metrics)
+                    write_tensorboard_metrics(tensorboard_writer, metrics)
                     message = (
                         f"[TRAIN] epoch={epoch + 1} step={global_step} "
                         f"stage={active_stage_name} elapsed={elapsed_seconds / 60.0:.2f}m "
@@ -571,6 +586,9 @@ def train(args: argparse.Namespace) -> None:
     finally:
         if "progress" in locals() and progress is not None:
             progress.close()
+        if "tensorboard_writer" in locals() and tensorboard_writer is not None:
+            tensorboard_writer.flush()
+            tensorboard_writer.close()
         if "metrics_history" in locals() and is_main_process(dist_state):
             if metrics_history:
                 save_loss_plot(loss_plot, metrics_history)
@@ -1293,6 +1311,43 @@ def build_window_z_factor(camera_meta: Dict[str, torch.Tensor], height: int, wid
     forward = camera_meta["rotations"][..., :, 2].reshape(-1, 3)
     z_factor = (rays * forward[:, None, None, :]).sum(dim=-1).clamp_min(0.0)
     return z_factor.reshape(*camera_meta["yaw"].shape, height, width)
+
+
+def create_tensorboard_writer(path: Path, dist_state: Dict[str, Any], enabled: bool = True):
+    if not enabled or not is_main_process(dist_state):
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        print("[WARN] tensorboard is not installed; skip TensorBoard scalar logging.")
+        return None
+    path.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(path))
+    print(f"[INFO] tensorboard_dir = {path}")
+    return writer
+
+
+def write_tensorboard_metrics(writer, metrics: Dict[str, Any]) -> None:
+    if writer is None:
+        return
+    step = int(metrics["step"])
+    scalar_map = {
+        "loss/total": "loss",
+        "loss/depth": "loss_depth",
+        "loss/camera": "loss_camera",
+        "loss/camera_t": "loss_camera_t",
+        "loss/camera_r": "loss_camera_r",
+        "loss/camera_fov": "loss_camera_fov",
+        "loss/camera_consistency": "loss_camera_consistency",
+        "train/lr": "lr",
+        "train/pred_depth_scale": "pred_depth_scale",
+        "train/elapsed_seconds": "elapsed_seconds",
+        "train/stage_index": "stage_index",
+    }
+    for tag, key in scalar_map.items():
+        value = metrics.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            writer.add_scalar(tag, float(value), step)
 
 
 def append_loss_csv(path: Path, metrics: Dict[str, float]) -> None:

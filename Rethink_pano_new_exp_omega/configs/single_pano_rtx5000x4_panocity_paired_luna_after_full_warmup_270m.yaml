@@ -101,6 +101,8 @@ runtime:
   debug_dir: logs/debug_panocity_paired_4xrtx5000_luna_after_full_warmup_270m
   progress_bar: true
   progress_log_every: 50
+  tensorboard: true
+  tensorboard_dir: logs/panocity_paired_4xrtx5000_luna_after_full_warmup_270m/tensorboard
 
 output:
   output_dir: logs/panocity_paired_4xrtx5000_luna_after_full_warmup_270m
