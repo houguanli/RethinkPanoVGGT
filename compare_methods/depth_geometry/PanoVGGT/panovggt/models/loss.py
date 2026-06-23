@@ -736,7 +736,6 @@ class Loss(nn.Module):
             dict: Normalized predictions.
         """
         local_points = pred['local_points']
-        camera_poses = pred['camera_poses']
         masks = gt['valid_masks']
         
         B, N, H, W, _ = local_points.shape
@@ -753,6 +752,10 @@ class Loss(nn.Module):
         
         # Normalize local points
         pred['local_points'] = local_points / scale
+
+        if 'camera_poses' not in pred:
+            return pred
+        camera_poses = pred['camera_poses']
         
         # Normalize global points if present
         if 'global_points' in pred and pred['global_points'] is not None:
@@ -817,9 +820,15 @@ class Loss(nn.Module):
         # Normalize predictions
         pred = self.normalize_pred(dict(pred), gt)
         
-        # Compute point and camera losses
+        # Compute point and camera losses. Single-pano training can disable the
+        # camera branch entirely; in that case there are no relative poses to
+        # supervise, so keep the logged camera losses at zero.
         point_loss, point_details, scale = self.point_loss(pred, gt)
-        cam_loss, cam_details = self.camera_loss(pred, gt, scale)
+        if self.camera_weight == 0.0 or 'camera_poses' not in pred:
+            cam_loss = point_loss.new_tensor(0.0)
+            cam_details = {'trans_loss': cam_loss, 'rot_loss': cam_loss}
+        else:
+            cam_loss, cam_details = self.camera_loss(pred, gt, scale)
         
         # Total objective loss
         loss_objective = (

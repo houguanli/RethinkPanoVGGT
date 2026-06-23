@@ -102,8 +102,8 @@ class PanoCityPairedDataset(BaseDataset):
         if seq_index is None:
             seq_index = np.random.randint(0, len(self.index))
         if img_per_seq is None:
-            img_per_seq = 2
-        img_per_seq = max(2, int(img_per_seq))
+            img_per_seq = 1
+        img_per_seq = max(1, int(img_per_seq))
         ids = ids if ids is not None else list(range(img_per_seq))
 
         target_resolution = self._target_resolution()
