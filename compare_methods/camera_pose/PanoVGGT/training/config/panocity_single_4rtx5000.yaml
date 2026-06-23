@@ -1,0 +1,6 @@
+defaults:
+  - panocity_4rtx5000
+  - _self_
+
+exp_name: panocity_single_4rtx5000
+

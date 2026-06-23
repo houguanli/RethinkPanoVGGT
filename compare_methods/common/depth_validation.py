@@ -11,7 +11,11 @@ import torch.nn.functional as F
 def as_bchw(depth: torch.Tensor) -> torch.Tensor:
     """Convert common depth tensor layouts to Bx1xHxW."""
     if depth.ndim == 5:
-        depth = depth[:, 0]
+        if depth.shape[-1] == 1:
+            depth = depth.permute(0, 1, 4, 2, 3)
+        if depth.shape[2] != 1:
+            raise ValueError(f"Expected 5D depth tensor as BxSx1xHxW or BxSxHxWx1, got shape={tuple(depth.shape)}")
+        depth = depth.reshape(depth.shape[0] * depth.shape[1], *depth.shape[2:])
     if depth.ndim == 4 and depth.shape[-1] == 1:
         depth = depth.permute(0, 3, 1, 2)
     if depth.ndim == 3:

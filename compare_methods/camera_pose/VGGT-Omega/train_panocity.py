@@ -15,7 +15,7 @@ COMPARE_ROOT = Path(__file__).resolve().parents[2]
 if str(COMPARE_ROOT) not in sys.path:
     sys.path.insert(0, str(COMPARE_ROOT))
 
-from common.panocity_paired import PanoCityDepthTorchDataset  # noqa: E402
+from common.panocity_paired import PanoCityDepthSequenceTorchDataset, PanoCityDepthTorchDataset  # noqa: E402
 from vggt_omega.models import VGGTOmega  # noqa: E402
 
 
@@ -25,10 +25,16 @@ def load_config(path: str):
 
 
 def depth_loss(pred, target, mask):
-    if pred.ndim == 5:
-        pred = pred[:, 0]
+    if pred.ndim == 5 and pred.shape[-1] == 1:
+        pred = pred.permute(0, 1, 4, 2, 3)
     if pred.shape[-1] == 1:
         pred = pred.permute(0, 3, 1, 2)
+    if pred.ndim == 5:
+        pred = pred.reshape(pred.shape[0] * pred.shape[1], *pred.shape[2:])
+    if target.ndim == 5:
+        target = target.reshape(target.shape[0] * target.shape[1], *target.shape[2:])
+    if mask.ndim == 5:
+        mask = mask.reshape(mask.shape[0] * mask.shape[1], *mask.shape[2:])
     if pred.shape[-2:] != target.shape[-2:]:
         pred = F.interpolate(pred, target.shape[-2:], mode="bilinear", align_corners=True)
     pred = torch.clamp(pred, min=1e-6, max=100.0)
@@ -48,10 +54,13 @@ def main():
     train_cfg = cfg.get("train", {})
     root = os.environ.get("PANOCITY_ROOT") or cfg.get("panocity", {}).get("root")
     image_size = int(train_cfg.get("image_size", 512))
+    num_views = int(train_cfg.get("num_views", 1))
     if args.smoke:
         image_size = int(train_cfg.get("smoke_image_size", min(image_size, 256)))
+        num_views = int(train_cfg.get("smoke_num_views", num_views))
 
-    dataset = PanoCityDepthTorchDataset(
+    dataset_cls = PanoCityDepthSequenceTorchDataset if num_views > 1 else PanoCityDepthTorchDataset
+    dataset_kwargs = dict(
         root_dir=root,
         height=image_size,
         width=image_size * 2,
@@ -63,6 +72,9 @@ def main():
         target_mode=train_cfg.get("target_mode", "metric"),
         normalize_rgb=bool(train_cfg.get("normalize_rgb", False)),
     )
+    if num_views > 1:
+        dataset_kwargs["num_views"] = num_views
+    dataset = dataset_cls(**dataset_kwargs)
     loader = DataLoader(dataset, batch_size=1 if args.smoke else int(train_cfg.get("batch_size", 1)), shuffle=True, num_workers=0 if args.smoke else int(train_cfg.get("num_workers", 4)))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -81,7 +93,9 @@ def main():
     for epoch in range(max_epochs):
         pbar = tqdm(loader, desc=f"epoch {epoch}")
         for batch in pbar:
-            rgb = batch["rgb"].to(device).unsqueeze(1)
+            rgb = batch["rgb"].to(device)
+            if rgb.ndim == 4:
+                rgb = rgb.unsqueeze(1)
             target = batch["gt_depth"].to(device)
             mask = batch["val_mask"].to(device)
             optim.zero_grad(set_to_none=True)

@@ -4,7 +4,7 @@ set -euo pipefail
 METHOD="${1:-}"
 if [[ -z "${METHOD}" ]]; then
   echo "Usage: $0 <method|all>"
-  echo "Methods: panovggt panovggt_camera panovggt_depth reloc3r vggt_omega vggt_omega_camera vggt_omega_depth dap panda all"
+  echo "Methods: panovggt panovggt_single panovggt_multi panovggt_camera panovggt_depth reloc3r vggt_omega vggt_omega_single vggt_omega_multi vggt_omega_camera vggt_omega_depth dap panda all"
   exit 2
 fi
 
@@ -190,9 +190,9 @@ if [[ "${METHOD}" == "all" ]]; then
   for m in panovggt_camera reloc3r vggt_omega_camera dap panda; do
     create_env "${m}"
   done
-elif [[ "${METHOD}" == "panovggt" ]]; then
+elif [[ "${METHOD}" == "panovggt" || "${METHOD}" == "panovggt_single" || "${METHOD}" == "panovggtsingle" || "${METHOD}" == "panovggt_multi" || "${METHOD}" == "panovggtmulti" ]]; then
   create_env panovggt_camera
-elif [[ "${METHOD}" == "vggt_omega" || "${METHOD}" == "vggtomega" ]]; then
+elif [[ "${METHOD}" == "vggt_omega" || "${METHOD}" == "vggtomega" || "${METHOD}" == "vggt_omega_single" || "${METHOD}" == "vggtomegasingle" || "${METHOD}" == "vggt_omega_multi" || "${METHOD}" == "vggtomegamulti" ]]; then
   create_env vggt_omega_camera
 else
   create_env "${METHOD}"

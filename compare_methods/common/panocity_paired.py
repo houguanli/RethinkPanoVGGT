@@ -360,6 +360,35 @@ class PanoCityDepthTorchDataset:
         return records
 
 
+class PanoCityDepthSequenceTorchDataset:
+    """Stack consecutive PanoCity panoramas into a BxS training sample.
+
+    This is intended for video/multi-frame models such as VGGT-Omega. PanoCity
+    paired exports do not include calibrated inter-pano camera labels here, so
+    the sequence adapter only provides per-view RGB/depth supervision.
+    """
+
+    def __init__(self, num_views: int = 2, **kwargs) -> None:
+        import torch
+
+        self.num_views = max(1, int(num_views))
+        self.single = PanoCityDepthTorchDataset(**kwargs)
+        self._torch = torch
+
+    def __len__(self) -> int:
+        return len(self.single)
+
+    def __getitem__(self, index: int):
+        samples = [self.single[(index + offset) % len(self.single)] for offset in range(self.num_views)]
+        stacked = {}
+        tensor_keys = ["rgb", "gt_depth", "raw_depth", "metric_depth", "val_mask", "mask_100"]
+        for key in tensor_keys:
+            stacked[key] = self._torch.stack([sample[key] for sample in samples], dim=0)
+        stacked["path"] = [sample["path"] for sample in samples]
+        stacked["num_id"] = [sample["num_id"] for sample in samples]
+        return stacked
+
+
 def smoke_summary(root: Optional[str] = None, split: str = "train") -> dict:
     index = PanoCityPairedIndex(root=root, split="smoke", max_samples=2)
     first = index[0]

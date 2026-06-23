@@ -1,5 +1,5 @@
 method:
-  name: vggt_omega_camera
+  name: vggt_omega_camera_single
   path: camera_pose/VGGT-Omega
 panocity:
   root: ${PANOCITY_ROOT:-../PanoCity_paired}
@@ -15,9 +15,9 @@ budget:
   reference: luna
 finetune:
   supported: true
-  command: [torchrun, --standalone, --nproc_per_node=4, train_panocity.py, --config, ../../configs/vggt_omega_camera_panocity_4rtx5000.yaml, --checkpoint, ../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt, --output-dir, outputs/panocity_4rtx5000]
+  command: [torchrun, --standalone, --nproc_per_node=4, train_panocity.py, --config, ../../configs/vggt_omega_camera_panocity_single_4rtx5000.yaml, --checkpoint, ../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt, --output-dir, outputs/panocity_single_4rtx5000]
 evaluate:
-  command: [python, check_panocity_depth.py, --config, ../../configs/vggt_omega_camera_panocity_4rtx5000.yaml, --checkpoint, outputs/panocity_4rtx5000/model.pt, --split, test, --max-samples, "4", --output-json, outputs/panocity_4rtx5000/depth_check.json]
+  command: [python, check_panocity_depth.py, --config, ../../configs/vggt_omega_camera_panocity_single_4rtx5000.yaml, --checkpoint, outputs/panocity_single_4rtx5000/model.pt, --split, test, --max-samples, "4", --output-json, outputs/panocity_single_4rtx5000/depth_check.json]
 train:
   task: single_pano
   num_views: 1
@@ -32,3 +32,4 @@ train:
   max_depth_meters: 100.0
   target_mode: metric
   normalize_rgb: false
+

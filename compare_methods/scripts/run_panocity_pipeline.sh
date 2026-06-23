@@ -112,9 +112,9 @@ resolve_finetune_timeout_seconds() {
 
 env_for_method() {
   case "$1" in
-    panovggt|panovggtcamera|panovggt_camera|panovggtdepth|panovggt_depth) echo cmp_panovggt;;
+    panovggt|panovggt_single|panovggtsingle|panovggt_multi|panovggtmulti|panovggtcamera|panovggt_camera|panovggtdepth|panovggt_depth|panovggt_multi_camera|panovggt_multi_depth) echo cmp_panovggt;;
     reloc3r|relo3r) echo cmp_reloc3r;;
-    vggt_omega|vggtomega|vggt_omega_camera|vggtomegacamera|vggt_omega_depth|vggtomegadepth) echo cmp_vggt_omega;;
+    vggt_omega|vggtomega|vggt_omega_single|vggtomegasingle|vggt_omega_multi|vggtomegamulti|vggt_omega_camera|vggtomegacamera|vggt_omega_depth|vggtomegadepth|vggt_omega_multi_camera|vggt_omega_multi_depth) echo cmp_vggt_omega;;
     dap) echo cmp_dap;;
     panda) echo cmp_panda;;
     *) echo "unknown";;

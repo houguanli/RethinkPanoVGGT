@@ -19,6 +19,9 @@ finetune:
 evaluate:
   command: [python, check_panocity_depth.py, --config, ../../configs/vggt_omega_depth_panocity_4rtx5000.yaml, --checkpoint, ../../camera_pose/VGGT-Omega/outputs/panocity_4rtx5000/model.pt, --split, test, --max-samples, "4", --output-json, outputs/panocity_4rtx5000/depth_check.json]
 train:
+  task: single_pano
+  num_views: 1
+  smoke_num_views: 1
   image_size: 512
   smoke_image_size: 256
   batch_size: 1

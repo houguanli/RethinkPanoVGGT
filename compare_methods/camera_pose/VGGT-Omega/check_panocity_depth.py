@@ -16,7 +16,7 @@ if str(COMPARE_ROOT) not in sys.path:
     sys.path.insert(0, str(COMPARE_ROOT))
 
 from common.depth_validation import depth_metrics, load_partial_state, tensor_stats  # noqa: E402
-from common.panocity_paired import PanoCityDepthTorchDataset  # noqa: E402
+from common.panocity_paired import PanoCityDepthSequenceTorchDataset, PanoCityDepthTorchDataset  # noqa: E402
 from vggt_omega.models import VGGTOmega  # noqa: E402
 
 
@@ -29,9 +29,12 @@ def build_dataset(config: Dict, split: str, max_samples: int | None) -> PanoCity
     train_cfg = config.get("train", {})
     root = os.environ.get("PANOCITY_ROOT") or config.get("panocity", {}).get("root")
     image_size = int(train_cfg.get("image_size", 512))
+    num_views = int(train_cfg.get("num_views", 1))
     if split == "smoke":
         image_size = int(train_cfg.get("smoke_image_size", min(image_size, 256)))
-    return PanoCityDepthTorchDataset(
+        num_views = int(train_cfg.get("smoke_num_views", num_views))
+    dataset_cls = PanoCityDepthSequenceTorchDataset if num_views > 1 else PanoCityDepthTorchDataset
+    kwargs = dict(
         root_dir=root,
         height=image_size,
         width=image_size * 2,
@@ -43,6 +46,9 @@ def build_dataset(config: Dict, split: str, max_samples: int | None) -> PanoCity
         target_mode=train_cfg.get("target_mode", "metric"),
         normalize_rgb=bool(train_cfg.get("normalize_rgb", False)),
     )
+    if num_views > 1:
+        kwargs["num_views"] = num_views
+    return dataset_cls(**kwargs)
 
 
 def main() -> int:
@@ -80,7 +86,10 @@ def main() -> int:
         summary["checkpoint"] = str(checkpoint.resolve())
         summary["checkpoint_matched_tensors"] = matched
         with torch.inference_mode():
-            pred = model(batch["rgb"].to(device).unsqueeze(1))["depth"].detach().cpu()
+            rgb = batch["rgb"].to(device)
+            if rgb.ndim == 4:
+                rgb = rgb.unsqueeze(1)
+            pred = model(rgb)["depth"].detach().cpu()
         summary["pred_metric_stats_m"] = tensor_stats(pred, batch["val_mask"])
         summary["metric_metrics_m"] = depth_metrics(pred, batch["raw_depth"], batch["val_mask"])
 
