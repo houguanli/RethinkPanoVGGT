@@ -17,11 +17,15 @@ finetune:
   supported: true
   command: [torchrun, --standalone, --nproc_per_node=4, train_panocity.py, --config, ../../configs/vggt_omega_camera_panocity_4rtx5000.yaml, --checkpoint, ../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt, --output-dir, outputs/panocity_4rtx5000]
 evaluate:
-  command: [python, evaluate_panocity.py, --stage, smoke]
+  command: [python, check_panocity_depth.py, --config, ../../configs/vggt_omega_camera_panocity_4rtx5000.yaml, --checkpoint, outputs/panocity_4rtx5000/model.pt, --split, test, --max-samples, "4", --output-json, outputs/panocity_4rtx5000/depth_check.json]
 train:
   image_size: 512
+  smoke_image_size: 256
   batch_size: 1
   num_workers: 4
   lr: 1.0e-5
   weight_decay: 0.01
+  depth_scale: 100.0
   max_depth_meters: 100.0
+  target_mode: metric
+  normalize_rgb: false

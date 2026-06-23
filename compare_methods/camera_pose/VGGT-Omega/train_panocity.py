@@ -47,7 +47,9 @@ def main():
     cfg = load_config(args.config)
     train_cfg = cfg.get("train", {})
     root = os.environ.get("PANOCITY_ROOT") or cfg.get("panocity", {}).get("root")
-    image_size = int(train_cfg.get("image_size", 512 if not args.smoke else 256))
+    image_size = int(train_cfg.get("image_size", 512))
+    if args.smoke:
+        image_size = int(train_cfg.get("smoke_image_size", min(image_size, 256)))
 
     dataset = PanoCityDepthTorchDataset(
         root_dir=root,
@@ -56,7 +58,10 @@ def main():
         split="smoke" if args.smoke else "train",
         is_training=True,
         max_samples=8 if args.smoke else train_cfg.get("max_samples"),
+        depth_scale=train_cfg.get("depth_scale"),
         max_depth_meters=float(train_cfg.get("max_depth_meters", 100.0)),
+        target_mode=train_cfg.get("target_mode", "metric"),
+        normalize_rgb=bool(train_cfg.get("normalize_rgb", False)),
     )
     loader = DataLoader(dataset, batch_size=1 if args.smoke else int(train_cfg.get("batch_size", 1)), shuffle=True, num_workers=0 if args.smoke else int(train_cfg.get("num_workers", 4)))
 

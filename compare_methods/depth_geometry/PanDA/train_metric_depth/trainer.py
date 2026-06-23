@@ -26,7 +26,7 @@ from losses import *
 def _dataset_options(dataset_config, is_training):
     args = dataset_config['args']
     options = {'is_training': is_training}
-    for key in ('split', 'max_samples', 'depth_scale', 'max_depth_meters'):
+    for key in ('split', 'max_samples', 'depth_scale', 'max_depth_meters', 'target_mode'):
         if key in args:
             options[key] = args[key]
     return options

@@ -15,4 +15,7 @@ from common.panocity_paired import PanoCityDepthTorchDataset  # noqa: E402
 class PanoCity(PanoCityDepthTorchDataset):
     """DAP-compatible PanoCity depth dataset."""
 
-    pass
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("target_mode", "normalized")
+        kwargs.setdefault("max_depth_meters", 100.0)
+        super().__init__(*args, **kwargs)

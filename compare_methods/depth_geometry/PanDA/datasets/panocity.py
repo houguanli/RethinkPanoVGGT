@@ -18,4 +18,6 @@ class PanoCity(PanoCityDepthTorchDataset):
     def __init__(self, *args, **kwargs):
         if "split" not in kwargs:
             kwargs["split"] = "train" if kwargs.get("is_training", False) else "test"
+        kwargs.setdefault("target_mode", "metric")
+        kwargs.setdefault("max_depth_meters", 10.0)
         super().__init__(*args, **kwargs)

@@ -17,4 +17,4 @@ finetune:
   supported: true
   command: [torchrun, --standalone, --nproc_per_node=4, train_panocity.py, --config, config/train_panocity_4rtx5000.yaml, --output-dir, outputs/panocity_4rtx5000]
 evaluate:
-  command: [python, evaluate_panocity.py, --stage, smoke]
+  command: [python, check_panocity_depth.py, --config, config/train_panocity_4rtx5000.yaml, --checkpoint, outputs/panocity_4rtx5000/model.pth, --split, test, --max-samples, "4", --output-json, outputs/panocity_4rtx5000/depth_check.json]

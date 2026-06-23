@@ -9,6 +9,9 @@ train_dataset:
     augment_color: True
     augment_flip: True
     augment_rotation: True
+    depth_scale: 100.0
+    max_depth_meters: 10.0
+    target_mode: metric
   batch_size: 4
   num_workers: 8
 
@@ -23,6 +26,9 @@ val_dataset:
     augment_color: False
     augment_flip: False
     augment_rotation: False
+    depth_scale: 100.0
+    max_depth_meters: 10.0
+    target_mode: metric
   batch_size: 1
   num_workers: 8
 

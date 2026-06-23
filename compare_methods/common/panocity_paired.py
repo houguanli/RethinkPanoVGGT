@@ -229,7 +229,15 @@ def read_depth(path: Path, depth_scale: Optional[float] = None, size: Optional[T
 
 
 class PanoCityDepthTorchDataset:
-    """Depth-estimation dataset adapter returning rgb/gt_depth/val_mask tensors."""
+    """Depth-estimation dataset adapter returning rgb/gt_depth/val_mask tensors.
+
+    `raw_depth` is always metric depth after applying PanoCity's file scale.
+    `gt_depth` is the method-specific training target selected by target_mode:
+
+    - normalized: raw_depth / max_depth_meters, clipped to [0.001, 1.0]
+    - metric: raw metric depth in meters
+    - quantile_normalized: per-image 2%-98% robust relative depth
+    """
 
     def __init__(
         self,
@@ -246,6 +254,8 @@ class PanoCityDepthTorchDataset:
         max_samples: Optional[int] = None,
         depth_scale: Optional[float] = None,
         max_depth_meters: float = 100.0,
+        target_mode: str = "normalized",
+        normalize_rgb: bool = True,
     ) -> None:
         import torch
         from torchvision import transforms
@@ -266,6 +276,10 @@ class PanoCityDepthTorchDataset:
         self.width = int(width)
         self.depth_scale = resolve_depth_scale(depth_scale)
         self.max_depth_meters = float(max_depth_meters)
+        self.target_mode = str(target_mode).lower()
+        if self.target_mode not in {"normalized", "metric", "quantile_normalized"}:
+            raise ValueError(f"Unsupported PanoCity depth target_mode: {target_mode}")
+        self.normalize_rgb = bool(normalize_rgb)
         self.is_training = bool(is_training)
         self.color_augmentation = bool(color_augmentation)
         self.flip_augmentation = bool(LR_filp_augmentation)
@@ -298,13 +312,28 @@ class PanoCityDepthTorchDataset:
 
             rgb = np.asarray(self.color_aug(transforms.ToPILImage()(rgb)))
 
-        rgb_tensor = self.normalize(self.to_tensor(rgb.copy()))
+        rgb_tensor = self.to_tensor(rgb.copy())
+        if self.normalize_rgb:
+            rgb_tensor = self.normalize(rgb_tensor)
         depth_tensor = self._torch.from_numpy(depth[None].copy()).to(self._torch.float32)
         val_mask = (depth_tensor > 0) & (depth_tensor <= self.max_depth_meters) & ~self._torch.isnan(depth_tensor)
-        depth_norm = self._torch.clamp(depth_tensor / self.max_depth_meters, 0.001, 1.0)
+        if self.target_mode == "metric":
+            gt_depth = depth_tensor
+        elif self.target_mode == "quantile_normalized":
+            if val_mask.any():
+                valid = depth_tensor[val_mask]
+                lo, hi = self._torch.quantile(valid, self._torch.tensor([0.02, 0.98], dtype=valid.dtype))
+                gt_depth = (depth_tensor - lo) / self._torch.clamp(hi - lo, min=1e-6)
+                gt_depth = self._torch.clamp(gt_depth, 0.01, 1.0)
+            else:
+                gt_depth = self._torch.clamp(depth_tensor / self.max_depth_meters, 0.001, 1.0)
+        else:
+            gt_depth = self._torch.clamp(depth_tensor / self.max_depth_meters, 0.001, 1.0)
         return {
             "rgb": rgb_tensor,
-            "gt_depth": depth_norm,
+            "gt_depth": gt_depth,
+            "raw_depth": depth_tensor,
+            "metric_depth": depth_tensor,
             "val_mask": val_mask,
             "mask_100": (depth_tensor > 0) & (depth_tensor <= 100.0),
             "path": str(record.rgb_path),
