@@ -21,7 +21,7 @@ logging:
   log_dir: logs
 
 model:
-  geometry_output_scale: ${oc.env:PANOVGGT_GEOMETRY_OUTPUT_SCALE,1.0}
+  geometry_output_scale: ${oc.env:PANOVGGT_GEOMETRY_OUTPUT_SCALE,7.8477684}
   train_geometry_output_scale: ${oc.env:PANOVGGT_TRAIN_GEOMETRY_OUTPUT_SCALE,true}
   aggregator:
     # Finetuning resumes from ckpt/PanoVGGT/model.pt, so a separate DINOv2
