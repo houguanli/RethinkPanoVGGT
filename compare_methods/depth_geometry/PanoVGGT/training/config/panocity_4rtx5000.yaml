@@ -7,6 +7,7 @@ img_size: 518
 patch_size: 14
 num_workers: 8
 max_img_per_gpu: 1
+max_img_per_gpu_val: 1
 accum_steps: 1
 max_epochs: 20
 limit_train_batches: 800

@@ -370,7 +370,12 @@ class Trainer:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
 
-            if self.epoch % self.val_epoch_freq == 0 and self.epoch < self.max_epochs - 1:
+            next_epoch = self.epoch + 1
+            if (
+                self.val_epoch_freq > 0
+                and next_epoch % self.val_epoch_freq == 0
+                and next_epoch < self.max_epochs
+            ):
                 self.run_val()
 
             self.epoch += 1
