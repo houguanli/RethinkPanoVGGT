@@ -143,6 +143,11 @@ class ComposedDataset(Dataset, ABC):
             "world_points": world_points,
             "point_masks": point_masks,
         }
+        for key in ["sample_weight", "metadata_valid_ratio", "metadata_structure_score"]:
+            if key in batch:
+                sample[key] = torch.as_tensor(batch[key], dtype=torch.float32)
+        if "metadata_quality_bin" in batch:
+            sample["metadata_quality_bin"] = batch["metadata_quality_bin"]
 
         # --- Track Processing (if enabled) ---
         if self.load_track:

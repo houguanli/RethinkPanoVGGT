@@ -62,6 +62,9 @@ data:
           depth_max_m: 80.0
           train_split_fraction: 0.95
           split_seed: 42
+          metadata_path: metadata/panocity_manifest.jsonl
+          curriculum_bins: clean,normal
+          use_metadata_weights: true
           num_yaw: 8
           pitch_degrees: -15.0
           fov_degrees: 75.0
@@ -85,6 +88,7 @@ logging:
         - loss_objective
         - loss_reg_depth
         - loss_log_l1_depth
+        - loss_overlap_depth
     val:
       keys_to_log:
         - loss_objective
@@ -106,6 +110,13 @@ loss:
     pred_depth_scale: 5.491308212280273
     log_error_clip: 0.5
     log_huber_delta: 0.2
+    sample_weighting: true
+    min_window_valid_ratio: 0.05
+    valid_ratio_loss_power: 0.5
+    sample_weight_min: 0.25
+    sample_weight_max: 1.25
+    overlap_consistency_weight: 0.02
+    overlap_band_fraction: 0.20
     gradient_loss_fn: null
     valid_range: -1
   point: null

@@ -48,6 +48,7 @@ CONFIG_PATH_KEYS = {
     "loss_plot",
     "tensorboard_dir",
     "debug_dir",
+    "metadata_path",
 }
 DEFAULT_PANOCITY_PRED_DEPTH_SCALE = 5.491308212280273
 
@@ -82,6 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-split", choices=["train", "val", "test"], default="train")
     parser.add_argument("--train-split-fraction", type=float, default=0.95)
     parser.add_argument("--split-seed", type=int, default=42)
+    parser.add_argument("--metadata-path", type=Path, default=None)
+    parser.add_argument("--curriculum-bins", type=str, default=None)
+    parser.add_argument("--use-metadata-weights", dest="use_metadata_weights", action="store_true", default=True)
+    parser.add_argument("--no-metadata-weights", dest="use_metadata_weights", action="store_false")
     parser.add_argument(
         "--output-depth-scale",
         type=float,
@@ -237,6 +242,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="Maximum per-pixel absolute log-depth error for --depth-loss-mode=clipped_log_l1.",
     )
+    parser.add_argument("--loss-sample-weighting", dest="loss_sample_weighting", action="store_true", default=True)
+    parser.add_argument("--no-loss-sample-weighting", dest="loss_sample_weighting", action="store_false")
+    parser.add_argument("--min-window-valid-ratio", type=float, default=0.05)
+    parser.add_argument("--valid-ratio-loss-power", type=float, default=0.5)
+    parser.add_argument("--sample-weight-min", type=float, default=0.25)
+    parser.add_argument("--sample-weight-max", type=float, default=1.25)
+    parser.add_argument("--overlap-consistency-weight", type=float, default=0.0)
+    parser.add_argument("--overlap-band-fraction", type=float, default=0.20)
     parser.add_argument("--save-last", action="store_true")
     parser.add_argument("--no-save-last", dest="save_last", action="store_false")
     parser.add_argument("--save-every-steps", type=int, default=0)
@@ -526,6 +539,7 @@ def train(args: argparse.Namespace) -> None:
                     "elapsed_seconds": elapsed_seconds,
                     "loss": float(loss_dict["loss"].item()),
                     "loss_depth": float(loss_dict["loss_depth"].item()),
+                    "loss_overlap": float(loss_dict.get("loss_overlap", torch.tensor(0.0)).item()),
                     "loss_camera": float(loss_dict["loss_camera"].item()),
                     "loss_camera_t": float(loss_dict.get("loss_camera_t", torch.tensor(0.0)).item()),
                     "loss_camera_r": float(loss_dict.get("loss_camera_r", torch.tensor(0.0)).item()),
@@ -546,7 +560,8 @@ def train(args: argparse.Namespace) -> None:
                         f"[TRAIN] epoch={epoch + 1} step={global_step} "
                         f"stage={active_stage_name} elapsed={elapsed_seconds / 60.0:.2f}m "
                         f"loss={metrics['loss']:.6f} depth={metrics['loss_depth']:.6f} "
-                        f"camera={metrics['loss_camera']:.6f} scale={metrics['pred_depth_scale']:.6f}"
+                        f"overlap={metrics['loss_overlap']:.6f} camera={metrics['loss_camera']:.6f} "
+                        f"scale={metrics['pred_depth_scale']:.6f}"
                     )
                     if progress is not None:
                         if max_duration_seconds is not None:
@@ -621,6 +636,9 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
             split=args.dataset_split,
             train_split_fraction=args.train_split_fraction,
             split_seed=args.split_seed,
+            metadata_path=args.metadata_path,
+            curriculum_bins=args.curriculum_bins,
+            use_metadata_weights=args.use_metadata_weights,
         )
     raise ValueError(f"Unknown dataset_format: {args.dataset_format}")
 
@@ -1041,6 +1059,17 @@ def train_step(
             mode=args.depth_loss_mode,
             huber_delta=args.depth_log_huber_delta,
             error_clip=args.depth_log_error_clip,
+            sample_weight=batch.get("sample_weight") if args.loss_sample_weighting else None,
+            min_window_valid_ratio=args.min_window_valid_ratio,
+            valid_ratio_power=args.valid_ratio_loss_power,
+            sample_weight_min=args.sample_weight_min,
+            sample_weight_max=args.sample_weight_max,
+        )
+        loss_overlap = adjacent_edge_overlap_loss(
+            pred_depth,
+            target_valid,
+            sample_weight=batch.get("sample_weight") if args.loss_sample_weighting else None,
+            band_fraction=args.overlap_band_fraction,
         )
         if args.debug_depth_dump and _is_rank0_process():
             dump_debug_depth_predictions(
@@ -1062,7 +1091,7 @@ def train_step(
             pano_consistency_weight=args.pano_translation_consistency_weight,
         )
         loss_camera = loss_camera_dict["loss_camera"]
-        loss = loss_depth + args.camera_loss_weight * loss_camera
+        loss = loss_depth + float(args.overlap_consistency_weight) * loss_overlap + args.camera_loss_weight * loss_camera
     loss.backward()
 
     if args.grad_clip > 0:
@@ -1078,6 +1107,7 @@ def train_step(
     return {
         "loss": loss.detach(),
         "loss_depth": loss_depth.detach(),
+        "loss_overlap": loss_overlap.detach(),
         "loss_camera": loss_camera.detach(),
         "pred_depth_scale": logged_pred_depth_scale,
         **{key: value.detach() for key, value in loss_camera_dict.items() if key != "loss_camera"},
@@ -1334,6 +1364,7 @@ def write_tensorboard_metrics(writer, metrics: Dict[str, Any]) -> None:
     scalar_map = {
         "loss/total": "loss",
         "loss/depth": "loss_depth",
+        "loss/overlap": "loss_overlap",
         "loss/camera": "loss_camera",
         "loss/camera_t": "loss_camera_t",
         "loss/camera_r": "loss_camera_r",
@@ -1465,6 +1496,11 @@ def masked_depth_loss(
     mode: str = "log_l1",
     huber_delta: float = 0.2,
     error_clip: float = 0.5,
+    sample_weight: torch.Tensor | None = None,
+    min_window_valid_ratio: float = 0.0,
+    valid_ratio_power: float = 0.0,
+    sample_weight_min: float = 0.0,
+    sample_weight_max: float = 10.0,
 ) -> torch.Tensor:
     pred_depth = pred_depth.float()
     target_depth = target_depth.to(device=pred_depth.device, dtype=torch.float32)
@@ -1473,22 +1509,98 @@ def masked_depth_loss(
         valid = valid & valid_mask.to(device=target_depth.device, dtype=torch.bool)
     if not bool(valid.any()):
         return torch.nan_to_num(pred_depth, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
-    pred = pred_depth[valid].clamp_min(1e-4)
-    target = target_depth[valid].clamp_min(1e-4)
-    log_abs_error = (torch.log(pred) - torch.log(target)).abs()
+    log_abs_error = torch.zeros_like(pred_depth, dtype=torch.float32)
+    log_abs_error[valid] = (
+        torch.log(pred_depth[valid].clamp_min(1e-4))
+        - torch.log(target_depth[valid].clamp_min(1e-4))
+    ).abs()
     if mode == "log_l1":
-        return log_abs_error.mean()
+        per_pixel_loss = log_abs_error
     if mode == "log_huber":
         delta = max(float(huber_delta), 1e-6)
-        return torch.where(
+        per_pixel_loss = torch.where(
             log_abs_error < delta,
             0.5 * log_abs_error.square() / delta,
             log_abs_error - 0.5 * delta,
-        ).mean()
-    if mode == "clipped_log_l1":
+        )
+    elif mode == "clipped_log_l1":
         clip_value = max(float(error_clip), 1e-6)
-        return log_abs_error.clamp_max(clip_value).mean()
-    raise ValueError(f"Unknown depth loss mode: {mode}")
+        per_pixel_loss = log_abs_error.clamp_max(clip_value)
+    elif mode != "log_l1":
+        raise ValueError(f"Unknown depth loss mode: {mode}")
+
+    valid_float = valid.to(dtype=torch.float32)
+    reduce_dims = tuple(range(2, per_pixel_loss.ndim))
+    per_window_loss = per_pixel_loss.sum(dim=reduce_dims) / valid_float.sum(dim=reduce_dims).clamp_min(1.0)
+    window_valid_ratio = valid_float.mean(dim=reduce_dims)
+    window_weight = torch.ones_like(per_window_loss)
+    min_ratio = max(float(min_window_valid_ratio), 0.0)
+    if min_ratio > 0:
+        window_weight = window_weight * (window_valid_ratio >= min_ratio).to(dtype=window_weight.dtype)
+    power = max(float(valid_ratio_power), 0.0)
+    if power > 0:
+        window_weight = window_weight * window_valid_ratio.clamp_min(1e-6).pow(power)
+    if sample_weight is not None:
+        window_weight = window_weight * _expand_sample_weight(
+            sample_weight,
+            per_window_loss,
+            sample_weight_min=sample_weight_min,
+            sample_weight_max=sample_weight_max,
+        )
+    if not bool((window_weight > 0).any()):
+        return (0.0 * pred_depth).sum()
+    return (per_window_loss * window_weight).sum() / window_weight.sum().clamp_min(1e-6)
+
+
+def _expand_sample_weight(
+    sample_weight: torch.Tensor,
+    target: torch.Tensor,
+    sample_weight_min: float = 0.0,
+    sample_weight_max: float = 10.0,
+) -> torch.Tensor:
+    weight = sample_weight.to(device=target.device, dtype=torch.float32)
+    while weight.ndim > target.ndim:
+        weight = weight.squeeze(-1)
+    while weight.ndim < target.ndim:
+        weight = weight.unsqueeze(-1)
+    return weight.expand_as(target).clamp(min=float(sample_weight_min), max=float(sample_weight_max))
+
+
+def adjacent_edge_overlap_loss(
+    pred_depth: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    sample_weight: torch.Tensor | None = None,
+    band_fraction: float = 0.20,
+) -> torch.Tensor:
+    if pred_depth.ndim != 5 or pred_depth.shape[1] < 2:
+        return torch.nan_to_num(pred_depth, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
+    finite_depth = torch.isfinite(pred_depth)
+    pred = torch.nan_to_num(pred_depth.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(1e-4)
+    batch_size, view_count, height, width, channels = pred.shape
+    band = max(1, min(width // 2, int(round(width * float(band_fraction)))))
+    left = torch.log(pred[:, :, :, :band, :])
+    right_next = torch.log(torch.roll(pred, shifts=-1, dims=1)[:, :, :, -band:, :])
+    finite_left = finite_depth[:, :, :, :band, :]
+    finite_right = torch.roll(finite_depth, shifts=-1, dims=1)[:, :, :, -band:, :]
+    valid = torch.isfinite(left) & torch.isfinite(right_next) & finite_left & finite_right
+    if valid_mask is not None:
+        valid_bool = valid_mask.to(device=pred.device, dtype=torch.bool)
+        valid_left = valid_bool[:, :, :, :band, :]
+        valid_right = torch.roll(valid_bool, shifts=-1, dims=1)[:, :, :, -band:, :]
+        valid = valid & valid_left & valid_right
+    if not bool(valid.any()):
+        return torch.nan_to_num(pred_depth, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
+    diff = torch.zeros_like(left)
+    diff[valid] = (left[valid] - right_next[valid]).abs().clamp_max(0.5)
+    per_pair = diff.sum(dim=(2, 3, 4)) / valid.to(dtype=torch.float32).sum(dim=(2, 3, 4)).clamp_min(1.0)
+    per_pair = torch.nan_to_num(per_pair, nan=0.0, posinf=0.0, neginf=0.0)
+    if sample_weight is None:
+        return torch.nan_to_num(per_pair.mean(), nan=0.0, posinf=0.0, neginf=0.0)
+    weight = _expand_sample_weight(sample_weight, per_pair, sample_weight_min=0.0, sample_weight_max=10.0)
+    if not bool((weight > 0).any()):
+        return torch.nan_to_num(pred_depth, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
+    result = (per_pair * weight).sum() / weight.sum().clamp_min(1e-6)
+    return torch.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def camera_alignment_loss(

@@ -169,9 +169,12 @@ class Trainer:
                         "elapsed_seconds",
                         "seq_name",
                         "valid_fraction",
+                        "sample_weight",
+                        "quality_bin",
                         "loss_objective",
                         "loss_reg_depth",
                         "loss_log_l1_depth",
+                        "loss_overlap_depth",
                         "lr",
                     ]
                 )
@@ -894,6 +897,11 @@ class Trainer:
             seq_name = "|".join(str(value) for value in seq_name)
         point_masks = batch.get("point_masks")
         valid_fraction = float(point_masks.float().mean().item()) if torch.is_tensor(point_masks) else 0.0
+        sample_weight = batch.get("sample_weight")
+        sample_weight_value = float(sample_weight.float().mean().item()) if torch.is_tensor(sample_weight) else 1.0
+        quality_bin = batch.get("metadata_quality_bin", "")
+        if isinstance(quality_bin, (list, tuple)):
+            quality_bin = "|".join(str(value) for value in quality_bin)
         lr = 0.0
         if hasattr(self, "optims") and self.optims:
             lr = float(self.optims[0].optimizer.param_groups[0]["lr"])
@@ -906,9 +914,12 @@ class Trainer:
                     elapsed,
                     seq_name,
                     valid_fraction,
+                    sample_weight_value,
+                    quality_bin,
                     scalar("objective"),
                     scalar("loss_reg_depth"),
                     scalar("loss_log_l1_depth"),
+                    scalar("loss_overlap_depth"),
                     lr,
                 ]
             )

@@ -1,9 +1,11 @@
 import glob
+import json
 import math
 import os
 import os.path as osp
 import random
-from typing import Optional
+from pathlib import Path
+from typing import Iterable, Optional
 
 import cv2
 import numpy as np
@@ -29,6 +31,9 @@ class PanoCityPairedPinholeDataset(BaseDataset):
         max_samples: Optional[int] = None,
         train_split_fraction: float = 0.95,
         split_seed: int = 42,
+        metadata_path: Optional[str] = None,
+        curriculum_bins: Optional[str | Iterable[str]] = None,
+        use_metadata_weights: bool = True,
     ):
         super().__init__(common_conf=common_conf)
         self.root = root
@@ -37,6 +42,10 @@ class PanoCityPairedPinholeDataset(BaseDataset):
         self.len_train = len_train if split == "train" else len_test
         self.train_split_fraction = float(train_split_fraction)
         self.split_seed = int(split_seed)
+        self.metadata_path = metadata_path
+        self.curriculum_bins = _parse_bins(curriculum_bins)
+        self.use_metadata_weights = bool(use_metadata_weights)
+        self.metadata_by_name = _load_metadata(metadata_path, self.root)
         self.output_depth_scale = float(output_depth_scale)
         self.invalid_depth_value = None if invalid_depth_value is None else float(invalid_depth_value)
         self.depth_max_m = float(depth_max_m)
@@ -98,6 +107,9 @@ class PanoCityPairedPinholeDataset(BaseDataset):
             point_masks.append(point_mask)
             original_sizes.append(np.array([height, width], dtype=np.int32))
 
+        sample_weight = float(item.get("sample_weight", 1.0))
+        metadata_valid_ratio = float(item.get("metadata_valid_ratio", 1.0))
+        metadata_structure_score = float(item.get("metadata_structure_score", 0.0))
         return {
             "seq_name": "panocity_paired_" + item["name"],
             "ids": np.arange(view_count, dtype=np.int64),
@@ -110,6 +122,10 @@ class PanoCityPairedPinholeDataset(BaseDataset):
             "world_points": world_points,
             "point_masks": point_masks,
             "original_sizes": original_sizes,
+            "sample_weight": np.full((view_count,), sample_weight, dtype=np.float32),
+            "metadata_valid_ratio": np.full((view_count,), metadata_valid_ratio, dtype=np.float32),
+            "metadata_structure_score": np.full((view_count,), metadata_structure_score, dtype=np.float32),
+            "metadata_quality_bin": str(item.get("metadata_quality_bin", "unknown")),
         }
 
     def _build_index(self, max_samples: Optional[int] = None):
@@ -123,6 +139,12 @@ class PanoCityPairedPinholeDataset(BaseDataset):
             if depth_path is None:
                 continue
             items.append({"rgb_path": rgb_path, "depth_path": depth_path, "name": osp.splitext(osp.basename(rgb_path))[0]})
+        items = _apply_metadata(
+            items,
+            metadata_by_name=self.metadata_by_name,
+            curriculum_bins=self.curriculum_bins,
+            use_metadata_weights=self.use_metadata_weights,
+        )
         items = _split_items(
             items,
             split=self.split,
@@ -151,6 +173,83 @@ def _split_items(items: list[dict], split: str, train_fraction: float, seed: int
     else:
         raise ValueError(f"Unknown PanoCity split: {split}")
     return [item for idx, item in enumerate(items) if idx in keep]
+
+
+def _parse_bins(raw: Optional[str | Iterable[str]]) -> Optional[set[str]]:
+    if raw in (None, "", "all"):
+        return None
+    if isinstance(raw, str):
+        values = [part.strip().lower() for part in raw.split(",")]
+    else:
+        values = [str(part).strip().lower() for part in raw]
+    bins = {value for value in values if value}
+    return bins or None
+
+
+def _load_metadata(path: Optional[str], root: str) -> dict[str, dict]:
+    if path in (None, ""):
+        return {}
+    resolved = Path(path)
+    if not resolved.is_absolute():
+        resolved = Path(root) / resolved
+    if not resolved.exists():
+        print(f"[WARN] PanoCity metadata not found: {resolved}; training without curriculum metadata.")
+        return {}
+    metadata: dict[str, dict] = {}
+    with resolved.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            keys = {
+                str(entry.get("name", "")),
+                Path(str(entry.get("rgb_rel", ""))).stem,
+                Path(str(entry.get("rgb_path", ""))).stem,
+            }
+            for key in keys:
+                if key:
+                    metadata[key] = entry
+    print(f"[INFO] loaded PanoCity metadata entries = {len(metadata)} from {resolved}")
+    return metadata
+
+
+def _apply_metadata(
+    items: list[dict],
+    metadata_by_name: dict[str, dict],
+    curriculum_bins: Optional[set[str]],
+    use_metadata_weights: bool,
+) -> list[dict]:
+    if not metadata_by_name:
+        for item in items:
+            item["sample_weight"] = 1.0
+            item["metadata_valid_ratio"] = 1.0
+            item["metadata_structure_score"] = 0.0
+            item["metadata_quality_bin"] = "unknown"
+        return items
+    filtered = []
+    for item in items:
+        name = str(item["name"])
+        metadata = metadata_by_name.get(name) or metadata_by_name.get(Path(item["rgb_path"]).stem)
+        if metadata is None:
+            quality_bin = "unknown"
+            sample_weight = 1.0
+            valid_ratio = 1.0
+            structure_score = 0.0
+        else:
+            quality_bin = str(metadata.get("quality_bin", "unknown")).lower()
+            sample_weight = float(metadata.get("sample_weight", 1.0)) if use_metadata_weights else 1.0
+            valid_ratio = float(metadata.get("valid_ratio", 1.0))
+            structure_score = float(metadata.get("structure_score", 0.0))
+        if curriculum_bins is not None and quality_bin not in curriculum_bins:
+            continue
+        updated = dict(item)
+        updated["sample_weight"] = sample_weight
+        updated["metadata_valid_ratio"] = valid_ratio
+        updated["metadata_structure_score"] = structure_score
+        updated["metadata_quality_bin"] = quality_bin
+        filtered.append(updated)
+    return filtered
 
 
 def _depth_path_for_rgb(rgb_path: str, depth_dir: str) -> Optional[str]:

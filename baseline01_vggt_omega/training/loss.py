@@ -277,6 +277,13 @@ def compute_depth_loss(
     pred_depth_scale=1.0,
     log_huber_delta=0.2,
     log_error_clip=0.5,
+    sample_weighting=True,
+    min_window_valid_ratio=0.05,
+    valid_ratio_loss_power=0.5,
+    sample_weight_min=0.25,
+    sample_weight_max=1.25,
+    overlap_consistency_weight=0.0,
+    overlap_band_fraction=0.20,
     **kwargs,
 ):
     """
@@ -314,13 +321,26 @@ def compute_depth_loss(
             mode=mode,
             huber_delta=log_huber_delta,
             error_clip=log_error_clip,
+            sample_weight=batch.get("sample_weight") if sample_weighting else None,
+            min_window_valid_ratio=min_window_valid_ratio,
+            valid_ratio_power=valid_ratio_loss_power,
+            sample_weight_min=sample_weight_min,
+            sample_weight_max=sample_weight_max,
         )
+        loss_overlap = adjacent_edge_overlap_loss(
+            pred_depth,
+            gt_depth_mask,
+            sample_weight=batch.get("sample_weight") if sample_weighting else None,
+            band_fraction=overlap_band_fraction,
+        )
+        loss_total = loss_log + float(overlap_consistency_weight) * loss_overlap
         dummy_loss = (0.0 * pred_depth).mean()
         return {
             "loss_conf_depth": dummy_loss,
-            "loss_reg_depth": loss_log,
+            "loss_reg_depth": loss_total,
             "loss_grad_depth": dummy_loss,
             "loss_log_l1_depth": loss_log,
+            "loss_overlap_depth": loss_overlap,
         }
 
     # NOTE: we put conf inside regression_loss so that we can also apply conf loss to the gradient loss in a multi-scale manner
@@ -348,6 +368,11 @@ def masked_log_depth_loss(
     mode="log_l1",
     huber_delta=0.2,
     error_clip=0.5,
+    sample_weight=None,
+    min_window_valid_ratio=0.0,
+    valid_ratio_power=0.0,
+    sample_weight_min=0.0,
+    sample_weight_max=10.0,
 ):
     pred_depth = pred_depth.float()
     target_depth = target_depth.to(device=pred_depth.device, dtype=torch.float32)
@@ -356,21 +381,86 @@ def masked_log_depth_loss(
         valid = valid & valid_mask.to(device=target_depth.device, dtype=torch.bool)[..., None]
     if not bool(valid.any()):
         return torch.nan_to_num(pred_depth, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
-    pred = pred_depth[valid].clamp_min(1e-4)
-    target = target_depth[valid].clamp_min(1e-4)
-    log_abs_error = (torch.log(pred) - torch.log(target)).abs()
+    log_abs_error = torch.zeros_like(pred_depth, dtype=torch.float32)
+    log_abs_error[valid] = (
+        torch.log(pred_depth[valid].clamp_min(1e-4))
+        - torch.log(target_depth[valid].clamp_min(1e-4))
+    ).abs()
     if mode == "log_l1":
-        return log_abs_error.mean()
+        per_pixel_loss = log_abs_error
     if mode == "log_huber":
         delta = max(float(huber_delta), 1e-6)
-        return torch.where(
+        per_pixel_loss = torch.where(
             log_abs_error < delta,
             0.5 * log_abs_error.square() / delta,
             log_abs_error - 0.5 * delta,
-        ).mean()
-    if mode == "clipped_log_l1":
-        return log_abs_error.clamp_max(max(float(error_clip), 1e-6)).mean()
-    raise ValueError(f"Unknown log-depth loss mode: {mode}")
+        )
+    elif mode == "clipped_log_l1":
+        per_pixel_loss = log_abs_error.clamp_max(max(float(error_clip), 1e-6))
+    elif mode != "log_l1":
+        raise ValueError(f"Unknown log-depth loss mode: {mode}")
+
+    valid_float = valid.to(dtype=torch.float32)
+    per_window_loss = per_pixel_loss.sum(dim=(2, 3, 4)) / valid_float.sum(dim=(2, 3, 4)).clamp_min(1.0)
+    window_valid_ratio = valid_float.mean(dim=(2, 3, 4))
+    window_weight = torch.ones_like(per_window_loss)
+    min_ratio = max(float(min_window_valid_ratio), 0.0)
+    if min_ratio > 0:
+        window_weight = window_weight * (window_valid_ratio >= min_ratio).to(dtype=window_weight.dtype)
+    power = max(float(valid_ratio_power), 0.0)
+    if power > 0:
+        window_weight = window_weight * window_valid_ratio.clamp_min(1e-6).pow(power)
+    if sample_weight is not None:
+        window_weight = window_weight * _expand_sample_weight(
+            sample_weight,
+            per_window_loss,
+            sample_weight_min=sample_weight_min,
+            sample_weight_max=sample_weight_max,
+        )
+    if not bool((window_weight > 0).any()):
+        return (0.0 * pred_depth).sum()
+    return (per_window_loss * window_weight).sum() / window_weight.sum().clamp_min(1e-6)
+
+
+def _expand_sample_weight(sample_weight, target, sample_weight_min=0.0, sample_weight_max=10.0):
+    weight = sample_weight.to(device=target.device, dtype=torch.float32)
+    while weight.ndim > target.ndim:
+        weight = weight.squeeze(-1)
+    while weight.ndim < target.ndim:
+        weight = weight.unsqueeze(-1)
+    return weight.expand_as(target).clamp(min=float(sample_weight_min), max=float(sample_weight_max))
+
+
+def adjacent_edge_overlap_loss(pred_depth, valid_mask=None, sample_weight=None, band_fraction=0.20):
+    if pred_depth.ndim != 5 or pred_depth.shape[1] < 2:
+        return torch.nan_to_num(pred_depth, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
+    finite_depth = torch.isfinite(pred_depth)
+    pred = torch.nan_to_num(pred_depth.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(1e-4)
+    _, _, _, width, _ = pred.shape
+    band = max(1, min(width // 2, int(round(width * float(band_fraction)))))
+    left = torch.log(pred[:, :, :, :band, :])
+    right_next = torch.log(torch.roll(pred, shifts=-1, dims=1)[:, :, :, -band:, :])
+    finite_left = finite_depth[:, :, :, :band, :]
+    finite_right = torch.roll(finite_depth, shifts=-1, dims=1)[:, :, :, -band:, :]
+    valid = torch.isfinite(left) & torch.isfinite(right_next) & finite_left & finite_right
+    if valid_mask is not None:
+        valid_bool = valid_mask.to(device=pred.device, dtype=torch.bool)
+        valid_left = valid_bool[:, :, :, :band][..., None]
+        valid_right = torch.roll(valid_bool, shifts=-1, dims=1)[:, :, :, -band:][..., None]
+        valid = valid & valid_left & valid_right
+    if not bool(valid.any()):
+        return torch.nan_to_num(pred_depth, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
+    diff = torch.zeros_like(left)
+    diff[valid] = (left[valid] - right_next[valid]).abs().clamp_max(0.5)
+    per_pair = diff.sum(dim=(2, 3, 4)) / valid.to(dtype=torch.float32).sum(dim=(2, 3, 4)).clamp_min(1.0)
+    per_pair = torch.nan_to_num(per_pair, nan=0.0, posinf=0.0, neginf=0.0)
+    if sample_weight is None:
+        return torch.nan_to_num(per_pair.mean(), nan=0.0, posinf=0.0, neginf=0.0)
+    weight = _expand_sample_weight(sample_weight, per_pair, sample_weight_min=0.0, sample_weight_max=10.0)
+    if not bool((weight > 0).any()):
+        return torch.nan_to_num(pred_depth, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
+    result = (per_pair * weight).sum() / weight.sum().clamp_min(1e-6)
+    return torch.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0, alpha=0.2, valid_range=-1):

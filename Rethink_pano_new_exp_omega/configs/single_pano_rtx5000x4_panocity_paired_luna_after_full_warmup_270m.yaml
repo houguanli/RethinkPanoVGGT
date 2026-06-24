@@ -8,6 +8,9 @@ data:
   dataset_split: train
   train_split_fraction: 0.95
   split_seed: 42
+  metadata_path: metadata/panocity_manifest.jsonl
+  curriculum_bins: clean,normal
+  use_metadata_weights: true
   checkpoint: ../baseline01_vggt_omega/logs/panocity_paired_4xrtx5000_full_warmup_90m_for_luna/ckpts/checkpoint.pt
   pano_sample_mode: single
   pano_min_count: 1
@@ -37,6 +40,13 @@ supervision:
   depth_loss_mode: clipped_log_l1
   depth_log_error_clip: 0.5
   depth_log_huber_delta: 0.2
+  loss_sample_weighting: true
+  min_window_valid_ratio: 0.05
+  valid_ratio_loss_power: 0.5
+  sample_weight_min: 0.25
+  sample_weight_max: 1.25
+  overlap_consistency_weight: 0.02
+  overlap_band_fraction: 0.20
   pred_depth_scale: 5.491308212280273
   learn_pred_depth_scale: true
   pred_depth_scale_lr: 5.0e-5
