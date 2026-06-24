@@ -9,15 +9,15 @@ num_workers: 8
 max_img_per_gpu: 1
 max_img_per_gpu_val: 1
 accum_steps: 1
-max_epochs: 20
-limit_train_batches: 800
+max_epochs: 40
+limit_train_batches: 2000
 limit_val_batches: 20
 val_epoch_freq: 999999
 
 hardware:
   gpus: 4
   gpu_model: rtx_5000
-  walltime_hours: 24
+  walltime_hours: 12
 
 logging:
   log_dir: logs

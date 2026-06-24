@@ -10,8 +10,9 @@ hardware:
   gpu_model: rtx_5000
   launcher: torchrun
 budget:
-  walltime_hours: 24
-  max_epochs: 20
+  walltime_hours: 12
+  max_epochs: 40
+  limit_train_batches: 2000
   reference: luna
 finetune:
   supported: true
