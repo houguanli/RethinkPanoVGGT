@@ -1,0 +1,115 @@
+# LUNA continuation after full-dataset 3h full-finetune warmup on local RTX 4090.
+data:
+  dataset_root: /mnt/f/panovggt/PanoCity_paired
+  dataset_format: panocity_paired
+  dataset_split: train
+  train_split_fraction: 0.95
+  split_seed: 42
+  metadata_path: metadata/panocity_manifest.jsonl
+  curriculum_bins: clean,normal
+  use_metadata_weights: true
+  checkpoint: ../baseline01_vggt_omega/logs/panocity_paired_full_curriculum_full_warmup_4090_3h_for_luna/ckpts/checkpoint.pt
+  pano_sample_mode: single
+  pano_min_count: 1
+  pano_max_count: 1
+  pano_grouping: nearest
+  output_depth_scale: 1000.0
+  invalid_depth_value: 65535.0
+  pano_position_step_m: 1.0
+
+sampler:
+  patch_size: 16
+  window_size: 512
+  num_yaw: 8
+  pitch_degrees: "-15"
+  fov_degrees: 75.0
+  pano_height: 0
+  pano_width: 0
+  luna_patch_layers: final
+  luna_camera_layers: none
+
+model:
+  enable_pano_global_token: false
+
+supervision:
+  gt_depth_semantics: range
+  depth_max_m: 80.0
+  depth_loss_mode: clipped_log_l1
+  depth_log_error_clip: 0.5
+  depth_log_huber_delta: 0.2
+  loss_sample_weighting: true
+  min_window_valid_ratio: 0.05
+  valid_ratio_loss_power: 0.5
+  sample_weight_min: 0.25
+  sample_weight_max: 1.25
+  overlap_consistency_weight: 0.02
+  overlap_band_fraction: 0.20
+  pred_depth_scale: 5.491308212280273
+  learn_pred_depth_scale: true
+  pred_depth_scale_lr: 5.0e-5
+  depth_residual_mode: log_conv
+  depth_residual_hidden: 32
+  depth_residual_max_log: 0.5
+  enable_camera_head: false
+  camera_supervision_mode: none
+  camera_loss_weight: 0.0
+  camera_translation_weight: 0.0
+  camera_rotation_weight: 0.0
+  camera_fov_weight: 0.0
+  pano_translation_consistency_weight: 0.1
+  camera_position_mode: local_zero
+
+optimization:
+  trainable: luna_residual_dense
+  lr: 5.0e-5
+  weight_decay: 0.05
+  grad_clip: 1.0
+  optimizer_type: adamw
+  batch_size: 1
+  training_stages:
+    - name: luna_residual_fit
+      until_minutes: 360.0
+      trainable: luna_residual_dense
+      lr: 5.0e-5
+      weight_decay: 0.05
+      optimizer_type: adamw
+      enable_luna_forward: true
+      enable_depth_residual: true
+      train_depth_residual: true
+      learn_pred_depth_scale: true
+    - name: luna_residual_low_lr
+      trainable: luna_residual_dense
+      lr: 1.0e-5
+      pred_depth_scale_lr: 1.0e-5
+      weight_decay: 0.05
+      optimizer_type: adamw
+      enable_luna_forward: true
+      enable_depth_residual: true
+      train_depth_residual: true
+      learn_pred_depth_scale: true
+
+runtime:
+  device: cuda
+  distributed: none
+  dist_backend: nccl
+  find_unused_parameters: true
+  amp_dtype: bfloat16
+  epochs: 100000
+  max_steps: 1000000
+  num_workers: 4
+  seed: 43
+  max_duration_minutes: 540.0
+  save_every_steps: 0
+  save_last: true
+  checkpoint_format: trainable_delta
+  debug_depth_dump: false
+  debug_depth_threshold: 0.3
+  debug_depth_max_dumps_per_step: 0
+  debug_dir: logs/debug_panocity_paired_full_curriculum_luna_after_full_warmup_4090_9h
+  progress_bar: true
+  progress_log_every: 50
+  tensorboard: true
+  tensorboard_dir: logs/panocity_paired_full_curriculum_luna_after_full_warmup_4090_9h/tensorboard
+
+output:
+  output_dir: logs/panocity_paired_full_curriculum_luna_after_full_warmup_4090_9h
