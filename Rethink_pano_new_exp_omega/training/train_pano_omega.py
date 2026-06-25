@@ -31,6 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from training.data import PanoCityPairedOmegaDataset, PanoVKittiOmegaDataset  # noqa: E402
+from vggt_omega.data.pano_sampler import make_default_view_grid  # noqa: E402
 from vggt_omega.models.heads.dense_head import DenseHead  # noqa: E402
 from vggt_omega.models.layers import PatchEmbed  # noqa: E402
 from vggt_omega.models.layers.pano_position import pinhole_rays  # noqa: E402
@@ -349,6 +350,7 @@ def train(args: argparse.Namespace) -> None:
     normalize_pano_sampling_args(args)
     normalize_camera_supervision_args(args)
     normalize_pred_depth_scale_args(args)
+    capture_default_sampler_args(args)
     args.training_stages = normalize_training_stages(args.training_stages)
     if args.pano_sample_mode == "variable_neighborhood" and args.batch_size != 1:
         raise ValueError("variable_neighborhood uses variable-length inputs and currently requires batch_size=1.")
@@ -395,6 +397,7 @@ def train(args: argparse.Namespace) -> None:
                 elapsed_minutes=0.0,
             )
             active_stage_name = str(active_stage.get("name", f"stage{active_stage_index + 1}"))
+            apply_stage_sampler_overrides(model, args, active_stage)
             trainable_count, frozen_count = configure_trainable_for_stage(model, args, active_stage)
         else:
             if isinstance(model, DepthPredictionAdapter):
@@ -517,6 +520,7 @@ def train(args: argparse.Namespace) -> None:
                         active_stage_index = next_stage_index
                         active_stage = next_stage
                         active_stage_name = str(active_stage.get("name", f"stage{active_stage_index + 1}"))
+                        apply_stage_sampler_overrides(unwrap_model(model), args, active_stage)
                         trainable_count, frozen_count = configure_trainable_for_stage(
                             unwrap_model(model),
                             args,
@@ -533,6 +537,7 @@ def train(args: argparse.Namespace) -> None:
                 loss_dict = train_step(model, batch, optimizer, args, global_step=global_step)
                 loss_dict = reduce_loss_dict(loss_dict, dist_state)
                 elapsed_seconds = time.time() - started_at
+                sampler_status = current_sampler_status(unwrap_model(model), args)
                 metrics = {
                     "step": global_step,
                     "epoch": epoch + 1,
@@ -550,6 +555,8 @@ def train(args: argparse.Namespace) -> None:
                     "pred_depth_scale": float(loss_dict["pred_depth_scale"].item()),
                     "stage": active_stage_name,
                     "stage_index": int(active_stage_index + 1) if active_stage_index is not None else 0,
+                    "window_size": sampler_status["window_size"],
+                    "patch_size": sampler_status["patch_size"],
                     "lr": optimizer.param_groups[0]["lr"],
                 }
                 if is_main_process(dist_state):
@@ -574,6 +581,7 @@ def train(args: argparse.Namespace) -> None:
                         progress.set_postfix(
                             step=global_step,
                             stage=active_stage_name,
+                            window=metrics["window_size"],
                             loss=f"{metrics['loss']:.4f}",
                             scale=f"{metrics['pred_depth_scale']:.3f}",
                         )
@@ -791,6 +799,85 @@ def build_optimizer(
     raise ValueError(f"Unknown optimizer_type: {optimizer_type}")
 
 
+def capture_default_sampler_args(args: argparse.Namespace) -> None:
+    args.default_window_size = int(args.window_size)
+    args.default_patch_size = int(args.patch_size)
+    args.default_num_yaw = int(args.num_yaw)
+    args.default_pitch_degrees = str(args.pitch_degrees)
+    args.default_fov_degrees = float(args.fov_degrees)
+
+
+def apply_stage_sampler_overrides(
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+    stage: Dict[str, Any] | None,
+) -> Dict[str, int | float | str]:
+    window_size = int(stage.get("window_size", args.default_window_size)) if stage else int(args.default_window_size)
+    patch_size = int(stage.get("patch_size", args.default_patch_size)) if stage else int(args.default_patch_size)
+    num_yaw = int(stage.get("num_yaw", args.default_num_yaw)) if stage else int(args.default_num_yaw)
+    pitch_degrees = str(stage.get("pitch_degrees", args.default_pitch_degrees)) if stage else str(args.default_pitch_degrees)
+    fov_degrees = float(stage.get("fov_degrees", args.default_fov_degrees)) if stage else float(args.default_fov_degrees)
+
+    if window_size <= 0:
+        raise ValueError(f"stage window_size must be positive, got {window_size}")
+    if patch_size <= 0:
+        raise ValueError(f"stage patch_size must be positive, got {patch_size}")
+    if window_size % patch_size != 0:
+        raise ValueError(f"stage window_size={window_size} must be divisible by patch_size={patch_size}")
+
+    base_model = unwrap_model(model)
+    if isinstance(base_model, DepthPredictionAdapter):
+        base_model = base_model.model
+    aggregator = getattr(base_model, "aggregator", None)
+    model_patch_size = int(getattr(aggregator, "patch_size", patch_size))
+    if patch_size != model_patch_size:
+        raise ValueError(
+            f"Changing patch_size inside training is not supported: "
+            f"stage patch_size={patch_size}, model patch_size={model_patch_size}."
+        )
+
+    sampler = getattr(base_model, "pano_sampler", None)
+    if sampler is None:
+        return current_sampler_status(model, args)
+
+    sampler.window_size = window_size
+    sampler.patch_size = patch_size
+    sampler.fov_radians = math.radians(fov_degrees)
+    yaw, pitch = make_default_view_grid(num_yaw=num_yaw, pitch_degrees=parse_pitch_degrees(pitch_degrees))
+    device = sampler.default_yaw.device if torch.is_tensor(getattr(sampler, "default_yaw", None)) else None
+    sampler.default_yaw = yaw.to(device=device) if device is not None else yaw
+    sampler.default_pitch = pitch.to(device=device) if device is not None else pitch
+
+    args.window_size = window_size
+    args.patch_size = patch_size
+    args.num_yaw = num_yaw
+    args.pitch_degrees = pitch_degrees
+    args.fov_degrees = fov_degrees
+    return current_sampler_status(model, args)
+
+
+def current_sampler_status(model: torch.nn.Module, args: argparse.Namespace) -> Dict[str, int | float | str]:
+    base_model = unwrap_model(model)
+    if isinstance(base_model, DepthPredictionAdapter):
+        base_model = base_model.model
+    sampler = getattr(base_model, "pano_sampler", None)
+    if sampler is None:
+        return {
+            "window_size": int(args.window_size),
+            "patch_size": int(args.patch_size),
+            "num_yaw": int(args.num_yaw),
+            "pitch_degrees": str(args.pitch_degrees),
+            "fov_degrees": float(args.fov_degrees),
+        }
+    return {
+        "window_size": int(getattr(sampler, "window_size", args.window_size)),
+        "patch_size": int(getattr(sampler, "patch_size", args.patch_size)),
+        "num_yaw": int(getattr(sampler, "default_yaw", torch.empty(0)).numel()),
+        "pitch_degrees": str(args.pitch_degrees),
+        "fov_degrees": float(math.degrees(float(getattr(sampler, "fov_radians", math.radians(args.fov_degrees))))),
+    }
+
+
 def normalize_pano_sampling_args(args: argparse.Namespace) -> None:
     legacy_count = getattr(args, "panos_per_sample", None)
     if legacy_count is not None:
@@ -889,6 +976,8 @@ def format_training_stages(stages: Sequence[Dict[str, Any]]) -> str:
             boundary.append(f"until={float(stage['until_minutes']):.1f}m")
         if stage.get("until_steps") is not None:
             boundary.append(f"until_step={int(stage['until_steps'])}")
+        if stage.get("window_size") is not None:
+            boundary.append(f"window={int(stage['window_size'])}")
         parts.append(f"{idx + 1}:{stage.get('name', f'stage{idx + 1}')}({','.join(boundary) or 'final'})")
     return "; ".join(parts)
 
@@ -905,6 +994,7 @@ def format_stage_status(
         f"{stage_index + 1}:{stage.get('name', f'stage{stage_index + 1}')} "
         f"trainable_mode={stage.get('trainable', 'default')} "
         f"lr={stage.get('lr', 'default')} "
+        f"window={stage.get('window_size', 'default')} "
         f"optimizer={stage.get('optimizer_type', 'default')} "
         f"luna_forward={stage.get('enable_luna_forward', 'default')} "
         f"depth_residual={stage.get('enable_depth_residual', 'default')} "
@@ -1374,6 +1464,7 @@ def write_tensorboard_metrics(writer, metrics: Dict[str, Any]) -> None:
         "train/pred_depth_scale": "pred_depth_scale",
         "train/elapsed_seconds": "elapsed_seconds",
         "train/stage_index": "stage_index",
+        "train/window_size": "window_size",
     }
     for tag, key in scalar_map.items():
         value = metrics.get(key)
@@ -1426,6 +1517,7 @@ def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace
     pred_depth_scale = current_pred_depth_scale(model, args)
     args_payload = vars(args).copy()
     args_payload["pred_depth_scale"] = pred_depth_scale
+    args_payload.update(current_sampler_status(model, args))
     adapter_state = None
     checkpoint_model = model
     if isinstance(model, DepthPredictionAdapter):
