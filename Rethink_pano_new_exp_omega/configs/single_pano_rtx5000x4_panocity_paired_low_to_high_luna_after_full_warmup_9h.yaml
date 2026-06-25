@@ -5,7 +5,7 @@ data:
   dataset_split: train
   train_split_fraction: 0.95
   split_seed: 42
-  metadata_path: metadata/panocity_manifest.jsonl
+  metadata_path: null
   curriculum_bins: null
   use_metadata_weights: false
   checkpoint: ../baseline01_vggt_omega/logs/panocity_paired_low_to_high_4xrtx5000_full_warmup_3h_for_luna/ckpts/checkpoint.pt

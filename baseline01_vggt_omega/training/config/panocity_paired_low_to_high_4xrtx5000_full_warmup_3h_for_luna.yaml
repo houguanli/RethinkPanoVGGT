@@ -61,7 +61,7 @@ data:
           depth_max_m: 80.0
           train_split_fraction: 0.95
           split_seed: 42
-          metadata_path: metadata/panocity_manifest.jsonl
+          metadata_path: null
           curriculum_bins: null
           use_metadata_weights: false
           num_yaw: 8

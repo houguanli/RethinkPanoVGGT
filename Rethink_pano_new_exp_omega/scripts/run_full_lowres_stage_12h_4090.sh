@@ -66,7 +66,7 @@ echo "[sequence] validation val100 started $(date --iso-8601=seconds)" | tee -a 
   --split val \
   --curriculum-bins all \
   --limit 100 \
-  --hard-limit 100 \
+  --hard-limit 0 \
   --num-workers 2 \
   --seed 123 \
   --no-progress \
