@@ -51,6 +51,7 @@ class PanoCityPairedOmegaDataset(Dataset):
         train_split_fraction: float = 0.95,
         split_seed: int = 42,
         metadata_path: Optional[str | Path] = None,
+        bad_sample_list: Optional[str | Path] = None,
         curriculum_bins: Optional[str | Iterable[str]] = None,
         use_metadata_weights: bool = True,
     ) -> None:
@@ -85,9 +86,11 @@ class PanoCityPairedOmegaDataset(Dataset):
         self.train_split_fraction = float(train_split_fraction)
         self.split_seed = int(split_seed)
         self.metadata_path = None if metadata_path in (None, "") else Path(metadata_path)
+        self.bad_sample_list = None if bad_sample_list in (None, "") else Path(bad_sample_list)
         self.curriculum_bins = _parse_bins(curriculum_bins)
         self.use_metadata_weights = bool(use_metadata_weights)
         self.metadata_by_name = _load_metadata(self.metadata_path, self.root)
+        self.bad_samples = _load_bad_samples(self.bad_sample_list, self.root)
         self.items = self._build_index(max_samples=max_samples)
         self.groups = self._build_groups()
         if strict and not self.items:
@@ -107,13 +110,13 @@ class PanoCityPairedOmegaDataset(Dataset):
     def __getitem__(self, index: int) -> Dict:
         group = self.groups[index]
         if self.pano_sample_mode == "single":
-            return self._read_item(self.items[group[0]])
+            return self._read_item_with_fallback(group[0])
         if self.pano_sample_mode == "variable_neighborhood":
             max_count = min(self.pano_max_count, len(group))
             min_count = min(self.pano_min_count, max_count)
             group = group[: random.randint(min_count, max_count)]
 
-        samples = [self._read_item(self.items[item_index]) for item_index in group]
+        samples = [self._read_item_with_fallback(item_index) for item_index in group]
         return {
             "pano_image": torch.stack([sample["pano_image"] for sample in samples], dim=0),
             "pano_depth": torch.stack([sample["pano_depth"] for sample in samples], dim=0),
@@ -127,6 +130,20 @@ class PanoCityPairedOmegaDataset(Dataset):
             "metadata_structure_score": torch.stack([sample["metadata_structure_score"] for sample in samples], dim=0),
             "metadata_quality_bin": [sample["metadata_quality_bin"] for sample in samples],
         }
+
+    def _read_item_with_fallback(self, item_index: int) -> Dict:
+        if not self.items:
+            raise IndexError("No PanoCity items are available.")
+        start = int(item_index) % len(self.items)
+        last_error: Exception | None = None
+        for offset in range(len(self.items)):
+            candidate_index = (start + offset) % len(self.items)
+            try:
+                return self._read_item(self.items[candidate_index])
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                last_error = exc
+                print(f"[WARN] skipping unreadable PanoCity sample {self.items[candidate_index].get('scene_name')}: {exc}")
+        raise RuntimeError("All PanoCity samples failed to load.") from last_error
 
     def _read_item(self, item: Dict) -> Dict:
         image = _read_rgb_tensor(item["rgb_path"])
@@ -189,6 +206,8 @@ class PanoCityPairedOmegaDataset(Dataset):
         for rgb_path in _iter_image_files(rgb_dir):
             depth_path = _depth_path_for_rgb(rgb_path, depth_dir)
             if depth_path is None:
+                continue
+            if _is_bad_sample(rgb_path, depth_path, self.bad_samples):
                 continue
             depth_key = str(depth_path)
             if depth_key in seen_depth_paths:
@@ -275,6 +294,40 @@ def _load_metadata(path: Optional[Path], root: Path) -> Dict[str, Dict]:
                     metadata[key] = entry
     print(f"[INFO] loaded PanoCity metadata entries = {len(metadata)} from {resolved}")
     return metadata
+
+
+def _load_bad_samples(path: Optional[Path], root: Path) -> set[str]:
+    if path is None:
+        return set()
+    resolved = path if path.is_absolute() else root / path
+    if not resolved.exists():
+        return set()
+    values: set[str] = set()
+    with resolved.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            path_value = Path(value)
+            values.add(value)
+            values.add(path_value.name)
+            values.add(path_value.stem)
+    print(f"[INFO] loaded PanoCity bad sample entries = {len(values)} from {resolved}")
+    return values
+
+
+def _is_bad_sample(rgb_path: Path, depth_path: Path, bad_samples: set[str]) -> bool:
+    if not bad_samples:
+        return False
+    keys = {
+        str(rgb_path),
+        str(depth_path),
+        rgb_path.name,
+        depth_path.name,
+        rgb_path.stem,
+        depth_path.stem,
+    }
+    return bool(keys & bad_samples)
 
 
 def _apply_metadata(

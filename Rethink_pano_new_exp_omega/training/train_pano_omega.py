@@ -50,6 +50,7 @@ CONFIG_PATH_KEYS = {
     "tensorboard_dir",
     "debug_dir",
     "metadata_path",
+    "bad_sample_list",
 }
 DEFAULT_PANOCITY_PRED_DEPTH_SCALE = 5.491308212280273
 
@@ -85,6 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-split-fraction", type=float, default=0.95)
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--metadata-path", type=Path, default=None)
+    parser.add_argument(
+        "--bad-sample-list",
+        type=Path,
+        default=None,
+        help="Optional newline-delimited bad PanoCity stems/paths to skip before training.",
+    )
     parser.add_argument("--curriculum-bins", type=str, default=None)
     parser.add_argument("--use-metadata-weights", dest="use_metadata_weights", action="store_true", default=True)
     parser.add_argument("--no-metadata-weights", dest="use_metadata_weights", action="store_false")
@@ -374,6 +381,8 @@ def train(args: argparse.Namespace) -> None:
         )
 
         model = build_model(args).to(device)
+        checkpoint_payload = load_checkpoint_payload(args.checkpoint) if args.checkpoint is not None else {}
+        apply_checkpoint_training_defaults(args, checkpoint_payload)
         if args.checkpoint is not None:
             load_checkpoint(model, args.checkpoint, strict=args.strict_checkpoint)
 
@@ -386,6 +395,7 @@ def train(args: argparse.Namespace) -> None:
                 residual_hidden=args.depth_residual_hidden,
                 residual_max_log=args.depth_residual_max_log,
             ).to(device)
+            load_adapter_state_if_present(model, checkpoint_payload, args.checkpoint)
 
         active_stage_index = None
         active_stage_name = "default"
@@ -645,6 +655,7 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
             train_split_fraction=args.train_split_fraction,
             split_seed=args.split_seed,
             metadata_path=args.metadata_path,
+            bad_sample_list=args.bad_sample_list,
             curriculum_bins=args.curriculum_bins,
             use_metadata_weights=args.use_metadata_weights,
         )
@@ -739,6 +750,42 @@ class DepthPredictionAdapter(torch.nn.Module):
 
 
 LearnablePredDepthScale = DepthPredictionAdapter
+
+
+def load_checkpoint_payload(checkpoint_path: Path | None) -> Dict[str, Any]:
+    if checkpoint_path is None or not checkpoint_path.exists():
+        return {}
+    try:
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(checkpoint_path, map_location="cpu")
+    return payload if isinstance(payload, dict) else {}
+
+
+def apply_checkpoint_training_defaults(args: argparse.Namespace, payload: Dict[str, Any]) -> None:
+    if not payload:
+        return
+    ckpt_args = payload.get("args", {}) if isinstance(payload.get("args", {}), dict) else {}
+    if payload.get("pred_depth_scale") is not None:
+        args.pred_depth_scale = float(payload["pred_depth_scale"])
+    elif ckpt_args.get("pred_depth_scale") is not None:
+        args.pred_depth_scale = float(ckpt_args["pred_depth_scale"])
+    for key in ("learn_pred_depth_scale", "depth_residual_mode", "depth_residual_hidden", "depth_residual_max_log"):
+        if key in ckpt_args and ckpt_args[key] is not None:
+            setattr(args, key, ckpt_args[key])
+
+
+def load_adapter_state_if_present(
+    model: DepthPredictionAdapter,
+    payload: Dict[str, Any],
+    checkpoint_path: Path | None,
+) -> None:
+    adapter_state = payload.get("adapter_state") if isinstance(payload, dict) else None
+    if adapter_state is None:
+        return
+    missing, unexpected = model.load_state_dict(adapter_state, strict=False)
+    print(f"[INFO] loaded adapter_state from {checkpoint_path}")
+    print(f"[INFO] adapter_state missing_keys={len(missing)} unexpected_keys={len(unexpected)}")
 
 
 def build_optimizer_for_stage(

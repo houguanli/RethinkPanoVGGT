@@ -32,6 +32,7 @@ class PanoCityPairedPinholeDataset(BaseDataset):
         train_split_fraction: float = 0.95,
         split_seed: int = 42,
         metadata_path: Optional[str] = None,
+        bad_sample_list: Optional[str] = None,
         curriculum_bins: Optional[str | Iterable[str]] = None,
         use_metadata_weights: bool = True,
     ):
@@ -43,9 +44,11 @@ class PanoCityPairedPinholeDataset(BaseDataset):
         self.train_split_fraction = float(train_split_fraction)
         self.split_seed = int(split_seed)
         self.metadata_path = metadata_path
+        self.bad_sample_list = bad_sample_list
         self.curriculum_bins = _parse_bins(curriculum_bins)
         self.use_metadata_weights = bool(use_metadata_weights)
         self.metadata_by_name = _load_metadata(metadata_path, self.root)
+        self.bad_samples = _load_bad_samples(bad_sample_list, self.root)
         self.output_depth_scale = float(output_depth_scale)
         self.invalid_depth_value = None if invalid_depth_value is None else float(invalid_depth_value)
         self.depth_max_m = float(depth_max_m)
@@ -59,14 +62,7 @@ class PanoCityPairedPinholeDataset(BaseDataset):
     def get_data(self, seq_index=None, img_per_seq=None, seq_name=None, ids=None, aspect_ratio=1.0):
         if seq_index is None:
             seq_index = 0
-        item = self.items[int(seq_index) % len(self.items)]
-        image = _read_rgb(item["rgb_path"])
-        range_depth = _read_depth(
-            item["depth_path"],
-            output_depth_scale=self.output_depth_scale,
-            invalid_depth_value=self.invalid_depth_value,
-            depth_max_m=self.depth_max_m,
-        )
+        item, image, range_depth = self._read_item_with_fallback(int(seq_index) % len(self.items))
 
         target_shape = self.get_target_shape(aspect_ratio)
         height, width = int(target_shape[0]), int(target_shape[1])
@@ -138,6 +134,8 @@ class PanoCityPairedPinholeDataset(BaseDataset):
             depth_path = _depth_path_for_rgb(rgb_path, depth_dir)
             if depth_path is None:
                 continue
+            if _is_bad_sample(rgb_path, depth_path, self.bad_samples):
+                continue
             items.append({"rgb_path": rgb_path, "depth_path": depth_path, "name": osp.splitext(osp.basename(rgb_path))[0]})
         items = _apply_metadata(
             items,
@@ -154,6 +152,24 @@ class PanoCityPairedPinholeDataset(BaseDataset):
         if max_samples is not None:
             items = items[: int(max_samples)]
         return items
+
+    def _read_item_with_fallback(self, item_index: int):
+        last_error: Exception | None = None
+        for offset in range(len(self.items)):
+            candidate = self.items[(item_index + offset) % len(self.items)]
+            try:
+                image = _read_rgb(candidate["rgb_path"])
+                range_depth = _read_depth(
+                    candidate["depth_path"],
+                    output_depth_scale=self.output_depth_scale,
+                    invalid_depth_value=self.invalid_depth_value,
+                    depth_max_m=self.depth_max_m,
+                )
+                return candidate, image, range_depth
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                last_error = exc
+                print(f"[WARN] skipping unreadable PanoCity sample {candidate.get('name')}: {exc}")
+        raise RuntimeError("All PanoCity samples failed to load.") from last_error
 
 
 def _split_items(items: list[dict], split: str, train_fraction: float, seed: int) -> list[dict]:
@@ -212,6 +228,44 @@ def _load_metadata(path: Optional[str], root: str) -> dict[str, dict]:
                     metadata[key] = entry
     print(f"[INFO] loaded PanoCity metadata entries = {len(metadata)} from {resolved}")
     return metadata
+
+
+def _load_bad_samples(path: Optional[str], root: str) -> set[str]:
+    if path in (None, ""):
+        return set()
+    resolved = Path(path)
+    if not resolved.is_absolute():
+        resolved = Path(root) / resolved
+    if not resolved.exists():
+        return set()
+    values: set[str] = set()
+    with resolved.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            path_value = Path(value)
+            values.add(value)
+            values.add(path_value.name)
+            values.add(path_value.stem)
+    print(f"[INFO] loaded PanoCity bad sample entries = {len(values)} from {resolved}")
+    return values
+
+
+def _is_bad_sample(rgb_path: str, depth_path: str, bad_samples: set[str]) -> bool:
+    if not bad_samples:
+        return False
+    rgb = Path(rgb_path)
+    depth = Path(depth_path)
+    keys = {
+        str(rgb),
+        str(depth),
+        rgb.name,
+        depth.name,
+        rgb.stem,
+        depth.stem,
+    }
+    return bool(keys & bad_samples)
 
 
 def _apply_metadata(

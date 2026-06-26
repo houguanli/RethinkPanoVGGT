@@ -6,6 +6,7 @@ data:
   train_split_fraction: 0.95
   split_seed: 42
   metadata_path: null
+  bad_sample_list: metadata/panocity_bad_samples.txt
   curriculum_bins: null
   use_metadata_weights: false
   checkpoint: ../baseline01_vggt_omega/logs/panocity_paired_full_lowres_full_warmup_4090_3h_for_luna/ckpts/checkpoint.pt
