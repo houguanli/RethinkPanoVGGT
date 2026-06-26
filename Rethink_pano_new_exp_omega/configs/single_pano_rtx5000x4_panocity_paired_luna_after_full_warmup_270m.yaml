@@ -102,7 +102,7 @@ runtime:
   num_workers: 4
   seed: 43
   max_duration_minutes: 270.0
-  save_every_steps: 0
+  save_every_steps: 5000
   save_last: true
   checkpoint_format: trainable_delta
   debug_depth_dump: false

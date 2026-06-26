@@ -31,14 +31,18 @@ mkdir -p "$(dirname "$SEQ_LOG")" "$BASE_OUT" "$LUNA_OUT"
 } | tee -a "$SEQ_LOG"
 
 cd "$BASELINE"
-echo "[sequence] stage1 baseline full warmup low384 started $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
-PYTHONPATH="$BASELINE${PYTHONPATH:+:$PYTHONPATH}" \
-  "$PYTHON" -m torch.distributed.run \
-  --nproc_per_node="$NPROC_PER_NODE" \
-  --master_port="$BASE_PORT" \
-  training/launch.py --config "$BASE_CONFIG" \
-  2>&1 | tee -a "$BASE_OUT/train_3h_console.log"
-echo "[sequence] stage1 baseline full warmup low384 finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
+if [[ -s "$BASE_CKPT" && "${FORCE_WARMUP:-0}" != "1" ]]; then
+  echo "[sequence] stage1 baseline warmup skipped; existing checkpoint found: $BASE_CKPT" | tee -a "$SEQ_LOG"
+else
+  echo "[sequence] stage1 baseline full warmup low384 started $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
+  PYTHONPATH="$BASELINE${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" -m torch.distributed.run \
+    --nproc_per_node="$NPROC_PER_NODE" \
+    --master_port="$BASE_PORT" \
+    training/launch.py --config "$BASE_CONFIG" \
+    2>&1 | tee -a "$BASE_OUT/train_3h_console.log"
+  echo "[sequence] stage1 baseline full warmup low384 finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
+fi
 
 if [[ ! -s "$BASE_CKPT" ]]; then
   echo "[sequence] missing baseline checkpoint: $BASE_CKPT" | tee -a "$SEQ_LOG"
@@ -46,6 +50,12 @@ if [[ ! -s "$BASE_CKPT" ]]; then
 fi
 
 cd "$LUNA"
+if [[ -s "$LUNA_OUT/loss.csv" && ! -s "$LUNA_OUT/last.pt" && "${PRESERVE_CRASHED_LUNA:-1}" == "1" ]]; then
+  CRASHED_OUT="${LUNA_OUT}_crashed_$(date +%Y%m%d_%H%M%S)"
+  echo "[sequence] preserving incomplete LUNA output: $LUNA_OUT -> $CRASHED_OUT" | tee -a "$SEQ_LOG"
+  mv "$LUNA_OUT" "$CRASHED_OUT"
+  mkdir -p "$LUNA_OUT"
+fi
 echo "[sequence] stage2/3 LUNA low384-to-high512 started $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   "$PYTHON" -m torch.distributed.run \
