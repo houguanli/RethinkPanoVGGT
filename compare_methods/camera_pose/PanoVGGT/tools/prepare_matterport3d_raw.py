@@ -13,16 +13,8 @@ import cv2
 import numpy as np
 
 
-FACE_ORDER = {
-    # Matterport skybox files are named skybox0..5. This follows the common
-    # cubemap order used by the public release and keeps RGB/depth aligned.
-    0: "front",
-    1: "right",
-    2: "back",
-    3: "left",
-    4: "up",
-    5: "down",
-}
+MATTERPORT_FACE_ORDER = "1,2,3,4,0,5"
+MATTERPORT_FACE_ROTATIONS = "0,0,0,0,0,0"
 
 
 def _read_zip_image(zf: zipfile.ZipFile, member: str, flags: int) -> np.ndarray:
@@ -81,7 +73,44 @@ def _cube_maps(size: int, out_h: int, out_w: int):
     return face, map_x, map_y
 
 
-def cube_to_equirect(faces: dict[int, np.ndarray], out_h: int = 1024, out_w: int = 2048, interpolation: int = cv2.INTER_LINEAR) -> np.ndarray:
+def parse_int_list(text: str, expected: int, name: str) -> list[int]:
+    values = [int(part.strip()) for part in text.split(",") if part.strip()]
+    if len(values) != expected:
+        raise ValueError(f"{name} must contain {expected} comma-separated integers, got {text!r}")
+    return values
+
+
+def rotate_face(img: np.ndarray, turns: int) -> np.ndarray:
+    turns = turns % 4
+    if turns == 0:
+        return img
+    return np.ascontiguousarray(np.rot90(img, k=turns))
+
+
+def remap_faces(
+    raw_faces: dict[int, np.ndarray],
+    face_order: list[int],
+    face_rotations: list[int],
+) -> dict[int, np.ndarray]:
+    return {
+        out_face: rotate_face(raw_faces[src_face], face_rotations[out_face])
+        for out_face, src_face in enumerate(face_order)
+    }
+
+
+def apply_yaw_offset(equi: np.ndarray, yaw_deg: float) -> np.ndarray:
+    if yaw_deg == 0:
+        return equi
+    shift = int(round((yaw_deg / 360.0) * equi.shape[1]))
+    return np.roll(equi, shift=shift, axis=1)
+
+
+def cube_to_equirect(
+    faces: dict[int, np.ndarray],
+    out_h: int = 1024,
+    out_w: int = 2048,
+    interpolation: int = cv2.INTER_LINEAR,
+) -> np.ndarray:
     size = next(iter(faces.values())).shape[0]
     face_map, map_x, map_y = _cube_maps(size, out_h, out_w)
     sample = next(iter(faces.values()))
@@ -135,7 +164,21 @@ def zip_member_lookup(zf: zipfile.ZipFile) -> dict[str, str]:
     return {Path(name).name: name for name in zf.namelist() if not name.endswith("/")}
 
 
-def convert_scene(raw_root: Path, out_root: Path, scene: str, panos: set[str], cache_payloads: dict[str, list], force: bool) -> tuple[int, int]:
+def convert_scene(
+    raw_root: Path,
+    out_root: Path,
+    scene: str,
+    panos: set[str],
+    cache_payloads: dict[str, list],
+    force: bool,
+    face_order: list[int],
+    face_rotations: list[int],
+    yaw_deg: float,
+    out_h: int,
+    out_w: int,
+    depth_camera: int,
+    pose_camera: int,
+) -> tuple[int, int]:
     scene_raw = raw_root / scene
     scene_out = out_root / scene
     color_dir = scene_out / "pano_skybox_color"
@@ -165,22 +208,24 @@ def convert_scene(raw_root: Path, out_root: Path, scene: str, panos: set[str], c
                 skipped += 1
                 continue
 
-            color_faces = {}
-            depth_faces = {}
+            raw_color_faces = {}
+            raw_depth_faces = {}
             for face in range(6):
                 color_name = f"{pano}_skybox{face}_sami.jpg"
-                depth_name = f"{pano}_d0_{face}.png"
+                depth_name = f"{pano}_d{depth_camera}_{face}.png"
                 if color_name not in color_members or depth_name not in depth_members:
                     raise FileNotFoundError(f"Missing face {face} for {scene}/{pano}")
-                color_faces[face] = _read_zip_image(z_color, color_members[color_name], cv2.IMREAD_COLOR)
-                depth_faces[face] = _read_zip_image(z_depth, depth_members[depth_name], cv2.IMREAD_UNCHANGED)
+                raw_color_faces[face] = _read_zip_image(z_color, color_members[color_name], cv2.IMREAD_COLOR)
+                raw_depth_faces[face] = _read_zip_image(z_depth, depth_members[depth_name], cv2.IMREAD_UNCHANGED)
 
-            color = cube_to_equirect(color_faces, interpolation=cv2.INTER_LINEAR)
-            depth = cube_to_equirect(depth_faces, interpolation=cv2.INTER_NEAREST)
+            color_faces = remap_faces(raw_color_faces, face_order, face_rotations)
+            depth_faces = remap_faces(raw_depth_faces, face_order, face_rotations)
+            color = apply_yaw_offset(cube_to_equirect(color_faces, out_h=out_h, out_w=out_w, interpolation=cv2.INTER_LINEAR), yaw_deg)
+            depth = apply_yaw_offset(cube_to_equirect(depth_faces, out_h=out_h, out_w=out_w, interpolation=cv2.INTER_NEAREST), yaw_deg)
             cv2.imwrite(str(color_path), color, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
             cv2.imwrite(str(depth_path), depth)
 
-            pose_name = f"{pano}_pose_0_0.txt"
+            pose_name = f"{pano}_pose_{pose_camera}_0.txt"
             if pose_name not in pose_members:
                 alternatives = [name for key, name in pose_members.items() if key.startswith(f"{pano}_pose_")]
                 if not alternatives:
@@ -200,6 +245,24 @@ def main() -> int:
     parser.add_argument("--split-dir", default="/home/aoki/RethinkPanoVGGT_omega_compare_methods_only/compare_methods/camera_pose/PanoVGGT/training/data/splits/matterport3d")
     parser.add_argument("--splits", nargs="+", default=["val", "test"])
     parser.add_argument("--max-scenes", type=int, default=-1)
+    parser.add_argument("--only-scene", default=None, help="Convert only this Matterport scene id.")
+    parser.add_argument("--only-pano", default=None, help="Convert only this panorama id.")
+    parser.add_argument(
+        "--face-order",
+        default=MATTERPORT_FACE_ORDER,
+        help="Raw skybox face index for output cube faces front,right,back,left,up,down. "
+        "Matterport skybox0 is up and skybox5 is down, so the default is 1,2,3,4,0,5.",
+    )
+    parser.add_argument(
+        "--face-rotations",
+        default=MATTERPORT_FACE_ROTATIONS,
+        help="Per output face rotation in 90-degree CCW turns.",
+    )
+    parser.add_argument("--yaw-deg", type=float, default=0.0, help="Horizontal roll/yaw offset applied after equirect conversion.")
+    parser.add_argument("--out-h", type=int, default=1024)
+    parser.add_argument("--out-w", type=int, default=2048)
+    parser.add_argument("--depth-camera", type=int, default=0, choices=[0, 1, 2])
+    parser.add_argument("--pose-camera", type=int, default=0, choices=[0, 1, 2])
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -217,12 +280,35 @@ def main() -> int:
         mode = "val" if split == "val" else "test"
         (out_root / f"{mode}.txt").write_text("\n".join(scenes) + "\n", encoding="utf-8")
 
-    scenes = sorted(needed)
+    if args.only_scene:
+        if args.only_scene not in needed:
+            needed[args.only_scene] = set()
+        scenes = [args.only_scene]
+        if args.only_pano:
+            needed[args.only_scene] = {args.only_pano}
+    else:
+        scenes = sorted(needed)
     if args.max_scenes > 0:
         scenes = scenes[:args.max_scenes]
+    face_order = parse_int_list(args.face_order, 6, "--face-order")
+    face_rotations = parse_int_list(args.face_rotations, 6, "--face-rotations")
     total_done = total_skipped = 0
     for idx, scene in enumerate(scenes, 1):
-        done, skipped = convert_scene(raw_root, out_root, scene, needed[scene], cache_payloads, args.force)
+        done, skipped = convert_scene(
+            raw_root,
+            out_root,
+            scene,
+            needed[scene],
+            cache_payloads,
+            args.force,
+            face_order,
+            face_rotations,
+            args.yaw_deg,
+            args.out_h,
+            args.out_w,
+            args.depth_camera,
+            args.pose_camera,
+        )
         total_done += done
         total_skipped += skipped
         print(f"[{idx}/{len(scenes)}] {scene}: converted={done} skipped={skipped}")
