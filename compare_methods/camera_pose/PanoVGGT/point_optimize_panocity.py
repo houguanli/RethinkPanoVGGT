@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import cv2
 import numpy as np
@@ -33,8 +33,55 @@ def _read_depth(path: Path, height: int, width: int, depth_scale: float) -> torc
     return torch.from_numpy(depth)
 
 
-def _records_for_sample(index: PanoCityPairedIndex, start: int, views: int):
-    return [index[(start + offset) % len(index)] for offset in range(views)]
+def _records_for_sample(records: Sequence, start: int, views: int):
+    return [records[(start + offset) % len(records)] for offset in range(views)]
+
+
+def _trajectory_level_records(index: PanoCityPairedIndex, split: str, train_count: int) -> tuple[list, dict]:
+    """Approximate PanoCity trajectory split by keeping `block` records together."""
+    all_records = sorted(index.records, key=lambda record: record.pair_idx)
+    by_block = {}
+    block_order = []
+    for record in all_records:
+        if record.block not in by_block:
+            by_block[record.block] = []
+            block_order.append(record.block)
+        by_block[record.block].append(record)
+
+    train_blocks = []
+    holdout_blocks = []
+    train_total = 0
+    for block in block_order:
+        block_records = by_block[block]
+        if not holdout_blocks and train_total + len(block_records) <= train_count:
+            train_blocks.append(block)
+            train_total += len(block_records)
+        else:
+            holdout_blocks.append(block)
+
+    if split == "train":
+        selected_blocks = train_blocks
+    elif split in {"val", "valid", "validation", "test", "test_final", "holdout"}:
+        selected_blocks = holdout_blocks
+    elif split in {"all", "smoke"}:
+        selected_blocks = block_order
+    else:
+        raise ValueError(f"Unsupported PanoCity split: {split}")
+
+    selected = [record for block in selected_blocks for record in by_block[block]]
+    info = {
+        "trajectory_split": True,
+        "split": split,
+        "train_count_target": train_count,
+        "train_records": sum(len(by_block[block]) for block in train_blocks),
+        "holdout_records": sum(len(by_block[block]) for block in holdout_blocks),
+        "train_blocks": len(train_blocks),
+        "holdout_blocks": len(holdout_blocks),
+        "selected_blocks": len(selected_blocks),
+        "selected_records": len(selected),
+        "first_holdout_block": holdout_blocks[0] if holdout_blocks else None,
+    }
+    return selected, info
 
 
 def _stack_inputs(records: Iterable, height: int, width: int, depth_scale: float):
@@ -68,10 +115,20 @@ def _metric_dict(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> di
             "valid_pixels": 0,
             "abs_rel": None,
             "rmse": None,
+            "delta1": None,
+            "delta2": None,
             "median_ratio": None,
             "lstsq_scale": None,
             "scaled_abs_rel": None,
             "scaled_rmse": None,
+            "scaled_delta1": None,
+            "scaled_delta2": None,
+            "scale_shift_scale": None,
+            "scale_shift_bias": None,
+            "scale_shift_abs_rel": None,
+            "scale_shift_rmse": None,
+            "scale_shift_delta1": None,
+            "scale_shift_delta2": None,
         }
 
     pred_valid = pred[valid].float()
@@ -83,14 +140,52 @@ def _metric_dict(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> di
     scaled_pred = scale * pred_valid
     ratio = (gt_valid / pred_valid.clamp_min(1e-6)).median()
 
+    def deltas(values: torch.Tensor) -> tuple[float, float]:
+        ratio_metric = torch.maximum(values / gt_valid.clamp_min(1e-6), gt_valid / values.clamp_min(1e-6))
+        return (
+            float((ratio_metric < 1.25).float().mean().item()),
+            float((ratio_metric < 1.25 ** 2).float().mean().item()),
+        )
+
+    delta1, delta2 = deltas(pred_valid)
+    scaled_delta1, scaled_delta2 = deltas(scaled_pred)
+
+    ones = torch.ones_like(pred_valid)
+    design = torch.stack([pred_valid, ones], dim=1)
+    try:
+        solution = torch.linalg.lstsq(design, gt_valid[:, None]).solution[:, 0]
+        shift_scale = solution[0]
+        shift_bias = solution[1]
+        scale_shift_pred = (shift_scale * pred_valid + shift_bias).clamp_min(1e-6)
+        scale_shift_abs_rel = float(((scale_shift_pred - gt_valid).abs() / denom).mean().item())
+        scale_shift_rmse = float(torch.sqrt((scale_shift_pred - gt_valid).square().mean()).item())
+        scale_shift_delta1, scale_shift_delta2 = deltas(scale_shift_pred)
+    except RuntimeError:
+        shift_scale = torch.tensor(float("nan"))
+        shift_bias = torch.tensor(float("nan"))
+        scale_shift_abs_rel = None
+        scale_shift_rmse = None
+        scale_shift_delta1 = None
+        scale_shift_delta2 = None
+
     return {
         "valid_pixels": int(valid.sum().item()),
         "abs_rel": float(((pred_valid - gt_valid).abs() / denom).mean().item()),
         "rmse": float(torch.sqrt((pred_valid - gt_valid).square().mean()).item()),
+        "delta1": delta1,
+        "delta2": delta2,
         "median_ratio": float(ratio.item()),
         "lstsq_scale": float(scale.item()),
         "scaled_abs_rel": float(((scaled_pred - gt_valid).abs() / denom).mean().item()),
         "scaled_rmse": float(torch.sqrt((scaled_pred - gt_valid).square().mean()).item()),
+        "scaled_delta1": scaled_delta1,
+        "scaled_delta2": scaled_delta2,
+        "scale_shift_scale": float(shift_scale.item()),
+        "scale_shift_bias": float(shift_bias.item()),
+        "scale_shift_abs_rel": scale_shift_abs_rel,
+        "scale_shift_rmse": scale_shift_rmse,
+        "scale_shift_delta1": scale_shift_delta1,
+        "scale_shift_delta2": scale_shift_delta2,
     }
 
 
@@ -121,6 +216,8 @@ def main() -> int:
     parser.add_argument("--views", type=int, default=2)
     parser.add_argument("--depth-scale", type=float, default=100.0)
     parser.add_argument("--depth-max", type=float, default=100.0)
+    parser.add_argument("--trajectory-split", action="store_true")
+    parser.add_argument("--train-count", type=int, default=100000)
     parser.add_argument("--output-dir", default="outputs/panocity_point_opt")
     parser.add_argument(
         "--device",
@@ -138,7 +235,19 @@ def main() -> int:
 
     height = int(cfg.img_size)
     width = height * 2
-    index = PanoCityPairedIndex(split=args.split, max_samples=max(args.max_samples + args.views, args.views))
+    if args.trajectory_split:
+        index = PanoCityPairedIndex(split="all")
+        records, split_info = _trajectory_level_records(index, args.split, args.train_count)
+    else:
+        index = PanoCityPairedIndex(split=args.split, max_samples=max(args.max_samples + args.views, args.views))
+        records = list(index.records)
+        split_info = {
+            "trajectory_split": False,
+            "split": args.split,
+            "selected_records": len(records),
+        }
+    if not records:
+        raise RuntimeError(f"No PanoCity records selected for split={args.split}")
 
     per_view_metrics = []
     per_sample = []
@@ -148,8 +257,8 @@ def main() -> int:
 
     with torch.no_grad():
         for sample_idx in range(args.max_samples):
-            records = _records_for_sample(index, sample_idx, args.views)
-            images, gt_depth, rgb_paths, depth_paths = _stack_inputs(records, height, width, args.depth_scale)
+            sample_records = _records_for_sample(records, sample_idx, args.views)
+            images, gt_depth, rgb_paths, depth_paths = _stack_inputs(sample_records, height, width, args.depth_scale)
             outputs = model(images.to(device))
             pred_depth = outputs["depth"].detach().cpu()
             if pred_depth.dim() == 5 and pred_depth.shape[-1] == 1:
@@ -192,14 +301,23 @@ def main() -> int:
         "views": args.views,
         "depth_scale": args.depth_scale,
         "depth_max": args.depth_max,
+        "split_info": split_info,
         "global_valid_pixels": global_valid,
         "suggested_panovggt_geometry_output_scale": global_scale,
         "mean_per_view": {
             "abs_rel": _mean_metric(per_view_metrics, "abs_rel"),
             "rmse": _mean_metric(per_view_metrics, "rmse"),
+            "delta1": _mean_metric(per_view_metrics, "delta1"),
+            "delta2": _mean_metric(per_view_metrics, "delta2"),
             "lstsq_scale": _mean_metric(per_view_metrics, "lstsq_scale"),
             "scaled_abs_rel": _mean_metric(per_view_metrics, "scaled_abs_rel"),
             "scaled_rmse": _mean_metric(per_view_metrics, "scaled_rmse"),
+            "scaled_delta1": _mean_metric(per_view_metrics, "scaled_delta1"),
+            "scaled_delta2": _mean_metric(per_view_metrics, "scaled_delta2"),
+            "scale_shift_abs_rel": _mean_metric(per_view_metrics, "scale_shift_abs_rel"),
+            "scale_shift_rmse": _mean_metric(per_view_metrics, "scale_shift_rmse"),
+            "scale_shift_delta1": _mean_metric(per_view_metrics, "scale_shift_delta1"),
+            "scale_shift_delta2": _mean_metric(per_view_metrics, "scale_shift_delta2"),
         },
         "samples": per_sample,
     }
