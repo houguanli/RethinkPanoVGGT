@@ -244,8 +244,15 @@ def _index_stanford2d3ds(root: Path, split: str, scale: float) -> List[Dict]:
 def _index_structured3d(root: Path, split: str, scale: float) -> List[Dict]:
     index_path = root / "cache" / f"structured3d_{split}_index.json"
     rows = _read_json_list(index_path)
-    if not rows and split == "train":
-        rows = [[scene.name, [camera.parent.parent.name for camera in scene.glob("2D_rendering/*/panorama/camera_xyz.txt")], [512, 1024]] for scene in sorted(root.glob("scene_*"))]
+    if not rows:
+        for fallback_split in ("val", "test"):
+            rows = _read_json_list(root / "cache" / f"structured3d_{fallback_split}_index.json")
+            if rows:
+                print(
+                    f"[WARN] Structured3D {split} index not found under {root}; "
+                    f"using structured3d_{fallback_split}_index.json instead."
+                )
+                break
     items: List[Dict] = []
     for row in rows:
         scene, pano_ids, _size = row
