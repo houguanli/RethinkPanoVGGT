@@ -30,7 +30,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from training.data import PanoCityPairedOmegaDataset, PanoVKittiOmegaDataset  # noqa: E402
+from training.data import MixedPanoDataset, PanoCityPairedOmegaDataset, PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E402
 from vggt_omega.data.pano_sampler import make_default_view_grid  # noqa: E402
 from vggt_omega.models.heads.dense_head import DenseHead  # noqa: E402
 from vggt_omega.models.layers import PatchEmbed  # noqa: E402
@@ -51,6 +51,7 @@ CONFIG_PATH_KEYS = {
     "debug_dir",
     "metadata_path",
     "bad_sample_list",
+    "dataset_roots",
 }
 DEFAULT_PANOCITY_PRED_DEPTH_SCALE = 5.491308212280273
 
@@ -59,7 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train VGGT-Omega LUNA on converted pano VKitti-style data.")
     parser.add_argument("--config", type=Path, default=None, help="Optional YAML config; explicit CLI values override it.")
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
-    parser.add_argument("--dataset-format", choices=["vkitti", "panocity_paired"], default="vkitti")
+    parser.add_argument("--dataset-format", choices=["vkitti", "panocity_paired", "pano_minimal", "mixed_pano"], default="vkitti")
+    parser.add_argument("--dataset-roots", nargs="+", type=Path, default=None)
+    parser.add_argument("--minimal-datasets", type=str, default="all")
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "pano_omega_luna")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
@@ -345,7 +348,10 @@ def load_config_defaults(path: Path, parser: argparse.ArgumentParser) -> Dict:
         raise ValueError(f"Unknown training config keys in {path}: {unknown}")
     for key in CONFIG_PATH_KEYS:
         if key in flattened and flattened[key] is not None:
-            flattened[key] = Path(flattened[key])
+            if key == "dataset_roots":
+                flattened[key] = [Path(value) for value in flattened[key]]
+            else:
+                flattened[key] = Path(flattened[key])
     flattened["config"] = path
     return flattened
 
@@ -659,6 +665,50 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
             curriculum_bins=args.curriculum_bins,
             use_metadata_weights=args.use_metadata_weights,
         )
+    if args.dataset_format == "pano_minimal":
+        return PanoMinimalDataset(
+            **common_kwargs,
+            split=args.dataset_split,
+            train_split_fraction=args.train_split_fraction,
+            split_seed=args.split_seed,
+            datasets=args.minimal_datasets,
+            output_depth_scale=args.output_depth_scale,
+            invalid_depth_value=args.invalid_depth_value,
+        )
+    if args.dataset_format == "mixed_pano":
+        roots = args.dataset_roots or [args.dataset_root]
+        datasets = []
+        for root in roots:
+            root = Path(root)
+            if (root / "rgb").exists() and (root / "depth").exists():
+                datasets.append(
+                    PanoCityPairedOmegaDataset(
+                        **{**common_kwargs, "root": root},
+                        output_depth_scale=args.output_depth_scale,
+                        invalid_depth_value=args.invalid_depth_value,
+                        position_step_m=args.pano_position_step_m,
+                        split=args.dataset_split,
+                        train_split_fraction=args.train_split_fraction,
+                        split_seed=args.split_seed,
+                        metadata_path=args.metadata_path,
+                        bad_sample_list=args.bad_sample_list,
+                        curriculum_bins=args.curriculum_bins,
+                        use_metadata_weights=args.use_metadata_weights,
+                    )
+                )
+            else:
+                datasets.append(
+                    PanoMinimalDataset(
+                        **{**common_kwargs, "root": root},
+                        split=args.dataset_split,
+                        train_split_fraction=args.train_split_fraction,
+                        split_seed=args.split_seed,
+                        datasets=args.minimal_datasets,
+                        output_depth_scale=args.output_depth_scale,
+                        invalid_depth_value=args.invalid_depth_value,
+                    )
+                )
+        return MixedPanoDataset(datasets)
     raise ValueError(f"Unknown dataset_format: {args.dataset_format}")
 
 
