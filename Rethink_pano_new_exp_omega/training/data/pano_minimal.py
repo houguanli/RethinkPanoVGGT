@@ -12,6 +12,10 @@ Supported layouts under one parent directory:
 
   Structured3D/<scene>/2D_rendering/<camera>/panorama/full/rgb_rawlight.png
   Structured3D/<scene>/2D_rendering/<camera>/panorama/full/depth.png
+
+  Panocity/<city>/<block>/pano_images/pano_*.png
+  Panocity/<city>/<block>/panodepth_images/pano_depth_*.png
+  Panocity/<city>/<block>/*_poses.json
 """
 
 from __future__ import annotations
@@ -62,7 +66,7 @@ class MixedPanoDataset(Dataset):
 
 
 class PanoMinimalDataset(Dataset):
-    """Read Matterport3D, Stanford2D3DS, and Structured3D from the minimal bundle."""
+    """Read Matterport3D, Stanford2D3DS, Structured3D, and Panocity from the bundle."""
 
     def __init__(
         self,
@@ -193,6 +197,8 @@ class PanoMinimalDataset(Dataset):
             items.extend(_index_stanford2d3ds(self.root / "Stanford2D3DS", self.split, self.output_depth_scale))
         if "structured3d" in self.dataset_names:
             items.extend(_index_structured3d(self.root / "Structured3D", self.split, self.output_depth_scale))
+        if "panocity" in self.dataset_names:
+            items.extend(_index_panocity_official(self.root / "Panocity", self.split, self.output_depth_scale))
         if max_samples is not None:
             items = items[: int(max_samples)]
         return items
@@ -200,12 +206,19 @@ class PanoMinimalDataset(Dataset):
 
 def _parse_dataset_names(raw: Optional[str | Iterable[str]]) -> set[str]:
     if raw in (None, "", "all"):
-        return {"matterport3d", "stanford2d3ds", "structured3d"}
+        return {"matterport3d", "stanford2d3ds", "structured3d", "panocity"}
     if isinstance(raw, str):
         values = raw.split(",")
     else:
         values = [str(value) for value in raw]
-    aliases = {"2d3ds": "stanford2d3ds", "stanford": "stanford2d3ds", "mp3d": "matterport3d", "s3d": "structured3d"}
+    aliases = {
+        "2d3ds": "stanford2d3ds",
+        "stanford": "stanford2d3ds",
+        "mp3d": "matterport3d",
+        "s3d": "structured3d",
+        "pano_city": "panocity",
+        "panocityofficial": "panocity",
+    }
     return {aliases.get(value.strip().lower(), value.strip().lower()) for value in values if value.strip()}
 
 
@@ -266,6 +279,77 @@ def _index_structured3d(root: Path, split: str, scale: float) -> List[Dict]:
     return items
 
 
+def _index_panocity_official(root: Path, split: str, scale: float) -> List[Dict]:
+    index_path = root / "cache" / f"panocity_{split}_index.json"
+    rows = _read_json_list(index_path)
+    if not rows and split != "all":
+        rows = _read_json_list(root / "cache" / "panocity_all_index.json")
+        if rows:
+            print(f"[WARN] Panocity {split} index not found under {root}; using panocity_all_index.json instead.")
+    if not rows:
+        rows = build_panocity_official_rows(root)
+    items: List[Dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rgb_path = _resolve_cached_path(root, row.get("rgb_path"))
+        depth_path = _resolve_cached_path(root, row.get("depth_path"))
+        if rgb_path is None or depth_path is None or not rgb_path.exists() or not depth_path.exists():
+            continue
+        items.append(
+            _item(
+                "Panocity",
+                str(row.get("scene_name") or rgb_path.stem),
+                rgb_path,
+                depth_path,
+                [float(value) for value in row.get("pano_position_m", [0.0, 0.0, 0.0])[:3]],
+                scale,
+            )
+        )
+    return items
+
+
+def build_panocity_official_rows(root: Path) -> List[Dict]:
+    rows: List[Dict] = []
+    if not root.exists():
+        return rows
+    for pose_path in sorted(root.glob("*/*/*_poses.json")):
+        block_dir = pose_path.parent
+        city = block_dir.parent.name
+        block = block_dir.name
+        try:
+            payload = json.loads(pose_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            print(f"[WARN] skipping malformed Panocity pose file {pose_path}: {exc}")
+            continue
+        frames = payload.get("frames", []) if isinstance(payload, dict) else []
+        for frame in frames:
+            if not isinstance(frame, dict):
+                continue
+            rgb_name = frame.get("name")
+            depth_name = frame.get("depth")
+            if not rgb_name or not depth_name:
+                continue
+            rgb_path = block_dir / "pano_images" / str(rgb_name)
+            depth_path = block_dir / "panodepth_images" / str(depth_name)
+            if not rgb_path.exists() or not depth_path.exists():
+                continue
+            matrix = frame.get("transformation_matrix") or []
+            position = _translation_from_matrix(matrix)
+            rows.append(
+                {
+                    "dataset": "Panocity",
+                    "city": city,
+                    "block": block,
+                    "scene_name": f"{city}_{block}_{Path(str(rgb_name)).stem}",
+                    "rgb_path": str(rgb_path.relative_to(root)),
+                    "depth_path": str(depth_path.relative_to(root)),
+                    "pano_position_m": position,
+                }
+            )
+    return rows
+
+
 def _item(sequence_name: str, scene_name: str, rgb_path: Path, depth_path: Path, position: List[float], scale: float) -> Dict:
     return {
         "sequence_name": sequence_name,
@@ -275,6 +359,22 @@ def _item(sequence_name: str, scene_name: str, rgb_path: Path, depth_path: Path,
         "pano_position_m": position,
         "output_depth_scale": scale,
     }
+
+
+def _resolve_cached_path(root: Path, value: object) -> Optional[Path]:
+    if value in (None, ""):
+        return None
+    path = Path(str(value))
+    return path if path.is_absolute() else root / path
+
+
+def _translation_from_matrix(matrix: object) -> List[float]:
+    try:
+        if len(matrix) >= 3:
+            return [float(matrix[0][3]), float(matrix[1][3]), float(matrix[2][3])]
+    except (TypeError, ValueError, IndexError):
+        pass
+    return [0.0, 0.0, 0.0]
 
 
 def _read_json_list(path: Path) -> List:
