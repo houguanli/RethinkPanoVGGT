@@ -15,6 +15,14 @@ import numpy as np
 
 MATTERPORT_FACE_ORDER = "1,2,3,4,0,5"
 MATTERPORT_FACE_ROTATIONS = "0,0,0,0,0,0"
+MATTERPORT_SKYBOX_TRANSFORMS = (
+    np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=np.float64),
+    np.eye(3, dtype=np.float64),
+    np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]], dtype=np.float64),
+    np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], dtype=np.float64),
+    np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], dtype=np.float64),
+    np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64),
+)
 
 
 def _read_zip_image(zf: zipfile.ZipFile, member: str, flags: int) -> np.ndarray:
@@ -164,6 +172,167 @@ def zip_member_lookup(zf: zipfile.ZipFile) -> dict[str, str]:
     return {Path(name).name: name for name in zf.namelist() if not name.endswith("/")}
 
 
+def parse_undistorted_camera_parameters(text: str):
+    intrinsics: dict[str, dict[str, np.ndarray]] = defaultdict(dict)
+    extrinsics: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = defaultdict(dict)
+    current_k = None
+
+    for line in text.splitlines():
+        if line.startswith("intrinsics_matrix"):
+            vals = [float(x) for x in line.split()[1:]]
+            current_k = np.array(vals, dtype=np.float64).reshape(3, 3)
+            continue
+        if not line.startswith("scan "):
+            continue
+        if current_k is None:
+            raise RuntimeError(f"Camera scan entry before intrinsics: {line}")
+
+        parts = line.split()
+        depth_name = parts[1]
+        color_name = parts[2]
+        pano = depth_name.rsplit("_d", 1)[0]
+        camera_key = color_name.rsplit(".", 1)[0].rsplit("_i", 1)[1]
+        camera_group = camera_key.split("_", 1)[0]
+        pose_c2w = np.array([float(x) for x in parts[3:19]], dtype=np.float64).reshape(4, 4)
+        intrinsics[pano][camera_group] = current_k.copy()
+        extrinsics[pano][camera_key] = (pose_c2w, np.linalg.inv(pose_c2w))
+
+    return intrinsics, extrinsics
+
+
+def _skybox_intrinsic(width: int, height: int) -> np.ndarray:
+    k = np.zeros((3, 3), dtype=np.float64)
+    k[0, 0] = width / 2.0
+    k[1, 1] = height / 2.0
+    k[0, 2] = width / 2.0
+    k[1, 2] = height / 2.0
+    k[2, 2] = 1.0
+    return k
+
+
+def _z_depth_to_euclidean(k_inv: np.ndarray, depth: np.ndarray) -> np.ndarray:
+    h, w = depth.shape
+    yy, xx = np.indices((h, w))
+    pix = np.vstack((xx.reshape(-1), yy.reshape(-1), np.ones(xx.size)))
+    rays = k_inv.dot(pix)
+    cos_theta = np.array([0.0, 0.0, 1.0], dtype=np.float64).dot(rays) / np.linalg.norm(rays, axis=0)
+    out = depth.astype(np.float64) / cos_theta.reshape(h, w)
+    out[~np.isfinite(out)] = 0
+    out[out < 0] = 0
+    out[out > 65535] = 65535
+    return out.astype(np.uint16)
+
+
+def fill_small_depth_holes(depth: np.ndarray, max_area: int) -> np.ndarray:
+    valid = depth > 0
+    invalid = (~valid).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(invalid, connectivity=8)
+    fill_mask = np.zeros_like(invalid, dtype=np.uint8)
+    for label in range(1, num):
+        x, y, w, h, area = stats[label]
+        touches_border = x == 0 or y == 0 or (x + w) >= depth.shape[1] or (y + h) >= depth.shape[0]
+        if not touches_border and area <= max_area:
+            fill_mask[labels == label] = 255
+    if not np.any(fill_mask):
+        return depth
+
+    values = depth[valid].astype(np.float32)
+    if values.size == 0:
+        return depth
+    lo, hi = np.percentile(values, [1, 99])
+    scale = max(float(hi - lo), 1.0)
+    depth_8u = np.clip((depth.astype(np.float32) - lo) / scale * 255.0, 0, 255).astype(np.uint8)
+    filled_8u = cv2.inpaint(depth_8u, fill_mask, 5, cv2.INPAINT_TELEA)
+    filled = depth.copy()
+    locs = fill_mask > 0
+    filled[locs] = np.clip(filled_8u[locs].astype(np.float32) / 255.0 * scale + lo, 0, 65535).astype(np.uint16)
+    return filled
+
+
+def project_undistorted_depth_to_equirect(
+    z_depth: zipfile.ZipFile,
+    depth_members: dict[str, str],
+    pano: str,
+    pano_intrinsics: dict[str, np.ndarray],
+    pano_extrinsics: dict[str, tuple[np.ndarray, np.ndarray]],
+    out_h: int,
+    out_w: int,
+    hole_fill: str,
+    small_hole_area: int,
+    depth_max_m: float,
+) -> np.ndarray:
+    if len(pano_intrinsics) < 3 or len(pano_extrinsics) < 18:
+        raise RuntimeError(f"Missing undistorted camera parameters for {pano}")
+
+    depth_euclidean = {}
+    for camera in range(3):
+        k_inv = np.linalg.inv(pano_intrinsics[str(camera)])
+        for angle in range(6):
+            key = f"{camera}_{angle}"
+            depth_name = f"{pano}_d{key}.png"
+            if depth_name not in depth_members:
+                raise FileNotFoundError(depth_name)
+            depth_z = _read_zip_image(z_depth, depth_members[depth_name], cv2.IMREAD_ANYDEPTH)
+            depth_euclidean[key] = _z_depth_to_euclidean(k_inv, depth_z)
+
+    face_size = 1024
+    k_skybox = _skybox_intrinsic(face_size, face_size)
+    center_key = "1_5"
+    if center_key not in pano_extrinsics:
+        raise RuntimeError(f"Missing central skybox reference pose {pano}_i{center_key}")
+    center_c2w, _ = pano_extrinsics[center_key]
+    skybox_faces = {}
+    z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    for skybox_ix, transform in enumerate(MATTERPORT_SKYBOX_TRANSFORMS):
+        skybox_c2w_rot = center_c2w[:3, :3].dot(transform)
+        skybox_wtc_rot = np.linalg.inv(skybox_c2w_rot)
+        face_depth = np.zeros((face_size, face_size), dtype=np.uint16)
+
+        for camera in range(3):
+            k_im = pano_intrinsics[str(camera)]
+            for angle in range(6):
+                key = f"{camera}_{angle}"
+                if key not in pano_extrinsics:
+                    raise RuntimeError(f"Missing undistorted pose {pano}_i{key}")
+                pose_c2w, _ = pano_extrinsics[key]
+                image_c2w_rot = pose_c2w[:3, :3]
+                if image_c2w_rot.dot(z_axis).dot(skybox_c2w_rot.dot(z_axis)) < 0:
+                    continue
+                homography = k_skybox.dot(skybox_wtc_rot.dot(image_c2w_rot.dot(np.linalg.inv(k_im))))
+                src_depth = cv2.flip(depth_euclidean[key], 1)
+                warped = cv2.warpPerspective(src_depth, homography, (face_size, face_size), flags=cv2.INTER_NEAREST)
+                mask = cv2.warpPerspective(
+                    np.ones_like(src_depth, dtype=np.uint8),
+                    homography,
+                    (face_size, face_size),
+                    flags=cv2.INTER_LINEAR,
+                )
+                mask[warped == 0] = 0
+                mask = cv2.erode(mask, np.ones((3, 3), dtype=np.uint8), iterations=1)
+                locs = np.where(mask == 1)
+                face_depth[locs] = warped[locs]
+
+        skybox_faces[skybox_ix] = cv2.flip(face_depth, 1)
+
+    equirect_faces = {
+        0: skybox_faces[1],
+        1: skybox_faces[2],
+        2: skybox_faces[3],
+        3: skybox_faces[4],
+        4: skybox_faces[0],
+        5: skybox_faces[5],
+    }
+    depth = cube_to_equirect(equirect_faces, out_h=out_h, out_w=out_w, interpolation=cv2.INTER_NEAREST)
+    if hole_fill == "small":
+        scaled_area = max(1, int(round(small_hole_area * (out_h * out_w) / float(1024 * 2048))))
+        depth = fill_small_depth_holes(depth, scaled_area)
+    if depth_max_m > 0:
+        depth = depth.copy()
+        depth[depth.astype(np.float32) / 4000.0 > depth_max_m] = 0
+    return depth
+
+
 def convert_scene(
     raw_root: Path,
     out_root: Path,
@@ -178,6 +347,10 @@ def convert_scene(
     out_w: int,
     depth_camera: int,
     pose_camera: int,
+    depth_source: str,
+    hole_fill: str,
+    small_hole_area: int,
+    depth_max_m: float,
 ) -> tuple[int, int]:
     scene_raw = raw_root / scene
     scene_out = out_root / scene
@@ -193,48 +366,83 @@ def convert_scene(
     (parsed_dir / f"{scene}.json").write_text(json.dumps(create_scene_json(cache_payloads, scene), ensure_ascii=False, indent=2), encoding="utf-8")
 
     with zipfile.ZipFile(scene_raw / "matterport_skybox_images.zip") as z_color, \
-            zipfile.ZipFile(scene_raw / "matterport_depth_images.zip") as z_depth, \
             zipfile.ZipFile(scene_raw / "matterport_camera_poses.zip") as z_pose:
         color_members = zip_member_lookup(z_color)
-        depth_members = zip_member_lookup(z_depth)
         pose_members = zip_member_lookup(z_pose)
+        if depth_source == "undistorted":
+            z_depth = zipfile.ZipFile(scene_raw / "undistorted_depth_images.zip")
+            z_params = zipfile.ZipFile(scene_raw / "undistorted_camera_parameters.zip")
+            conf_text = z_params.read(f"{scene}/undistorted_camera_parameters/{scene}.conf").decode("utf-8")
+            scene_intrinsics, scene_extrinsics = parse_undistorted_camera_parameters(conf_text)
+        else:
+            z_depth = zipfile.ZipFile(scene_raw / "matterport_depth_images.zip")
+            z_params = None
+            scene_intrinsics = scene_extrinsics = None
+        depth_members = zip_member_lookup(z_depth)
         done = 0
         skipped = 0
-        for pano in sorted(panos):
-            color_path = color_dir / f"{pano}.jpg"
-            depth_path = depth_dir / f"{pano}.png"
-            pose_path = pose_dir / f"{pano}.txt"
-            if not force and color_path.exists() and depth_path.exists() and pose_path.exists():
-                skipped += 1
-                continue
+        try:
+            for pano in sorted(panos):
+                color_path = color_dir / f"{pano}.jpg"
+                depth_path = depth_dir / f"{pano}.png"
+                pose_path = pose_dir / f"{pano}.txt"
+                if not force and color_path.exists() and depth_path.exists() and pose_path.exists():
+                    skipped += 1
+                    continue
 
-            raw_color_faces = {}
-            raw_depth_faces = {}
-            for face in range(6):
-                color_name = f"{pano}_skybox{face}_sami.jpg"
-                depth_name = f"{pano}_d{depth_camera}_{face}.png"
-                if color_name not in color_members or depth_name not in depth_members:
-                    raise FileNotFoundError(f"Missing face {face} for {scene}/{pano}")
-                raw_color_faces[face] = _read_zip_image(z_color, color_members[color_name], cv2.IMREAD_COLOR)
-                raw_depth_faces[face] = _read_zip_image(z_depth, depth_members[depth_name], cv2.IMREAD_UNCHANGED)
+                raw_color_faces = {}
+                raw_depth_faces = {}
+                for face in range(6):
+                    color_name = f"{pano}_skybox{face}_sami.jpg"
+                    if color_name not in color_members:
+                        raise FileNotFoundError(f"Missing color face {face} for {scene}/{pano}")
+                    raw_color_faces[face] = _read_zip_image(z_color, color_members[color_name], cv2.IMREAD_COLOR)
+                    if depth_source == "legacy":
+                        depth_name = f"{pano}_d{depth_camera}_{face}.png"
+                        if depth_name not in depth_members:
+                            raise FileNotFoundError(f"Missing depth face {face} for {scene}/{pano}")
+                        raw_depth_faces[face] = _read_zip_image(z_depth, depth_members[depth_name], cv2.IMREAD_UNCHANGED)
 
-            color_faces = remap_faces(raw_color_faces, face_order, face_rotations)
-            depth_faces = remap_faces(raw_depth_faces, face_order, face_rotations)
-            color = apply_yaw_offset(cube_to_equirect(color_faces, out_h=out_h, out_w=out_w, interpolation=cv2.INTER_LINEAR), yaw_deg)
-            depth = apply_yaw_offset(cube_to_equirect(depth_faces, out_h=out_h, out_w=out_w, interpolation=cv2.INTER_NEAREST), yaw_deg)
-            cv2.imwrite(str(color_path), color, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-            cv2.imwrite(str(depth_path), depth)
+                color_faces = remap_faces(raw_color_faces, face_order, face_rotations)
+                color = cube_to_equirect(color_faces, out_h=out_h, out_w=out_w, interpolation=cv2.INTER_LINEAR)
+                if depth_source == "undistorted":
+                    depth = project_undistorted_depth_to_equirect(
+                        z_depth,
+                        depth_members,
+                        pano,
+                        scene_intrinsics.get(pano, {}),
+                        scene_extrinsics.get(pano, {}),
+                        out_h,
+                        out_w,
+                        hole_fill,
+                        small_hole_area,
+                        depth_max_m,
+                    )
+                else:
+                    depth_faces = remap_faces(raw_depth_faces, face_order, face_rotations)
+                    depth = cube_to_equirect(depth_faces, out_h=out_h, out_w=out_w, interpolation=cv2.INTER_NEAREST)
+                    if depth_max_m > 0:
+                        depth = depth.copy()
+                        depth[depth.astype(np.float32) / 4000.0 > depth_max_m] = 0
+                color = apply_yaw_offset(color, yaw_deg)
+                depth = apply_yaw_offset(depth, yaw_deg)
+                cv2.imwrite(str(color_path), color, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                cv2.imwrite(str(depth_path), depth)
 
-            pose_name = f"{pano}_pose_{pose_camera}_0.txt"
-            if pose_name not in pose_members:
-                alternatives = [name for key, name in pose_members.items() if key.startswith(f"{pano}_pose_")]
-                if not alternatives:
-                    raise FileNotFoundError(f"Missing pose for {scene}/{pano}")
-                pose_member = alternatives[0]
-            else:
-                pose_member = pose_members[pose_name]
-            pose_path.write_bytes(z_pose.read(pose_member))
-            done += 1
+                pose_name = f"{pano}_pose_{pose_camera}_0.txt"
+                if pose_name not in pose_members:
+                    alternatives = [name for key, name in pose_members.items() if key.startswith(f"{pano}_pose_")]
+                    if not alternatives:
+                        raise FileNotFoundError(f"Missing pose for {scene}/{pano}")
+                    pose_member = alternatives[0]
+                else:
+                    pose_member = pose_members[pose_name]
+                pose_path.write_bytes(z_pose.read(pose_member))
+                done += 1
+        finally:
+            z_depth.close()
+            if z_params is not None:
+                z_params.close()
     return done, skipped
 
 
@@ -263,6 +471,10 @@ def main() -> int:
     parser.add_argument("--out-w", type=int, default=2048)
     parser.add_argument("--depth-camera", type=int, default=0, choices=[0, 1, 2])
     parser.add_argument("--pose-camera", type=int, default=0, choices=[0, 1, 2])
+    parser.add_argument("--depth-source", default="undistorted", choices=["undistorted", "legacy"])
+    parser.add_argument("--hole-fill", default="small", choices=["none", "small"])
+    parser.add_argument("--small-hole-area", type=int, default=18000)
+    parser.add_argument("--depth-max-m", type=float, default=10.0)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -308,6 +520,10 @@ def main() -> int:
             args.out_w,
             args.depth_camera,
             args.pose_camera,
+            args.depth_source,
+            args.hole_fill,
+            args.small_hole_area,
+            args.depth_max_m,
         )
         total_done += done
         total_skipped += skipped

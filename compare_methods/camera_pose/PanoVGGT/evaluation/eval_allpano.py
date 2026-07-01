@@ -113,6 +113,7 @@ def evaluate_sequence(
     depth_max: float = 10.0,
     depth_align: str = "median-scale",
     dataset_name: str = "",
+    skip_pointcloud: bool = False,
 ) -> tuple:
     """Run inference on one sequence and compute all metrics.
 
@@ -199,6 +200,9 @@ def evaluate_sequence(
         depth_metrics = {k: _safe_mean(v) for k, v in per_frame.items()}
 
     # ── 3. Point-cloud metrics ───────────────────────────────────────
+    if skip_pointcloud:
+        return pose_metrics, depth_metrics, {}, {}
+
     pc_cfg = POINTCLOUD_CONFIG.get(dataset_name, _DEFAULT_PC)
     gt_world_np = gt_world.cpu().float().numpy().transpose(0, 2, 3, 1)  # (N,H,W,3)
     mask_np = gt_mask.cpu().numpy()
@@ -236,12 +240,16 @@ def eval_one_dataset(
     num_frames: int,
     depth_align: str,
     json_root: str,
+    skip_pointcloud: bool = False,
 ) -> dict:
     """Evaluate *model* on *dataset* and save per-dataset JSON."""
     pc_cfg = POINTCLOUD_CONFIG.get(name, _DEFAULT_PC)
     print(f"\n{'=' * 72}")
     print(f"  Dataset : {name}")
-    print(f"  ICP th  : {pc_cfg['icp_threshold']}m  |  normal radius : {pc_cfg['normal_radius']}m")
+    if skip_pointcloud:
+        print("  Point-cloud metrics: skipped")
+    else:
+        print(f"  ICP th  : {pc_cfg['icp_threshold']}m  |  normal radius : {pc_cfg['normal_radius']}m")
     print(f"{'=' * 72}")
 
     indices = list(range(dataset.sequence_list_len))
@@ -259,6 +267,7 @@ def eval_one_dataset(
                 depth_max=dataset.depth_max,
                 depth_align=depth_align,
                 dataset_name=name,
+                skip_pointcloud=skip_pointcloud,
             )
             for src, bucket in [(pose_m, "pose"), (depth_m, "depth"),
                                 (wpt_m, "world_point"), (gpt_m, "global_point")]:
@@ -284,6 +293,7 @@ def eval_one_dataset(
     with open(path, "w") as f:
         json.dump({**result, "num_sequences": len(indices),
                    "frames_per_seq": num_frames,
+                   "pointcloud_enabled": not skip_pointcloud,
                    "pointcloud_config": pc_cfg}, f, indent=2)
     print(f"  → {path}")
     return result
@@ -298,10 +308,14 @@ def parse_args():
         description="Evaluate on all panoramic datasets (pose / depth / point-cloud).")
 
     # paths
-    p.add_argument("--panocity_root",       type=str, required=True)
-    p.add_argument("--matterport_root",   type=str, required=True)
-    p.add_argument("--stanford_root",     type=str, required=True)
-    p.add_argument("--structured3d_root", type=str, required=True)
+    p.add_argument("--panocity_root", type=str,
+                   default=os.environ.get("PANOCITY_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets/Panocity"))
+    p.add_argument("--matterport_root", type=str,
+                   default=os.environ.get("MATTERPORT3D_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets/Matterport3D"))
+    p.add_argument("--stanford_root", type=str,
+                   default=os.environ.get("STANFORD2D3DS_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets/Stanford2D3DS"))
+    p.add_argument("--structured3d_root", type=str,
+                   default=os.environ.get("STRUCTURED3D_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets/Structured3D"))
 
     # model
     p.add_argument("--ckpt",  type=str, required=True, help="Path to model checkpoint")
@@ -309,6 +323,8 @@ def parse_args():
                    help="module:ClassName")
     p.add_argument("--model_kwargs", type=str, default=None,
                    help="JSON string of model constructor kwargs")
+    p.add_argument("--model_kwargs_file", type=str, default=None,
+                   help="Path to a JSON file with model constructor kwargs")
     p.add_argument("--split", type=str, default="test_final",
                    choices=["train", "test", "test_final"])
 
@@ -329,6 +345,8 @@ def parse_args():
     p.add_argument("--seed",        type=int, default=0)
     p.add_argument("--amp_dtype",   type=str, default="bf16", choices=["none", "bf16", "fp16"])
     p.add_argument("--depth_align", type=str, default="median-scale")
+    p.add_argument("--no_pointcloud", action="store_true",
+                   help="Skip expensive point-cloud ICP metrics and report pose/depth only.")
     p.add_argument("--json_root",   type=str, default="eval_results")
 
     return p.parse_args()
@@ -343,7 +361,11 @@ def main():
     # ── load model ───────────────────────────────────────────────────
     mod_path, cls_name = args.model.split(":")
     ModelClass = getattr(importlib.import_module(mod_path), cls_name)
-    kwargs = json.loads(args.model_kwargs) if args.model_kwargs else {}
+    if args.model_kwargs_file:
+        with open(args.model_kwargs_file, "r") as f:
+            kwargs = json.load(f)
+    else:
+        kwargs = json.loads(args.model_kwargs) if args.model_kwargs else {}
     model = ModelClass(**kwargs).to(device).eval()
 
     ckpt = torch.load(args.ckpt, map_location="cpu")
@@ -385,6 +407,9 @@ def main():
     ]
 
     for name, DatasetClass, ds_kwargs, n_seqs, n_frames in DATASETS:
+        if n_seqs == 0:
+            print(f"Skipping {name} because requested sequence count is 0")
+            continue
         ds = DatasetClass(
             common_conf=common, split=args.split,
             len_train=10**9, len_test=10**9,
@@ -396,6 +421,7 @@ def main():
             num_seqs=n_seqs, num_frames=n_frames,
             depth_align=args.depth_align,
             json_root=args.json_root,
+            skip_pointcloud=args.no_pointcloud,
         )
 
     # ── global summary ───────────────────────────────────────────────

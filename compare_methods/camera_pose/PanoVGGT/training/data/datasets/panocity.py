@@ -35,7 +35,9 @@ class PanoCityDataset(BaseDataset):
             expand_ratio: int = 3,
             augmentation: dict = None,
             get_nearby: bool = None,  # If None, use common_conf.get_nearby
-            split_seed: int = 42      
+            split_seed: int = 42,
+            use_official_splits: bool = True,
+            official_split_dir: str = None,
     ):
         super().__init__(common_conf=common_conf)
 
@@ -56,6 +58,8 @@ class PanoCityDataset(BaseDataset):
         self.min_num_images = min_num_images
         self.split = split
         self.split_seed = int(split_seed)
+        self.use_official_splits = bool(use_official_splits)
+        self.official_split_dir = official_split_dir
 
         # Split semantics:
         # - split="train"      -> mode="train" (90%)
@@ -104,6 +108,14 @@ class PanoCityDataset(BaseDataset):
     # ------------------------- cache / indexing -------------------------
     def _load_splits_cache(self):
         """Load split index from cache, or build once and cache it."""
+        official = self._load_official_split_index()
+        if official is not None:
+            self.trajectories = official
+            self.sequence_list_len = len(self.trajectories)
+            if self.trajectories:
+                self.base_resolution = tuple(self.trajectories[0]['resolution'])
+            return
+
         cache_dir = osp.join(self.PanoCity_DIR, "cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_path = osp.join(cache_dir, f"PanoCity_{self.mode}_index.json")
@@ -115,6 +127,93 @@ class PanoCityDataset(BaseDataset):
         self.sequence_list_len = len(self.trajectories)
         if self.trajectories:
             self.base_resolution = tuple(self.trajectories[0]['resolution'])
+
+    def _official_split_path(self):
+        """Return the released PanoCity split file path for the current mode."""
+        if self.official_split_dir:
+            split_dir = self.official_split_dir
+        else:
+            data_dir = osp.dirname(osp.dirname(osp.abspath(__file__)))
+            split_dir = osp.join(data_dir, "splits", "panocity")
+        return osp.join(split_dir, f"panocity_{self.mode}_index.json")
+
+    def _load_official_split_index(self):
+        """
+        Load the official released PanoCity split when available.
+
+        The upstream repository now ships train/val/test JSON indices under
+        training/data/splits/panocity. Prefer those over regenerating a local
+        random 90/5/5 split, but fall back cleanly for custom datasets.
+        """
+        if not self.use_official_splits:
+            return None
+
+        split_path = self._official_split_path()
+        if not osp.exists(split_path):
+            return None
+
+        try:
+            with open(split_path, "r") as f:
+                records = json.load(f)
+        except Exception as e:
+            logging.warning(f"[OfficialSplit] Failed to read {split_path}: {e}")
+            return None
+
+        if not isinstance(records, list):
+            logging.warning(f"[OfficialSplit] Expected list in {split_path}, got {type(records).__name__}")
+            return None
+
+        valid_records = []
+        missing_first_rgb = 0
+        missing_first_depth = 0
+        missing_pose = 0
+        for record in records:
+            pano_images = record.get("pano_images", [])
+            panodepth_images = record.get("panodepth_images", [])
+            if len(pano_images) < self.min_num_images:
+                continue
+            first_rgb = osp.join(self.PanoCity_DIR, pano_images[0])
+            if not osp.exists(first_rgb):
+                missing_first_rgb += 1
+                continue
+            if len(panodepth_images) < self.min_num_images:
+                missing_first_depth += 1
+                continue
+            first_depth = osp.join(self.PanoCity_DIR, panodepth_images[0])
+            if not osp.exists(first_depth):
+                missing_first_depth += 1
+                continue
+            pose_file = record.get("poses_file")
+            if pose_file and not osp.exists(osp.join(self.PanoCity_DIR, pose_file)):
+                missing_pose += 1
+                continue
+            valid_records.append(record)
+
+        if not valid_records:
+            logging.warning(
+                f"[OfficialSplit] {split_path} exists but no records matched "
+                f"PanoCity_DIR={self.PanoCity_DIR}; falling back to {self.splits_config_file}"
+            )
+            return None
+
+        if missing_first_rgb:
+            logging.warning(
+                f"[OfficialSplit] Skipped {missing_first_rgb}/{len(records)} records with missing first RGB"
+            )
+        if missing_first_depth:
+            logging.warning(
+                f"[OfficialSplit] Skipped {missing_first_depth}/{len(records)} records with missing first depth"
+            )
+        if missing_pose:
+            logging.warning(
+                f"[OfficialSplit] Skipped {missing_pose}/{len(records)} records with missing pose file"
+            )
+
+        logging.info(
+            f"[OfficialSplit] Loaded {len(valid_records)} official PanoCity {self.mode} "
+            f"trajectories from {split_path}"
+        )
+        return valid_records
 
     
     def _split_indices_path(self):

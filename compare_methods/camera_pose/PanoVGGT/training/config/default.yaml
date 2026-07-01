@@ -47,7 +47,7 @@ data:
           get_nearby: False
         - _target_: data.datasets.panocity.PanoCityDataset
           split: train
-          PanoCity_DIR: ${oc.env:PANOCITY_ROOT,../PanoCity_paired}
+          PanoCity_DIR: ${oc.env:PANOCITY_ROOT,/mnt/e/PanoVGGT_minimal_datasets/datasets/Panocity}
           len_train: 16800
           get_nearby: True
           
@@ -75,7 +75,7 @@ data:
           len_test: 1400
         - _target_: data.datasets.panocity.PanoCityDataset
           split: test
-          PanoCity_DIR: ${oc.env:PANOCITY_ROOT,../PanoCity_paired}
+          PanoCity_DIR: ${oc.env:PANOCITY_ROOT,/mnt/e/PanoVGGT_minimal_datasets/datasets/Panocity}
           len_test: 2400
 
 
