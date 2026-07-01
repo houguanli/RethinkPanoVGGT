@@ -1,24 +1,29 @@
-# RTX 4090 profile for variable-length multi-pano training.
-# The model sees 2..X neighboring panos. Per-window geometry is fixed by the
-# pano sampler; camera supervision is applied to pano centers relative to pano0.
+# Multi-pano PanoCity paired profile for a 4x RTX 5000 machine.
+# Launch with torchrun --nproc_per_node=4 for synchronized DDP training.
 data:
-  dataset_root: /home/aoki/RethinkPanoVGGT_omega/dataset/converted_pano4vggt_omega_range_v2
-  dataset_format: vkitti
-  checkpoint: /home/aoki/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt
+  dataset_root: ../../panovggt/PanoCity_paired
+  dataset_format: panocity_paired
+  dataset_split: train
+  train_split_fraction: 0.95
+  split_seed: 42
+  metadata_path: metadata/panocity_manifest.jsonl
+  curriculum_bins: clean,normal
+  use_metadata_weights: true
+  checkpoint: ../ckpt/vggt_omega_1b_512.pt
   pano_sample_mode: variable_neighborhood
   pano_min_count: 2
-  # Verified on the local RTX 4090 with num_yaw=2: pano_max_count=8
-  # completes one full train step, but high counts are slow.
-  pano_max_count: 8
+  pano_max_count: 4
   pano_grouping: nearest
+  output_depth_scale: 1000.0
+  invalid_depth_value: 65535.0
+  pano_position_step_m: 1.0
 
 sampler:
   patch_size: 16
   window_size: 512
-  # Keep this at 2 on a 24GB 4090 when pano_max_count can reach 8.
-  # Raise on larger GPUs if denser per-pano coverage is needed.
-  num_yaw: 2
-  pitch_degrees: "0"
+  # 2..4 panos x 4 yaw windows keeps the max at 16 VGGT views.
+  num_yaw: 4
+  pitch_degrees: "-15"
   fov_degrees: 75.0
   pano_height: 0
   pano_width: 0
@@ -41,7 +46,7 @@ supervision:
   sample_weight_max: 1.25
   overlap_consistency_weight: 0.02
   overlap_band_fraction: 0.20
-  pred_depth_scale: 21.137727657535685
+  pred_depth_scale: 5.491308212280273
   learn_pred_depth_scale: true
   pred_depth_scale_lr: 5.0e-5
   depth_residual_mode: log_conv
@@ -83,20 +88,20 @@ runtime:
   amp_dtype: bfloat16
   epochs: 100000
   max_steps: 1000000
-  num_workers: 2
-  seed: 42
-  max_duration_minutes: 180.0
-  save_every_steps: 0
+  num_workers: 4
+  seed: 43
+  max_duration_minutes: 270.0
+  save_every_steps: 5000
   save_last: true
   checkpoint_format: trainable_delta
   debug_depth_dump: true
   debug_depth_threshold: 0.3
   debug_depth_max_dumps_per_step: 2
-  debug_dir: logs/debug_multipano_pano_relative_4090
+  debug_dir: logs/debug_panocity_paired_multipano_4xrtx5000
   progress_bar: true
   progress_log_every: 50
   tensorboard: true
-  tensorboard_dir: logs/multipano_pano_relative_4090/tensorboard
+  tensorboard_dir: logs/panocity_paired_multipano_4xrtx5000/tensorboard
 
 output:
-  output_dir: logs/multipano_pano_relative_4090
+  output_dir: logs/panocity_paired_multipano_4xrtx5000

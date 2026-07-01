@@ -1,100 +1,422 @@
 #!/usr/bin/env python3
-"""Evaluate corrected metric Z-depth loss for a pano checkpoint."""
+"""Validate a VGGT-Omega/LUNA depth checkpoint on held-out pano samples."""
 
 from __future__ import annotations
 
 import argparse
+import copy
+import csv
 import json
+import math
+import random
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from training.data import PanoVKittiOmegaDataset  # noqa: E402
-from training.train_pano_omega import build_model, load_checkpoint, move_batch_to_device, sample_depth_targets, set_seed  # noqa: E402
+from training.train_pano_omega import (  # noqa: E402
+    DepthPredictionAdapter,
+    adjacent_edge_overlap_loss,
+    build_dataset,
+    build_model,
+    load_checkpoint,
+    masked_depth_loss,
+    move_batch_to_device,
+    normalize_camera_supervision_args,
+    normalize_pano_sampling_args,
+    normalize_pred_depth_scale_args,
+    normalize_training_stages,
+    parse_args as parse_training_args,
+    resolve_device,
+    sample_depth_targets,
+    set_seed,
+    unwrap_model,
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True, help="Training config used to build model/dataset.")
+    parser.add_argument("--checkpoint", type=Path, required=True, help="Checkpoint to validate.")
+    parser.add_argument("--output", type=Path, required=True, help="Summary JSON path.")
+    parser.add_argument("--per-sample-csv", type=Path, default=None, help="Optional per-sample CSV path.")
+    parser.add_argument("--train-loss-csv", type=Path, default=None, help="Optional training loss.csv for comparison.")
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument("--split", choices=["train", "val", "test"], default="val")
+    parser.add_argument("--curriculum-bins", default="all", help="Bins for the main validation run. Use all/clean,normal/hard.")
+    parser.add_argument("--limit", type=int, default=100, help="Number of samples for the main validation run.")
+    parser.add_argument("--hard-limit", type=int, default=100, help="Extra hard-bin val samples. Use 0 to disable.")
+    parser.add_argument("--seed", type=int, default=123, help="Deterministic sample seed.")
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default=None)
+    parser.add_argument("--progress", action="store_true", default=True)
+    parser.add_argument("--no-progress", dest="progress", action="store_false")
+    return parser
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset-root", type=Path, default=PROJECT_ROOT.parent / "dataset")
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--pred-depth-scale", type=float, default=None)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--gt-depth-semantics", choices=["range", "cubemap_z", "double_cubemap_z"], default="range")
-    parser.add_argument("--depth-max-m", type=float, default=80.0)
-    args = parser.parse_args()
+    args = build_parser().parse_args()
     set_seed(args.seed)
-    device = resolve_device(args.device)
+    device = resolve_device(args.device, {"distributed": False, "local_rank": 0})
 
-    payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    ckpt_args = payload.get("args", {}) if isinstance(payload, dict) else {}
-    scale = args.pred_depth_scale if args.pred_depth_scale is not None else float(ckpt_args.get("pred_depth_scale", 1.0))
-    model = build_model(
-        SimpleNamespace(
-            patch_size=int(ckpt_args.get("patch_size", 16)),
-            window_size=int(ckpt_args.get("window_size", 512)),
-            num_yaw=int(ckpt_args.get("num_yaw", 8)),
-            pitch_degrees=ckpt_args.get("pitch_degrees", "0"),
-            fov_degrees=float(ckpt_args.get("fov_degrees", 75.0)),
-            enable_camera_head=True,
-            smoke=False,
+    train_args = parse_training_args(["--config", str(args.config)])
+    train_args.device = args.device
+    train_args.distributed = "none"
+    train_args.batch_size = args.batch_size
+    train_args.num_workers = args.num_workers
+    if args.amp_dtype is not None:
+        train_args.amp_dtype = args.amp_dtype
+    train_args.checkpoint = args.checkpoint
+    normalize_args_for_eval(train_args)
+
+    checkpoint_payload = load_checkpoint_payload(args.checkpoint)
+    apply_checkpoint_eval_defaults(train_args, checkpoint_payload)
+    model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
+    model.eval()
+
+    runs: list[dict[str, Any]] = []
+    per_sample_rows: list[dict[str, Any]] = []
+    runs.append(
+        evaluate_run(
+            name=f"{args.split}_{normalize_bins_label(args.curriculum_bins)}_{args.limit}",
+            base_args=train_args,
+            model=model,
+            device=device,
+            split=args.split,
+            curriculum_bins=args.curriculum_bins,
+            limit=args.limit,
+            seed=args.seed,
+            num_workers=args.num_workers,
+            progress=args.progress,
+            per_sample_rows=per_sample_rows,
         )
-    ).to(device).eval()
-    load_checkpoint(model, args.checkpoint, strict=False)
-    dataset = PanoVKittiOmegaDataset(root=args.dataset_root)
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
-
-    losses = []
-    sample_rows = []
-    with torch.no_grad():
-        for batch in loader:
-            moved = move_batch_to_device(batch, device)
-            pred = model(pano_images=moved["pano_image"])["depth"].float() * scale
-            target, valid = sample_depth_targets(
-                model,
-                moved["pano_depth"],
-                source_depth_semantics=args.gt_depth_semantics,
-                max_range_depth=args.depth_max_m,
+    )
+    if args.hard_limit > 0:
+        runs.append(
+            evaluate_run(
+                name=f"{args.split}_hard_{args.hard_limit}",
+                base_args=train_args,
+                model=model,
+                device=device,
+                split=args.split,
+                curriculum_bins="hard",
+                limit=args.hard_limit,
+                seed=args.seed + 17,
+                num_workers=args.num_workers,
+                progress=args.progress,
+                per_sample_rows=per_sample_rows,
             )
-            valid = valid & torch.isfinite(pred) & torch.isfinite(target)
-            values = (torch.log(pred.clamp_min(1e-6)) - torch.log(target.clamp_min(1e-6))).abs()[valid]
-            if values.numel() == 0:
-                continue
-            loss = float(values.mean().cpu())
-            losses.append(loss)
-            sample_rows.append({"scene_name": batch["scene_name"][0], "log_l1_z_depth": loss})
+        )
 
     result = {
+        "config": str(args.config),
         "checkpoint": str(args.checkpoint),
-        "pred_depth_scale": scale,
-        "gt_source_depth_semantics": args.gt_depth_semantics,
-        "depth_max_m": args.depth_max_m,
-        "samples": len(losses),
-        "mean_log_l1_z_depth": float(np.mean(losses)),
-        "median_log_l1_z_depth": float(np.median(losses)),
-        "p90_log_l1_z_depth": float(np.percentile(losses, 90)),
-        "per_sample": sample_rows,
+        "split": args.split,
+        "seed": args.seed,
+        "device": str(device),
+        "dataset_root": str(train_args.dataset_root),
+        "sampler": {
+            "window_size": int(train_args.window_size),
+            "patch_size": int(train_args.patch_size),
+            "num_yaw": int(train_args.num_yaw),
+            "pitch_degrees": str(train_args.pitch_degrees),
+            "fov_degrees": float(train_args.fov_degrees),
+        },
+        "train_loss_reference": read_train_loss_reference(args.train_loss_csv),
+        "runs": runs,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    print(json.dumps({key: value for key, value in result.items() if key != "per_sample"}, indent=2))
+    args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    if args.per_sample_csv is not None:
+        write_per_sample_csv(args.per_sample_csv, per_sample_rows)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
-def resolve_device(requested: str) -> torch.device:
-    if requested == "auto":
-        requested = "cuda" if torch.cuda.is_available() else "cpu"
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is False.")
-    return torch.device(requested)
+def normalize_args_for_eval(args: argparse.Namespace) -> None:
+    normalize_pano_sampling_args(args)
+    normalize_camera_supervision_args(args)
+    normalize_pred_depth_scale_args(args)
+    args.training_stages = normalize_training_stages(args.training_stages)
+
+
+def load_checkpoint_payload(path: Path) -> dict[str, Any]:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    return payload if isinstance(payload, dict) else {}
+
+
+def apply_checkpoint_eval_defaults(args: argparse.Namespace, payload: dict[str, Any]) -> None:
+    ckpt_args = payload.get("args", {}) if isinstance(payload.get("args", {}), dict) else {}
+    if payload.get("pred_depth_scale") is not None:
+        args.pred_depth_scale = float(payload["pred_depth_scale"])
+    elif ckpt_args.get("pred_depth_scale") is not None:
+        args.pred_depth_scale = float(ckpt_args["pred_depth_scale"])
+    for key in ("learn_pred_depth_scale", "depth_residual_mode", "depth_residual_hidden", "depth_residual_max_log"):
+        if key in ckpt_args and ckpt_args[key] is not None:
+            setattr(args, key, ckpt_args[key])
+    for key in ("window_size", "patch_size", "num_yaw", "pitch_degrees", "fov_degrees"):
+        if key in ckpt_args and ckpt_args[key] is not None:
+            setattr(args, key, ckpt_args[key])
+
+
+def build_eval_model(
+    args: argparse.Namespace,
+    checkpoint: Path,
+    payload: dict[str, Any],
+    device: torch.device,
+) -> torch.nn.Module:
+    base_model = build_model(args).to(device)
+    load_checkpoint(base_model, checkpoint, strict=False)
+
+    adapter_state = payload.get("adapter_state")
+    needs_adapter = bool(args.learn_pred_depth_scale) or args.depth_residual_mode != "none" or adapter_state is not None
+    if not needs_adapter:
+        return base_model
+
+    model = DepthPredictionAdapter(
+        base_model,
+        initial_scale=float(args.pred_depth_scale),
+        learn_scale=bool(args.learn_pred_depth_scale),
+        residual_mode=str(args.depth_residual_mode),
+        residual_hidden=int(args.depth_residual_hidden),
+        residual_max_log=float(args.depth_residual_max_log),
+    ).to(device)
+    if adapter_state is not None:
+        adapter_state = {key: value.to(device) if torch.is_tensor(value) else value for key, value in adapter_state.items()}
+        missing, unexpected = model.load_state_dict(adapter_state, strict=False)
+        print(f"[INFO] loaded adapter_state from {checkpoint}")
+        print(f"[INFO] adapter_state missing_keys={len(missing)} unexpected_keys={len(unexpected)}")
+    return model
+
+
+def evaluate_run(
+    name: str,
+    base_args: argparse.Namespace,
+    model: torch.nn.Module,
+    device: torch.device,
+    split: str,
+    curriculum_bins: str | None,
+    limit: int,
+    seed: int,
+    num_workers: int,
+    progress: bool,
+    per_sample_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    eval_args = copy.copy(base_args)
+    eval_args.dataset_split = split
+    eval_args.curriculum_bins = None if curriculum_bins in (None, "", "all") else str(curriculum_bins)
+    eval_args.dataset_max_samples = None
+    pano_size = (eval_args.pano_height, eval_args.pano_width) if eval_args.pano_height > 0 and eval_args.pano_width > 0 else None
+    dataset = build_dataset(eval_args, pano_size)
+    indices = sample_indices(len(dataset), limit, seed)
+    subset = Subset(dataset, indices)
+    loader = DataLoader(
+        subset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+
+    rows: list[dict[str, Any]] = []
+    amp_enabled = device.type == "cuda" and eval_args.amp_dtype != "none"
+    amp_dtype = torch.bfloat16 if eval_args.amp_dtype == "bfloat16" else torch.float32
+    iterator = tqdm(loader, desc=f"validate {name}", dynamic_ncols=True) if progress else loader
+    with torch.no_grad():
+        for local_index, batch in enumerate(iterator):
+            moved = move_batch_to_device(batch, device)
+            sampler_model = unwrap_model(model)
+            target_depth, target_valid = sample_depth_targets(
+                sampler_model,
+                moved["pano_depth"],
+                source_depth_semantics=eval_args.gt_depth_semantics,
+                max_range_depth=eval_args.depth_max_m,
+            )
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                predictions = model(pano_images=moved["pano_image"], return_sampler_output=True)
+                pred_depth_scale = predictions.get(
+                    "_pred_depth_scale",
+                    predictions["depth"].new_tensor(float(eval_args.pred_depth_scale)),
+                )
+                pred_depth = predictions["depth"] * pred_depth_scale
+                loss_depth = masked_depth_loss(
+                    pred_depth,
+                    target_depth,
+                    target_valid,
+                    mode=eval_args.depth_loss_mode,
+                    huber_delta=eval_args.depth_log_huber_delta,
+                    error_clip=eval_args.depth_log_error_clip,
+                    sample_weight=moved.get("sample_weight") if eval_args.loss_sample_weighting else None,
+                    min_window_valid_ratio=eval_args.min_window_valid_ratio,
+                    valid_ratio_power=eval_args.valid_ratio_loss_power,
+                    sample_weight_min=eval_args.sample_weight_min,
+                    sample_weight_max=eval_args.sample_weight_max,
+                )
+                loss_overlap = adjacent_edge_overlap_loss(
+                    pred_depth,
+                    target_valid,
+                    sample_weight=moved.get("sample_weight") if eval_args.loss_sample_weighting else None,
+                    band_fraction=eval_args.overlap_band_fraction,
+                )
+                loss = loss_depth + float(eval_args.overlap_consistency_weight) * loss_overlap
+
+            row = {
+                "run": name,
+                "dataset_index": int(indices[local_index]),
+                "seq_name": scalar_string(batch.get("scene_name") or batch.get("sequence_name")),
+                "quality_bin": scalar_string(batch.get("metadata_quality_bin"), default="unknown"),
+                "loss": float(loss.detach().cpu()),
+                "loss_depth": float(loss_depth.detach().cpu()),
+                "loss_overlap": float(loss_overlap.detach().cpu()),
+                "valid_fraction": float(target_valid.float().mean().detach().cpu()),
+                "pred_depth_scale": float(pred_depth_scale.detach().float().cpu()),
+                "metadata_valid_ratio": scalar_float(batch.get("metadata_valid_ratio")),
+                "metadata_structure_score": scalar_float(batch.get("metadata_structure_score")),
+                "sample_weight": scalar_float(batch.get("sample_weight"), default=1.0),
+            }
+            rows.append(row)
+            per_sample_rows.append(row)
+
+    return {
+        "name": name,
+        "split": split,
+        "curriculum_bins": curriculum_bins or "all",
+        "dataset_size": len(dataset),
+        "requested_samples": int(limit),
+        "evaluated_samples": len(rows),
+        "summary": summarize_values([row["loss"] for row in rows]),
+        "depth_summary": summarize_values([row["loss_depth"] for row in rows]),
+        "overlap_summary": summarize_values([row["loss_overlap"] for row in rows]),
+        "valid_fraction_summary": summarize_values([row["valid_fraction"] for row in rows]),
+        "by_quality_bin": summarize_by_key(rows, "quality_bin", "loss"),
+        "worst_samples": sorted(rows, key=lambda row: row["loss"], reverse=True)[:10],
+    }
+
+
+def sample_indices(length: int, limit: int, seed: int) -> list[int]:
+    if length <= 0:
+        return []
+    limit = min(max(int(limit), 0), length)
+    indices = list(range(length))
+    random.Random(int(seed)).shuffle(indices)
+    return indices[:limit]
+
+
+def summarize_values(values: list[float]) -> dict[str, Any]:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite:
+        return {"n": 0}
+    arr = np.asarray(finite, dtype=np.float64)
+    return {
+        "n": int(arr.size),
+        "mean": float(arr.mean()),
+        "median": float(np.median(arr)),
+        "std": float(arr.std()),
+        "min": float(arr.min()),
+        "p90": float(np.percentile(arr, 90)),
+        "p95": float(np.percentile(arr, 95)),
+        "max": float(arr.max()),
+        "gt_0p1": int((arr > 0.1).sum()),
+        "gt_0p2": int((arr > 0.2).sum()),
+        "gt_0p3": int((arr > 0.3).sum()),
+    }
+
+
+def summarize_by_key(rows: list[dict[str, Any]], key: str, value_key: str) -> dict[str, Any]:
+    grouped: dict[str, list[float]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get(key, "unknown")), []).append(float(row[value_key]))
+    return {group: summarize_values(values) for group, values in sorted(grouped.items())}
+
+
+def read_train_loss_reference(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.exists():
+        return None
+    rows: list[float] = []
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            raw = row.get("loss") or row.get("loss_objective") or row.get("total_loss")
+            if raw in (None, ""):
+                continue
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if math.isfinite(value):
+                rows.append(value)
+    if not rows:
+        return None
+    return {
+        "path": str(path),
+        "all": summarize_values(rows),
+        "last_1000": summarize_values(rows[-1000:]),
+        "last_5000": summarize_values(rows[-5000:]),
+    }
+
+
+def write_per_sample_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "run",
+        "dataset_index",
+        "seq_name",
+        "quality_bin",
+        "loss",
+        "loss_depth",
+        "loss_overlap",
+        "valid_fraction",
+        "pred_depth_scale",
+        "metadata_valid_ratio",
+        "metadata_structure_score",
+        "sample_weight",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def scalar_string(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return str(value.detach().cpu().item())
+        return str(value.detach().cpu().reshape(-1)[0].item())
+    if isinstance(value, (list, tuple)):
+        return scalar_string(value[0], default=default) if value else default
+    return str(value)
+
+
+def scalar_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return float(default)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return float(default)
+        return float(value.detach().float().cpu().reshape(-1)[0])
+    if isinstance(value, (list, tuple)):
+        return scalar_float(value[0], default=default) if value else float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def normalize_bins_label(value: str | None) -> str:
+    if value in (None, "", "all"):
+        return "all"
+    return str(value).replace(",", "_").replace(" ", "")
 
 
 if __name__ == "__main__":

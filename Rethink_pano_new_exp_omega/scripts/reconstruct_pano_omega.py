@@ -20,15 +20,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from training.data import PanoVKittiOmegaDataset  # noqa: E402
+from training.data import PanoCityPairedOmegaDataset, PanoVKittiOmegaDataset  # noqa: E402
 from training.train_pano_omega import build_model, load_checkpoint, sample_depth_targets, set_seed  # noqa: E402
 from vggt_omega.models.layers.pano_position import pinhole_rays, rays_to_equirectangular  # noqa: E402
 from vggt_omega.utils.pose_enc import encoding_to_camera  # noqa: E402
 
 
+DEFAULT_PANOCITY_PRED_DEPTH_SCALE = 5.491308212280273
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Export pano reconstruction previews from a trained LUNA checkpoint.")
     parser.add_argument("--dataset-root", type=Path, default=PROJECT_ROOT.parent / "dataset")
+    parser.add_argument("--dataset-format", choices=["vkitti", "panocity_paired"], default="vkitti")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--sample-index", type=int, default=0)
@@ -36,6 +40,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-points", type=int, default=250000)
     parser.add_argument("--depth-max-m", type=float, default=80.0)
     parser.add_argument("--pred-depth-scale", type=float, default=None)
+    parser.add_argument(
+        "--fit-pred-depth-scale-from-target",
+        action="store_true",
+        help="Estimate pred depth scale from finite valid sampled GT window depth for this sample.",
+    )
+    parser.add_argument(
+        "--pred-depth-scale-stat",
+        choices=["median", "mean"],
+        default="median",
+        help="Statistic used with --fit-pred-depth-scale-from-target.",
+    )
     parser.add_argument("--gt-depth-semantics", choices=["range", "cubemap_z", "double_cubemap_z"], default="range")
     parser.add_argument(
         "--mask-pred-by-target-valid",
@@ -44,6 +59,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pano-height", type=int, default=None)
     parser.add_argument("--pano-width", type=int, default=None)
+    parser.add_argument("--output-depth-scale", type=float, default=100.0)
+    parser.add_argument("--invalid-depth-value", type=float, default=None)
+    parser.add_argument(
+        "--pred-camera-center-z",
+        type=float,
+        default=None,
+        help=(
+            "Override the exported official prediction camera center height in z-up coordinates. "
+            "Defaults to 0.0 for panocity_paired and leaves checkpoint pose unchanged otherwise."
+        ),
+    )
     parser.add_argument("--num-yaw", type=int, default=None, help="Override checkpoint window yaw count for eval/export.")
     parser.add_argument("--pitch-degrees", type=str, default=None, help="Override checkpoint pitch list for eval/export.")
     parser.add_argument("--fov-degrees", type=float, default=None, help="Override checkpoint window FOV for eval/export.")
@@ -59,9 +85,8 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     ckpt_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
     model_args = model_args_from_checkpoint(ckpt_args)
-    pred_depth_scale = args.pred_depth_scale
-    if pred_depth_scale is None:
-        pred_depth_scale = float(ckpt_args.get("pred_depth_scale", 1.0))
+    pred_depth_scale = resolve_pred_depth_scale(args, ckpt_args)
+    pred_camera_center_z = resolve_pred_camera_center_z(args)
     if args.pano_height is not None and args.pano_width is not None:
         model_args.pano_height = args.pano_height
         model_args.pano_width = args.pano_width
@@ -74,10 +99,7 @@ def main() -> None:
     if args.window_size is not None:
         model_args.window_size = args.window_size
 
-    dataset = PanoVKittiOmegaDataset(
-        root=args.dataset_root,
-        pano_size=pano_size_from_args(model_args),
-    )
+    dataset = build_dataset(args, pano_size_from_args(model_args))
     sample = dataset[args.sample_index]
     model = build_model(model_args).to(device)
     load_checkpoint(model, args.checkpoint, strict=False)
@@ -97,10 +119,21 @@ def main() -> None:
             max_range_depth=args.depth_max_m,
         )
 
-    raw_pred_depth = (predictions["depth"] * pred_depth_scale)[0, ..., 0].detach().float().cpu().numpy()
+    model_pred_depth = predictions["depth"][0, ..., 0].detach().float().cpu().numpy()
     pred_conf = predictions["depth_conf"][0].detach().float().cpu().numpy()
     target_depth_np = target_depth[0, ..., 0].detach().float().cpu().numpy()
     target_valid_np = target_valid[0, ..., 0].detach().cpu().numpy()
+    fitted_pred_depth_scale = None
+    fitted_pred_depth_scale_valid_count = 0
+    if args.fit_pred_depth_scale_from_target:
+        pred_depth_scale, fitted_pred_depth_scale_valid_count = fit_pred_depth_scale_from_target(
+            model_pred_depth,
+            target_depth_np,
+            target_valid_np,
+            stat=args.pred_depth_scale_stat,
+        )
+        fitted_pred_depth_scale = pred_depth_scale
+    raw_pred_depth = model_pred_depth * pred_depth_scale
     windows = predictions["pano_windows"][0].detach().float().cpu().numpy()
     camera_meta = {key: value[0].detach().float().cpu() for key, value in predictions["pano_camera_meta"].items()}
     pano_np = tensor_image_to_uint8(sample["pano_image"])
@@ -136,6 +169,7 @@ def main() -> None:
         max_points=args.max_points,
         display_y_up=True,
         rotate_y_180=True,
+        camera_center_z=pred_camera_center_z,
     )
     write_official_point_cloud(
         output_dir / "pred_official_camera_points_native.ply",
@@ -147,6 +181,7 @@ def main() -> None:
         display_y_up=False,
         rotate_y_180=False,
         output_z_up=False,
+        camera_center_z=pred_camera_center_z,
     )
     write_known_window_point_cloud(
         output_dir / "pred_known_window_camera_points.ply",
@@ -205,6 +240,9 @@ def main() -> None:
         target_valid_np,
         pred_valid_after_range,
         pred_depth_scale,
+        pred_camera_center_z,
+        fitted_pred_depth_scale,
+        fitted_pred_depth_scale_valid_count,
     )
     print(f"[INFO] exported reconstruction = {output_dir}")
 
@@ -230,6 +268,65 @@ def pano_size_from_args(args: SimpleNamespace) -> Tuple[int, int] | None:
     if args.pano_height and args.pano_width:
         return int(args.pano_height), int(args.pano_width)
     return None
+
+
+def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
+    if args.dataset_format == "vkitti":
+        return PanoVKittiOmegaDataset(
+            root=args.dataset_root,
+            pano_size=pano_size,
+        )
+    if args.dataset_format == "panocity_paired":
+        return PanoCityPairedOmegaDataset(
+            root=args.dataset_root,
+            pano_size=pano_size,
+            output_depth_scale=args.output_depth_scale,
+            invalid_depth_value=args.invalid_depth_value,
+        )
+    raise ValueError(f"Unknown dataset format: {args.dataset_format}")
+
+
+def resolve_pred_camera_center_z(args: argparse.Namespace) -> float | None:
+    if args.pred_camera_center_z is not None:
+        return float(args.pred_camera_center_z)
+    if args.dataset_format == "panocity_paired":
+        return 0.0
+    return None
+
+
+def resolve_pred_depth_scale(args: argparse.Namespace, ckpt_args: Dict) -> float:
+    if args.pred_depth_scale is not None:
+        return float(args.pred_depth_scale)
+    checkpoint_scale = ckpt_args.get("pred_depth_scale", None)
+    if checkpoint_scale is not None and float(checkpoint_scale) != 1.0:
+        return float(checkpoint_scale)
+    if args.dataset_format == "panocity_paired":
+        return DEFAULT_PANOCITY_PRED_DEPTH_SCALE
+    return float(checkpoint_scale if checkpoint_scale is not None else 1.0)
+
+
+def fit_pred_depth_scale_from_target(
+    pred_depth: np.ndarray,
+    target_depth: np.ndarray,
+    target_valid: np.ndarray,
+    stat: str,
+) -> Tuple[float, int]:
+    valid = (
+        target_valid.astype(bool)
+        & np.isfinite(target_depth)
+        & np.isfinite(pred_depth)
+        & (target_depth > 0)
+        & (pred_depth > 0)
+    )
+    ratios = target_depth[valid].astype(np.float64) / pred_depth[valid].astype(np.float64)
+    ratios = ratios[np.isfinite(ratios) & (ratios > 0)]
+    if ratios.size == 0:
+        raise ValueError("Cannot fit pred depth scale: no finite positive pred/target depth pairs.")
+    if stat == "median":
+        return float(np.median(ratios)), int(ratios.size)
+    if stat == "mean":
+        return float(np.mean(ratios)), int(ratios.size)
+    raise ValueError(f"Unknown pred-depth-scale-stat: {stat}")
 
 
 def tensor_image_to_uint8(image: torch.Tensor) -> np.ndarray:
@@ -379,6 +476,7 @@ def write_official_point_cloud(
     rotate_y_180: bool = False,
     output_z_up: bool = True,
     extra_valid: np.ndarray | None = None,
+    camera_center_z: float | None = None,
 ) -> None:
     extrinsics, intrinsics = encoding_to_camera(pose_enc[None], pred_depth_z.shape[-2:])
     extrinsics = extrinsics[0].numpy()
@@ -398,6 +496,8 @@ def write_official_point_cloud(
     )
     rotation = extrinsics[:, :3, :3]
     translation = extrinsics[:, :3, 3]
+    if camera_center_z is not None:
+        translation = translation_for_camera_center_z(rotation, translation, camera_center_z)
     points = np.einsum(
         "sij,shwj->shwi",
         np.transpose(rotation, (0, 2, 1)),
@@ -416,6 +516,21 @@ def write_official_point_cloud(
         points = omega_y_up_to_z_up(points)
     colors = np.clip(windows.transpose(0, 2, 3, 1)[valid] * 255.0, 0, 255).astype(np.uint8)
     write_ply(path, points[valid], colors, max_points)
+
+
+def translation_for_camera_center_z(
+    rotation: np.ndarray,
+    translation: np.ndarray,
+    camera_center_z: float,
+) -> np.ndarray:
+    """Keep predicted orientation, but set camera center up-height in z-up exports.
+
+    Omega native coordinates are [right, up, forward], and z-up exports map native
+    up to output z. For a world-to-camera transform, camera center C = -R^T t.
+    """
+    centers = -np.einsum("sji,sj->si", rotation, translation)
+    centers[:, 1] = float(camera_center_z)
+    return -np.einsum("sij,sj->si", rotation, centers)
 
 
 def write_ply(path: Path, points: np.ndarray, colors: np.ndarray, max_points: int) -> None:
@@ -544,6 +659,9 @@ def write_summary(
     target_valid: np.ndarray,
     pred_valid_after_range: np.ndarray,
     pred_depth_scale: float,
+    pred_camera_center_z: float | None,
+    fitted_pred_depth_scale: float | None,
+    fitted_pred_depth_scale_valid_count: int,
 ) -> None:
     valid_pred_raw = np.isfinite(raw_pred_depth) & (raw_pred_depth > 0)
     valid_pred = np.isfinite(pred_depth) & (pred_depth > 0) & pred_valid
@@ -551,15 +669,20 @@ def write_summary(
     summary = {
         "checkpoint": str(args.checkpoint),
         "dataset_root": str(args.dataset_root),
+        "dataset_format": args.dataset_format,
         "sample_index": args.sample_index,
         "scene_name": sample["scene_name"],
         "rgb_path": sample["rgb_path"],
+        "depth_path": sample.get("depth_path"),
         "depth_definition": "window Z-depth meters; target_range_depth_erp.png is decoded ERP radial range in meters",
         "gt_source_depth_semantics": args.gt_depth_semantics,
         "prediction_modifier": f"predictions with reconstructed radial range > {args.depth_max_m:g}m are marked non-output (inf)",
         "mask_pred_by_target_valid": bool(args.mask_pred_by_target_valid),
         "official_point_cloud_coordinates": "pred_official_camera_points_native.ply is Omega native Y-up; comparison PLYs are exported as ERP/GT Z-up [forward, right, up]",
         "pred_depth_scale": pred_depth_scale,
+        "fitted_pred_depth_scale": fitted_pred_depth_scale,
+        "fitted_pred_depth_scale_valid_count": fitted_pred_depth_scale_valid_count,
+        "pred_camera_center_z": pred_camera_center_z,
         "pred_valid_ratio_before_modifier": float(valid_pred_raw.mean()),
         "pred_valid_ratio_after_range_modifier": float(pred_valid_after_range.mean()),
         "pred_valid_ratio": float(valid_pred.mean()),
