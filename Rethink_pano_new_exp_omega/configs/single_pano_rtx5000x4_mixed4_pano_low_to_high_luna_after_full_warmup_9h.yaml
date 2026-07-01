@@ -1,19 +1,16 @@
 # 4x RTX 5000: joint PanoCity + Matterport3D + Stanford2D3DS + Structured3D.
 data:
-  dataset_root: ../../panovggt/PanoCity_paired
-  dataset_roots:
-    - ../../panovggt/PanoCity_paired
-    - ../../datasets
-  dataset_format: mixed_pano
+  dataset_root: ../../panovggt
+  dataset_format: pano_minimal
   minimal_datasets: all
   dataset_split: train
   train_split_fraction: 0.95
   split_seed: 42
   metadata_path: null
-  bad_sample_list: metadata/panocity_bad_samples.txt
+  bad_sample_list: null
   curriculum_bins: null
   use_metadata_weights: false
-  checkpoint: ../baseline01_vggt_omega/logs/panocity_paired_low_to_high_4xrtx5000_full_warmup_3h_for_luna/ckpts/checkpoint.pt
+  checkpoint: ../baseline01_vggt_omega/logs/mixed4_pano_low_to_high_4xrtx5000_full_warmup_3h_for_luna/ckpts/checkpoint.pt
   pano_sample_mode: single
   pano_min_count: 1
   pano_max_count: 1

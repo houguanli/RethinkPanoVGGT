@@ -11,13 +11,16 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 BASE_PORT="${BASE_PORT:-29681}"
 LUNA_PORT="${LUNA_PORT:-29682}"
 
-BASE_CONFIG="panocity_paired_low_to_high_4xrtx5000_full_warmup_3h_for_luna"
+PANOVGGT_ROOT="${PANOVGGT_ROOT:-$ROOT/panovggt}"
+PANOCITY_ROOT="$PANOVGGT_ROOT/Panocity"
+
+BASE_CONFIG="mixed4_pano_low_to_high_4xrtx5000_full_warmup_3h_for_luna"
 BASE_OUT="$BASELINE/logs/$BASE_CONFIG"
 BASE_CKPT="$BASE_OUT/ckpts/checkpoint.pt"
 
-LUNA_CONFIG="configs/single_pano_rtx5000x4_panocity_paired_low_to_high_luna_after_full_warmup_9h.yaml"
-LUNA_OUT="$LUNA/logs/panocity_paired_low_to_high_4xrtx5000_luna_after_full_warmup_9h"
-SEQ_LOG="$LUNA/logs/panocity_paired_low_to_high_4xrtx5000_stage_12h_sequence.log"
+LUNA_CONFIG="configs/single_pano_rtx5000x4_mixed4_pano_low_to_high_luna_after_full_warmup_9h.yaml"
+LUNA_OUT="$LUNA/logs/mixed4_pano_low_to_high_4xrtx5000_luna_after_full_warmup_9h"
+SEQ_LOG="$LUNA/logs/mixed4_pano_low_to_high_4xrtx5000_stage_12h_sequence.log"
 
 mkdir -p "$(dirname "$SEQ_LOG")" "$BASE_OUT" "$LUNA_OUT"
 
@@ -28,7 +31,20 @@ mkdir -p "$(dirname "$SEQ_LOG")" "$BASE_OUT" "$LUNA_OUT"
   echo "[sequence] luna_config=$LUNA_CONFIG"
   echo "[sequence] python=$PYTHON"
   echo "[sequence] nproc_per_node=$NPROC_PER_NODE"
+  echo "[sequence] panovggt_root=$PANOVGGT_ROOT"
 } | tee -a "$SEQ_LOG"
+
+if [[ -d "$PANOCITY_ROOT" ]]; then
+  echo "[sequence] building Panocity official index under $PANOCITY_ROOT $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
+  PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" "$LUNA/scripts/build_panocity_official_index.py" \
+    --root "$PANOCITY_ROOT" \
+    --train-fraction 0.95 \
+    --seed 42 \
+    2>&1 | tee -a "$SEQ_LOG"
+else
+  echo "[sequence] missing Panocity official root: $PANOCITY_ROOT" | tee -a "$SEQ_LOG"
+fi
 
 cd "$BASELINE"
 if [[ -s "$BASE_CKPT" && "${FORCE_WARMUP:-0}" != "1" ]]; then
@@ -77,7 +93,7 @@ if [[ -s "$BASE_OUT/loss.csv" && -s "$LUNA_OUT/loss.csv" ]]; then
     --clip-quantile 0.98 \
     --raw-alpha 0.10 \
     --out "$LUNA_OUT/loss_curve_full12h_low_to_high_smoothed_robust.png" \
-    --title "PanoCity low-to-high 3h warmup + 9h LUNA robust smoothed loss" \
+    --title "Mixed4 low-to-high 3h warmup + 9h LUNA robust smoothed loss" \
     2>&1 | tee -a "$SEQ_LOG"
 fi
 
