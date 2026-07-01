@@ -11,7 +11,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 BASE_PORT="${BASE_PORT:-29681}"
 LUNA_PORT="${LUNA_PORT:-29682}"
 
-PANOVGGT_ROOT="${PANOVGGT_ROOT:-$ROOT/panovggt}"
+PANOVGGT_ROOT="${PANOVGGT_ROOT:-$(cd "$ROOT/.." && pwd)/panovggt}"
 PANOCITY_ROOT="$PANOVGGT_ROOT/Panocity"
 
 BASE_CONFIG="mixed4_pano_low_to_high_4xrtx5000_full_warmup_3h_for_luna"
