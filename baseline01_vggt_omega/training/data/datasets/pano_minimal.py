@@ -8,9 +8,18 @@ from data.datasets.panocity_paired import (
     _is_bad_sample,
 )
 
+_PANOCITY_DEPTH_SCALE = 100.0
+_MATTERPORT3D_DEPTH_SCALE = 4000.0
+_STANFORD2D3DS_DEPTH_SCALE = 512.0
+_STRUCTURED3D_DEPTH_SCALE = 1000.0
+
 
 class PanoMinimalPinholeDataset(PanoCityPairedPinholeDataset):
-    """Pinhole-window reader for the official PanoVGGT minimal dataset bundle."""
+    """Pinhole-window reader for the official PanoVGGT minimal dataset bundle.
+
+    Depth scales follow the official PanoVGGT readers:
+    Panocity /100, Matterport3D /4000, Stanford2D3DS /512, Structured3D /1000.
+    """
 
     def __init__(
         self,
@@ -112,7 +121,15 @@ def _index_matterport3d(root: Path, split: str) -> list[dict]:
             rgb_path = root / str(scan) / "pano_skybox_color" / f"{pano_id}.jpg"
             depth_path = root / str(scan) / "pano_depth" / f"{pano_id}.png"
             if rgb_path.exists() and depth_path.exists():
-                items.append(_item("Matterport3D", f"{scan}_{room_id}_{pano_id}", rgb_path, depth_path))
+                items.append(
+                    _item(
+                        "Matterport3D",
+                        f"{scan}_{room_id}_{pano_id}",
+                        rgb_path,
+                        depth_path,
+                        _MATTERPORT3D_DEPTH_SCALE,
+                    )
+                )
     return items
 
 
@@ -125,7 +142,15 @@ def _index_stanford2d3ds(root: Path, split: str) -> list[dict]:
             rgb_path = _first_match(root / str(area) / "pano" / "rgb", f"camera_{pano_id}_*_rgb.png")
             depth_path = _first_match(root / str(area) / "pano" / "depth", f"camera_{pano_id}_*_depth.png")
             if rgb_path is not None and depth_path is not None:
-                items.append(_item("Stanford2D3DS", f"{area}_{room_name}_{pano_id}", rgb_path, depth_path))
+                items.append(
+                    _item(
+                        "Stanford2D3DS",
+                        f"{area}_{room_name}_{pano_id}",
+                        rgb_path,
+                        depth_path,
+                        _STANFORD2D3DS_DEPTH_SCALE,
+                    )
+                )
     return items
 
 
@@ -148,7 +173,7 @@ def _index_structured3d(root: Path, split: str) -> list[dict]:
             rgb_path = pano_dir / "rgb_rawlight.png"
             depth_path = pano_dir / "depth.png"
             if rgb_path.exists() and depth_path.exists():
-                items.append(_item("Structured3D", f"{scene}_{pano_id}", rgb_path, depth_path))
+                items.append(_item("Structured3D", f"{scene}_{pano_id}", rgb_path, depth_path, _STRUCTURED3D_DEPTH_SCALE))
     return items
 
 
@@ -167,7 +192,7 @@ def _index_panocity_official(root: Path, split: str) -> list[dict]:
         rgb_path = _resolve_cached_path(root, row.get("rgb_path"))
         depth_path = _resolve_cached_path(root, row.get("depth_path"))
         if rgb_path is not None and depth_path is not None and rgb_path.exists() and depth_path.exists():
-            items.append(_item("Panocity", str(row.get("scene_name") or rgb_path.stem), rgb_path, depth_path))
+            items.append(_item("Panocity", str(row.get("scene_name") or rgb_path.stem), rgb_path, depth_path, _PANOCITY_DEPTH_SCALE))
     return items
 
 
@@ -208,11 +233,12 @@ def _build_panocity_official_rows(root: Path) -> list[dict]:
     return rows
 
 
-def _item(dataset: str, name: str, rgb_path: Path, depth_path: Path) -> dict:
+def _item(dataset: str, name: str, rgb_path: Path, depth_path: Path, output_depth_scale: float) -> dict:
     return {
         "rgb_path": str(rgb_path),
         "depth_path": str(depth_path),
         "name": f"{dataset}_{name}",
+        "output_depth_scale": float(output_depth_scale),
     }
 
 

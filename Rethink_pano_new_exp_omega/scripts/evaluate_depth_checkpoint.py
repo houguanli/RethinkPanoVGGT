@@ -42,6 +42,17 @@ from training.train_pano_omega import (  # noqa: E402
 )
 
 
+DEPTH_METRIC_KEYS = [
+    "depth_mae",
+    "depth_rmse",
+    "depth_abs_rel",
+    "depth_delta_1p25",
+    "depth_delta_1p25_2",
+    "depth_delta_1p25_3",
+    "depth_valid_pixels",
+]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="Training config used to build model/dataset.")
@@ -269,6 +280,7 @@ def evaluate_run(
                 )
                 loss = loss_depth + float(eval_args.overlap_consistency_weight) * loss_overlap
 
+            depth_metrics = compute_depth_metrics(pred_depth, target_depth, target_valid)
             row = {
                 "run": name,
                 "dataset_index": int(indices[local_index]),
@@ -282,6 +294,7 @@ def evaluate_run(
                 "metadata_valid_ratio": scalar_float(batch.get("metadata_valid_ratio")),
                 "metadata_structure_score": scalar_float(batch.get("metadata_structure_score")),
                 "sample_weight": scalar_float(batch.get("sample_weight"), default=1.0),
+                **depth_metrics,
             }
             rows.append(row)
             per_sample_rows.append(row)
@@ -297,8 +310,39 @@ def evaluate_run(
         "depth_summary": summarize_values([row["loss_depth"] for row in rows]),
         "overlap_summary": summarize_values([row["loss_overlap"] for row in rows]),
         "valid_fraction_summary": summarize_values([row["valid_fraction"] for row in rows]),
+        "depth_metric_summary": summarize_metric_rows(rows, DEPTH_METRIC_KEYS),
         "by_quality_bin": summarize_by_key(rows, "quality_bin", "loss"),
         "worst_samples": sorted(rows, key=lambda row: row["loss"], reverse=True)[:10],
+    }
+
+
+def compute_depth_metrics(pred_depth: torch.Tensor, target_depth: torch.Tensor, target_valid: torch.Tensor) -> dict[str, float]:
+    pred = pred_depth.detach().float()
+    target = target_depth.detach().float()
+    valid = target_valid.detach().bool() & torch.isfinite(pred) & torch.isfinite(target) & (target > 0)
+    if valid.sum().item() == 0:
+        return {
+            "depth_mae": 0.0,
+            "depth_rmse": 0.0,
+            "depth_abs_rel": 0.0,
+            "depth_delta_1p25": 0.0,
+            "depth_delta_1p25_2": 0.0,
+            "depth_delta_1p25_3": 0.0,
+            "depth_valid_pixels": 0,
+        }
+    pred_values = pred[valid].clamp_min(1e-6)
+    target_values = target[valid].clamp_min(1e-6)
+    diff = pred_values - target_values
+    abs_diff = diff.abs()
+    ratio = torch.maximum(pred_values / target_values, target_values / pred_values)
+    return {
+        "depth_mae": float(abs_diff.mean().cpu()),
+        "depth_rmse": float(torch.sqrt((diff.square()).mean()).cpu()),
+        "depth_abs_rel": float((abs_diff / target_values).mean().cpu()),
+        "depth_delta_1p25": float((ratio < 1.25).float().mean().cpu()),
+        "depth_delta_1p25_2": float((ratio < 1.25**2).float().mean().cpu()),
+        "depth_delta_1p25_3": float((ratio < 1.25**3).float().mean().cpu()),
+        "depth_valid_pixels": int(valid.sum().item()),
     }
 
 
@@ -336,6 +380,15 @@ def summarize_by_key(rows: list[dict[str, Any]], key: str, value_key: str) -> di
     for row in rows:
         grouped.setdefault(str(row.get(key, "unknown")), []).append(float(row[value_key]))
     return {group: summarize_values(values) for group, values in sorted(grouped.items())}
+
+
+def summarize_metric_rows(rows: list[dict[str, Any]], keys: list[str]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key in keys:
+        values = [float(row[key]) for row in rows if key in row and math.isfinite(float(row[key]))]
+        if values:
+            summary[key] = summarize_values(values)
+    return summary
 
 
 def read_train_loss_reference(path: Path | None) -> dict[str, Any] | None:
@@ -379,6 +432,7 @@ def write_per_sample_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "metadata_valid_ratio",
         "metadata_structure_score",
         "sample_weight",
+        *DEPTH_METRIC_KEYS,
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)

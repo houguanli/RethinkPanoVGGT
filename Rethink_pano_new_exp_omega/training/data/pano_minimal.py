@@ -16,6 +16,12 @@ Supported layouts under one parent directory:
   Panocity/<city>/<block>/pano_images/pano_*.png
   Panocity/<city>/<block>/panodepth_images/pano_depth_*.png
   Panocity/<city>/<block>/*_poses.json
+
+Official PanoVGGT depth units are dataset-specific:
+  Panocity: cm -> meters (/100)
+  Matterport3D: /4000
+  Stanford2D3DS: /512
+  Structured3D: mm -> meters (/1000)
 """
 
 from __future__ import annotations
@@ -35,6 +41,11 @@ from torch.utils.data import Dataset
 
 
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+
+_PANOCITY_DEPTH_SCALE = 100.0
+_MATTERPORT3D_DEPTH_SCALE = 4000.0
+_STANFORD2D3DS_DEPTH_SCALE = 512.0
+_STRUCTURED3D_DEPTH_SCALE = 1000.0
 
 
 class MixedPanoDataset(Dataset):
@@ -192,13 +203,13 @@ class PanoMinimalDataset(Dataset):
     def _build_index(self, max_samples: Optional[int]) -> List[Dict]:
         items: List[Dict] = []
         if "matterport3d" in self.dataset_names:
-            items.extend(_index_matterport3d(self.root / "Matterport3D", self.split, self.output_depth_scale))
+            items.extend(_index_matterport3d(self.root / "Matterport3D", self.split, _MATTERPORT3D_DEPTH_SCALE))
         if "stanford2d3ds" in self.dataset_names:
-            items.extend(_index_stanford2d3ds(self.root / "Stanford2D3DS", self.split, self.output_depth_scale))
+            items.extend(_index_stanford2d3ds(self.root / "Stanford2D3DS", self.split, _STANFORD2D3DS_DEPTH_SCALE))
         if "structured3d" in self.dataset_names:
-            items.extend(_index_structured3d(self.root / "Structured3D", self.split, self.output_depth_scale))
+            items.extend(_index_structured3d(self.root / "Structured3D", self.split, _STRUCTURED3D_DEPTH_SCALE))
         if "panocity" in self.dataset_names:
-            items.extend(_index_panocity_official(self.root / "Panocity", self.split, self.output_depth_scale))
+            items.extend(_index_panocity_official(self.root / "Panocity", self.split, _PANOCITY_DEPTH_SCALE))
         if max_samples is not None:
             items = items[: int(max_samples)]
         return items

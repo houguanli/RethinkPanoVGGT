@@ -161,7 +161,7 @@ class PanoCityPairedPinholeDataset(BaseDataset):
                 image = _read_rgb(candidate["rgb_path"])
                 range_depth = _read_depth(
                     candidate["depth_path"],
-                    output_depth_scale=self.output_depth_scale,
+                    output_depth_scale=float(candidate.get("output_depth_scale", self.output_depth_scale)),
                     invalid_depth_value=self.invalid_depth_value,
                     depth_max_m=self.depth_max_m,
                 )
