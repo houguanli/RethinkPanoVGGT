@@ -8,8 +8,6 @@ BASELINE="$ROOT/baseline01_vggt_omega"
 
 PYTHON="${PYTHON:-python}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
-BASE_PORT="${BASE_PORT:-29681}"
-LUNA_PORT="${LUNA_PORT:-29682}"
 
 PANOVGGT_ROOT="${PANOVGGT_ROOT:-$(cd "$ROOT/.." && pwd)/panovggt}"
 
@@ -98,8 +96,8 @@ else
   echo "[sequence] stage1 baseline full warmup low384 started $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
   PYTHONPATH="$BASELINE${PYTHONPATH:+:$PYTHONPATH}" \
     "$PYTHON" -m torch.distributed.run \
+    --standalone \
     --nproc_per_node="$NPROC_PER_NODE" \
-    --master_port="$BASE_PORT" \
     training/launch.py --config "$BASE_CONFIG" \
     loss.depth.pred_depth_scale="$PRED_DEPTH_SCALE" \
     loss.depth.mode=log_huber \
@@ -122,8 +120,8 @@ fi
 echo "[sequence] stage2/3 LUNA low384-to-high512 started $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   "$PYTHON" -m torch.distributed.run \
+  --standalone \
   --nproc_per_node="$NPROC_PER_NODE" \
-  --master_port="$LUNA_PORT" \
   training/train_pano_omega.py --config "$LUNA_CONFIG" \
   --pred-depth-scale "$PRED_DEPTH_SCALE" \
   --depth-loss-mode log_huber \
