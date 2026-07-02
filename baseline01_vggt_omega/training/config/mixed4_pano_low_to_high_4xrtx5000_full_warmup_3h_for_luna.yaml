@@ -107,8 +107,8 @@ loss:
   camera: null
   depth:
     weight: 1.0
-    mode: clipped_log_l1
-    pred_depth_scale: 5.491308212280273
+    mode: log_huber
+    pred_depth_scale: 2.7437050342559814
     log_error_clip: 0.5
     log_huber_delta: 0.2
     sample_weighting: true

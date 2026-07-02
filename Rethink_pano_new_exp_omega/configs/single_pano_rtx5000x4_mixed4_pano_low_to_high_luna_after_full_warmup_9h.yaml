@@ -36,7 +36,7 @@ model:
 supervision:
   gt_depth_semantics: range
   depth_max_m: 80.0
-  depth_loss_mode: clipped_log_l1
+  depth_loss_mode: log_huber
   depth_log_error_clip: 0.5
   depth_log_huber_delta: 0.2
   loss_sample_weighting: true
@@ -46,7 +46,7 @@ supervision:
   sample_weight_max: 1.25
   overlap_consistency_weight: 0.02
   overlap_band_fraction: 0.20
-  pred_depth_scale: 5.491308212280273
+  pred_depth_scale: 2.7437050342559814
   learn_pred_depth_scale: true
   pred_depth_scale_lr: 5.0e-5
   depth_residual_mode: log_conv
