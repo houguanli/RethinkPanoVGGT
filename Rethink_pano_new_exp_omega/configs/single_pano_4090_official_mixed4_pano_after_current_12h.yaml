@@ -3,7 +3,7 @@ data:
   dataset_root: /mnt/e/PanoVGGT_minimal_datasets/datasets
   dataset_format: pano_minimal
   minimal_datasets: all
-  dataset_sampling_weights: "panocity:0.5,matterport3d:0.3,structured3d:0.15,stanford2d3ds:0.05"
+  dataset_sampling_weights: "panocity:0.45,matterport3d:0.25,structured3d:0.25,stanford2d3ds:0.05"
   dataset_split: train
   train_split_fraction: 0.95
   split_seed: 42

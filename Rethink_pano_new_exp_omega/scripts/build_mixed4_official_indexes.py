@@ -15,9 +15,10 @@ The generated cache files are the files consumed by the mixed4 readers:
   Stanford2D3DS/cache/2d3ds_{train,val,test}_index.json
   Structured3D/cache/structured3d_{train,val,test}_index.json
 
-Structured3D minimal bundles often ship only val/test scenes. By default this
-script mirrors the current reader behavior by using val as train when no
-train.txt exists.
+Structured3D minimal bundles may ship only a subset of scenes. When no
+train.txt exists, auto mode first checks whether the folder matches the
+official scene ids and uses the official Structured3D split. It falls back to a
+deterministic generated split for subset bundles.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--structured3d-train-source",
-        choices=("auto", "generated", "val", "all", "not-val-test"),
+        choices=("auto", "official", "generated", "val", "all", "not-val-test"),
         default="auto",
         help="How to build Structured3D train index when train.txt is absent.",
     )
@@ -279,6 +280,9 @@ def build_structured3d(root: Path, train_source: str, seed: int, train_fraction:
             val_source_scenes = val_scenes
             test_source_scenes = test_scenes
             resolved_train_source = "train.txt"
+        elif has_official_structured3d_scene_ids(all_scenes):
+            train_scenes, val_source_scenes, test_source_scenes = make_official_structured3d_split(all_scenes)
+            resolved_train_source = "official"
         else:
             train_scenes, val_source_scenes, test_source_scenes = make_generated_split(
                 all_scenes,
@@ -287,6 +291,9 @@ def build_structured3d(root: Path, train_source: str, seed: int, train_fraction:
                 val_fraction=val_fraction,
             )
             resolved_train_source = "generated"
+    elif train_source == "official":
+        train_scenes, val_source_scenes, test_source_scenes = make_official_structured3d_split(all_scenes)
+        resolved_train_source = "official"
     elif train_source == "generated":
         train_scenes, val_source_scenes, test_source_scenes = make_generated_split(
             all_scenes,
@@ -312,20 +319,20 @@ def build_structured3d(root: Path, train_source: str, seed: int, train_fraction:
         test_source_scenes = test_scenes
         resolved_train_source = "all"
 
-    if resolved_train_source == "generated":
+    if resolved_train_source in {"generated", "official"}:
         cache = root / "cache"
         write_lines(cache / "structured3d_train_scenes.txt", train_scenes)
         write_lines(cache / "structured3d_val_scenes.txt", val_source_scenes)
         write_lines(cache / "structured3d_test_scenes.txt", test_source_scenes)
         write_json(
-            cache / "structured3d_generated_split_summary.json",
+            cache / f"structured3d_{resolved_train_source}_split_summary.json",
             {
-                "source": "generated",
+                "source": resolved_train_source,
                 "seed": int(seed),
                 "scene_count": len(all_scenes),
-                "train_fraction": float(train_fraction),
-                "val_fraction": float(val_fraction),
-                "test_fraction": float(1.0 - train_fraction - val_fraction),
+                "train_fraction": float(train_fraction) if resolved_train_source == "generated" else None,
+                "val_fraction": float(val_fraction) if resolved_train_source == "generated" else None,
+                "test_fraction": float(1.0 - train_fraction - val_fraction) if resolved_train_source == "generated" else None,
                 "train_scenes": len(train_scenes),
                 "val_scenes": len(val_source_scenes),
                 "test_scenes": len(test_source_scenes),
@@ -347,6 +354,47 @@ def build_structured3d(root: Path, train_source: str, seed: int, train_fraction:
         "val": split_summary(rows_by_split["val"], "structured3d"),
         "test": split_summary(rows_by_split["test"], "structured3d"),
     }
+
+
+def has_official_structured3d_scene_ids(scenes: list[str]) -> bool:
+    scene_ids = {parse_structured3d_scene_id(scene) for scene in scenes}
+    scene_ids.discard(None)
+    # Full official Structured3D has scene_00000 through scene_03499. Accept a
+    # nearly complete folder so a few bad/missing scenes do not force a random
+    # split.
+    return len(scene_ids) >= 3000 and any(scene_id < 3000 for scene_id in scene_ids) and any(scene_id >= 3250 for scene_id in scene_ids)
+
+
+def make_official_structured3d_split(scenes: list[str]) -> tuple[list[str], list[str], list[str]]:
+    train: list[str] = []
+    val: list[str] = []
+    test: list[str] = []
+    unknown: list[str] = []
+    for scene in sorted(scenes):
+        scene_id = parse_structured3d_scene_id(scene)
+        if scene_id is None:
+            unknown.append(scene)
+        elif 0 <= scene_id <= 2999:
+            train.append(scene)
+        elif 3000 <= scene_id <= 3249:
+            val.append(scene)
+        elif 3250 <= scene_id <= 3499:
+            test.append(scene)
+        else:
+            unknown.append(scene)
+    if unknown:
+        print(f"[WARN] Structured3D official split ignored {len(unknown)} non-standard scene ids.")
+    return train, val, test
+
+
+def parse_structured3d_scene_id(scene: str) -> int | None:
+    prefix = "scene_"
+    if not scene.startswith(prefix):
+        return None
+    try:
+        return int(scene[len(prefix) :])
+    except ValueError:
+        return None
 
 
 def make_generated_split(
