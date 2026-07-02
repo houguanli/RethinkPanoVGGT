@@ -63,6 +63,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-format", choices=["vkitti", "panocity_paired", "pano_minimal", "mixed_pano"], default="vkitti")
     parser.add_argument("--dataset-roots", nargs="+", type=Path, default=None)
     parser.add_argument("--minimal-datasets", type=str, default="all")
+    parser.add_argument(
+        "--dataset-sampling-weights",
+        type=str,
+        default=None,
+        help="Optional mixed dataset sampling weights, e.g. panocity:0.5,matterport3d:0.3,structured3d:0.15,stanford2d3ds:0.05.",
+    )
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "pano_omega_luna")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
@@ -446,6 +452,9 @@ def train(args: argparse.Namespace) -> None:
                 dist_state,
             )
         rank0_print(f"[INFO] samples = {len(dataset)}", dist_state)
+        sampling_summary = getattr(dataset, "dataset_sampling_summary", None)
+        if sampling_summary is not None:
+            rank0_print(f"[INFO] dataset_sampling = {json.dumps(sampling_summary, sort_keys=True)}", dist_state)
         rank0_print(
         "[INFO] pano_sampling = "
         f"{args.pano_sample_mode} min={args.pano_min_count} max={args.pano_max_count} grouping={args.pano_grouping}",
@@ -672,6 +681,7 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
             train_split_fraction=args.train_split_fraction,
             split_seed=args.split_seed,
             datasets=args.minimal_datasets,
+            dataset_sampling_weights=args.dataset_sampling_weights,
             output_depth_scale=args.output_depth_scale,
             invalid_depth_value=args.invalid_depth_value,
         )
@@ -704,6 +714,7 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
                         train_split_fraction=args.train_split_fraction,
                         split_seed=args.split_seed,
                         datasets=args.minimal_datasets,
+                        dataset_sampling_weights=args.dataset_sampling_weights,
                         output_depth_scale=args.output_depth_scale,
                         invalid_depth_value=args.invalid_depth_value,
                     )

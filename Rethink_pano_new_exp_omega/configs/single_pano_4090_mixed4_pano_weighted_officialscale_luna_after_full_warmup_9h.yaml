@@ -1,6 +1,6 @@
-# 4x RTX 5000: joint PanoCity + Matterport3D + Stanford2D3DS + Structured3D.
+# Local RTX 4090: weighted official-scale mixed PanoVGGT bundle after 3h full warmup.
 data:
-  dataset_root: ../../panovggt
+  dataset_root: /mnt/e/PanoVGGT_minimal_datasets/datasets
   dataset_format: pano_minimal
   minimal_datasets: all
   dataset_sampling_weights: "panocity:0.5,matterport3d:0.3,structured3d:0.15,stanford2d3ds:0.05"
@@ -11,7 +11,7 @@ data:
   bad_sample_list: null
   curriculum_bins: null
   use_metadata_weights: false
-  checkpoint: ../baseline01_vggt_omega/logs/mixed4_pano_low_to_high_4xrtx5000_full_warmup_3h_for_luna/ckpts/checkpoint.pt
+  checkpoint: ../baseline01_vggt_omega/logs/mixed4_pano_weighted_officialscale_full_warmup_4090_3h_for_luna/ckpts/checkpoint.pt
   pano_sample_mode: single
   pano_min_count: 1
   pano_max_count: 1
@@ -70,7 +70,7 @@ optimization:
   optimizer_type: adamw
   batch_size: 1
   training_stages:
-    - name: luna_residual_fit_low384
+    - name: luna_residual_fit_officialscale_low384
       until_minutes: 360.0
       window_size: 384
       trainable: luna_residual_dense
@@ -81,8 +81,8 @@ optimization:
       enable_depth_residual: true
       train_depth_residual: true
       learn_pred_depth_scale: true
-    - name: luna_residual_low_lr_high512
-      window_size: 512
+    - name: luna_residual_low_lr_officialscale_low384
+      window_size: 384
       trainable: luna_residual_dense
       lr: 1.0e-5
       pred_depth_scale_lr: 1.0e-5
@@ -95,14 +95,14 @@ optimization:
 
 runtime:
   device: cuda
-  distributed: auto
+  distributed: none
   dist_backend: nccl
   find_unused_parameters: true
   amp_dtype: bfloat16
   epochs: 100000
   max_steps: 1000000
   num_workers: 4
-  seed: 43
+  seed: 45
   max_duration_minutes: 540.0
   save_every_steps: 5000
   save_last: true
@@ -110,11 +110,11 @@ runtime:
   debug_depth_dump: false
   debug_depth_threshold: 0.3
   debug_depth_max_dumps_per_step: 0
-  debug_dir: logs/debug_mixed4_pano_low_to_high_4xrtx5000_luna_after_full_warmup_9h
+  debug_dir: logs/debug_mixed4_pano_weighted_officialscale_luna_after_full_warmup_4090_9h
   progress_bar: true
   progress_log_every: 50
   tensorboard: true
-  tensorboard_dir: logs/mixed4_pano_low_to_high_4xrtx5000_luna_after_full_warmup_9h/tensorboard
+  tensorboard_dir: logs/mixed4_pano_weighted_officialscale_luna_after_full_warmup_4090_9h/tensorboard
 
 output:
-  output_dir: logs/mixed4_pano_low_to_high_4xrtx5000_luna_after_full_warmup_9h
+  output_dir: logs/mixed4_pano_weighted_officialscale_luna_after_full_warmup_4090_9h

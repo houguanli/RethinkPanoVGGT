@@ -12,7 +12,6 @@ BASE_PORT="${BASE_PORT:-29681}"
 LUNA_PORT="${LUNA_PORT:-29682}"
 
 PANOVGGT_ROOT="${PANOVGGT_ROOT:-$(cd "$ROOT/.." && pwd)/panovggt}"
-PANOCITY_ROOT="$PANOVGGT_ROOT/Panocity"
 
 BASE_CONFIG="mixed4_pano_low_to_high_4xrtx5000_full_warmup_3h_for_luna"
 BASE_OUT="$BASELINE/logs/$BASE_CONFIG"
@@ -43,17 +42,13 @@ mkdir -p "$BASE_OUT" "$LUNA_OUT"
   echo "[sequence] calibration_samples_per_dataset=$CALIB_SAMPLES_PER_DATASET"
 } | tee -a "$SEQ_LOG"
 
-if [[ -d "$PANOCITY_ROOT" ]]; then
-  echo "[sequence] building Panocity official index under $PANOCITY_ROOT $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
-  PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
-    "$PYTHON" "$LUNA/scripts/build_panocity_official_index.py" \
-    --root "$PANOCITY_ROOT" \
-    --train-fraction 0.95 \
-    --seed 42 \
-    2>&1 | tee -a "$SEQ_LOG"
-else
-  echo "[sequence] missing Panocity official root: $PANOCITY_ROOT" | tee -a "$SEQ_LOG"
-fi
+echo "[sequence] building mixed4 official indexes under $PANOVGGT_ROOT $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
+PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" "$LUNA/scripts/build_mixed4_official_indexes.py" \
+  --root "$PANOVGGT_ROOT" \
+  --train-fraction 0.95 \
+  --seed 42 \
+  2>&1 | tee -a "$SEQ_LOG"
 
 PRED_DEPTH_SCALE="${PRED_DEPTH_SCALE:-}"
 if [[ "${SKIP_CALIBRATION:-0}" != "1" ]]; then

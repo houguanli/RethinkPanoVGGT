@@ -62,7 +62,8 @@ class PanoCityPairedPinholeDataset(BaseDataset):
     def get_data(self, seq_index=None, img_per_seq=None, seq_name=None, ids=None, aspect_ratio=1.0):
         if seq_index is None:
             seq_index = 0
-        item, image, range_depth = self._read_item_with_fallback(int(seq_index) % len(self.items))
+        item_index = self._resolve_item_index(int(seq_index))
+        item, image, range_depth = self._read_item_with_fallback(item_index)
 
         target_shape = self.get_target_shape(aspect_ratio)
         height, width = int(target_shape[0]), int(target_shape[1])
@@ -123,6 +124,9 @@ class PanoCityPairedPinholeDataset(BaseDataset):
             "metadata_structure_score": np.full((view_count,), metadata_structure_score, dtype=np.float32),
             "metadata_quality_bin": str(item.get("metadata_quality_bin", "unknown")),
         }
+
+    def _resolve_item_index(self, seq_index: int) -> int:
+        return int(seq_index) % len(self.items)
 
     def _build_index(self, max_samples: Optional[int] = None):
         rgb_dir = osp.join(self.root, "rgb")

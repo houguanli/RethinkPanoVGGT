@@ -1,4 +1,6 @@
 import json
+import math
+import random
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -29,6 +31,7 @@ class PanoMinimalPinholeDataset(PanoCityPairedPinholeDataset):
         len_train: int = 100000,
         len_test: int = 10000,
         datasets: Optional[str | Iterable[str]] = "all",
+        dataset_sampling_weights: Optional[str | dict[str, float]] = None,
         output_depth_scale: float = 1000.0,
         invalid_depth_value: Optional[float] = 65535.0,
         depth_max_m: float = 80.0,
@@ -44,6 +47,7 @@ class PanoMinimalPinholeDataset(PanoCityPairedPinholeDataset):
         use_metadata_weights: bool = True,
     ):
         self.dataset_names = _parse_dataset_names(datasets)
+        self.dataset_sampling_weights = _parse_dataset_sampling_weights(dataset_sampling_weights)
         super().__init__(
             common_conf=common_conf,
             split=split,
@@ -64,6 +68,18 @@ class PanoMinimalPinholeDataset(PanoCityPairedPinholeDataset):
             curriculum_bins=curriculum_bins,
             use_metadata_weights=use_metadata_weights,
         )
+        self.balanced_sample_indices, self.dataset_sampling_summary = _build_balanced_sample_indices(
+            self.items,
+            self.dataset_sampling_weights if self.split == "train" else None,
+            seed=self.split_seed,
+        )
+        if self.dataset_sampling_summary.get("enabled"):
+            print(f"[INFO] PanoMinimal dataset_sampling = {self.dataset_sampling_summary}")
+
+    def _resolve_item_index(self, seq_index: int) -> int:
+        if getattr(self, "balanced_sample_indices", None):
+            return self.balanced_sample_indices[int(seq_index) % len(self.balanced_sample_indices)]
+        return int(seq_index) % len(self.items)
 
     def _build_index(self, max_samples: Optional[int] = None):
         root = Path(self.root)
@@ -110,6 +126,113 @@ def _parse_dataset_names(raw: Optional[str | Iterable[str]]) -> set[str]:
         "panocityofficial": "panocity",
     }
     return {aliases.get(value.strip().lower(), value.strip().lower()) for value in values if value.strip()}
+
+
+def _dataset_key(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "pano_city": "panocity",
+        "panocityofficial": "panocity",
+        "panocity_paired": "panocity",
+        "matterport": "matterport3d",
+        "mp3d": "matterport3d",
+        "stanford": "stanford2d3ds",
+        "2d3ds": "stanford2d3ds",
+        "s3d": "structured3d",
+    }
+    return aliases.get(raw, raw)
+
+
+def _parse_dataset_sampling_weights(raw: Optional[str | dict[str, float]]) -> Optional[dict[str, float]]:
+    if raw in (None, "", "none"):
+        return None
+    if isinstance(raw, dict):
+        pairs = raw.items()
+    else:
+        pairs = []
+        for part in str(raw).split(","):
+            if not part.strip():
+                continue
+            if ":" not in part:
+                raise ValueError(f"Dataset sampling weight must be name:weight, got {part!r}")
+            name, value = part.split(":", 1)
+            pairs.append((name, value))
+    weights: dict[str, float] = {}
+    for name, value in pairs:
+        key = _dataset_key(name)
+        weight = float(value)
+        if weight < 0:
+            raise ValueError(f"Dataset sampling weight must be non-negative, got {name}:{value}")
+        weights[key] = weights.get(key, 0.0) + weight
+    return weights or None
+
+
+def _build_balanced_sample_indices(
+    items: list[dict],
+    requested_weights: Optional[dict[str, float]],
+    seed: int,
+) -> tuple[list[int], dict]:
+    natural_indices: dict[str, list[int]] = {}
+    for index, item in enumerate(items):
+        key = _dataset_key(item.get("dataset") or str(item.get("name", "")).split("_", 1)[0])
+        natural_indices.setdefault(key, []).append(index)
+    natural_counts = {key: len(indices) for key, indices in sorted(natural_indices.items())}
+    if not requested_weights:
+        return list(range(len(items))), {
+            "enabled": False,
+            "natural_counts": natural_counts,
+            "target_counts": natural_counts,
+            "weights": {},
+        }
+
+    available = {key for key, indices in natural_indices.items() if indices}
+    provided = {key: float(value) for key, value in requested_weights.items() if key in available and value > 0}
+    if not provided:
+        return list(range(len(items))), {
+            "enabled": False,
+            "natural_counts": natural_counts,
+            "target_counts": natural_counts,
+            "weights": {},
+            "warning": "no requested dataset weights matched available datasets",
+        }
+
+    provided_sum = sum(provided.values())
+    weights = dict(provided)
+    missing = sorted(available - set(weights))
+    if provided_sum < 1.0 and missing:
+        missing_total = sum(natural_counts[key] for key in missing)
+        if missing_total > 0:
+            remaining = 1.0 - provided_sum
+            for key in missing:
+                weights[key] = remaining * natural_counts[key] / missing_total
+
+    weight_sum = sum(weights.values())
+    weights = {key: value / weight_sum for key, value in weights.items() if value > 0}
+    total = len(items)
+    exact = {key: total * weight for key, weight in weights.items()}
+    target_counts = {key: int(math.floor(value)) for key, value in exact.items()}
+    remainder = total - sum(target_counts.values())
+    for key in sorted(weights, key=lambda name: (exact[name] - target_counts[name]), reverse=True)[:remainder]:
+        target_counts[key] += 1
+
+    rng = random.Random(int(seed))
+    sampled: list[int] = []
+    for key, target in sorted(target_counts.items()):
+        indices = natural_indices.get(key, [])
+        if not indices or target <= 0:
+            continue
+        if target <= len(indices):
+            sampled.extend(rng.sample(indices, target))
+        else:
+            sampled.extend(rng.choice(indices) for _ in range(target))
+    rng.shuffle(sampled)
+    return sampled, {
+        "enabled": True,
+        "natural_counts": natural_counts,
+        "target_counts": {key: int(value) for key, value in sorted(target_counts.items())},
+        "weights": {key: float(value) for key, value in sorted(weights.items())},
+        "virtual_total": len(sampled),
+    }
 
 
 def _index_matterport3d(root: Path, split: str) -> list[dict]:
@@ -235,6 +358,7 @@ def _build_panocity_official_rows(root: Path) -> list[dict]:
 
 def _item(dataset: str, name: str, rgb_path: Path, depth_path: Path, output_depth_scale: float) -> dict:
     return {
+        "dataset": dataset,
         "rgb_path": str(rgb_path),
         "depth_path": str(depth_path),
         "name": f"{dataset}_{name}",

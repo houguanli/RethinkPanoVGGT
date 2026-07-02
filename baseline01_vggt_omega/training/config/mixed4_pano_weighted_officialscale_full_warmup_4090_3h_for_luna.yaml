@@ -1,4 +1,4 @@
-exp_name: mixed4_pano_low_to_high_4xrtx5000_full_warmup_3h_for_luna
+exp_name: mixed4_pano_weighted_officialscale_full_warmup_4090_3h_for_luna
 img_size: 384
 num_workers: 4
 seed_value: 42
@@ -54,7 +54,7 @@ data:
       dataset_configs:
         - _target_: data.datasets.pano_minimal.PanoMinimalPinholeDataset
           split: train
-          root: ../../panovggt
+          root: /mnt/e/PanoVGGT_minimal_datasets/datasets
           datasets: all
           dataset_sampling_weights: "panocity:0.5,matterport3d:0.3,structured3d:0.15,stanford2d3ds:0.05"
           len_train: 1000000
