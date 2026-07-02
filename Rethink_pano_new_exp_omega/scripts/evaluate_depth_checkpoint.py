@@ -349,6 +349,8 @@ def compute_depth_metrics(pred_depth: torch.Tensor, target_depth: torch.Tensor, 
 def sample_indices(length: int, limit: int, seed: int) -> list[int]:
     if length <= 0:
         return []
+    if int(limit) <= 0:
+        return list(range(length))
     limit = min(max(int(limit), 0), length)
     indices = list(range(length))
     random.Random(int(seed)).shuffle(indices)

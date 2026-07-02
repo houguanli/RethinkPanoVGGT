@@ -20,6 +20,11 @@ CALIB_JSON="$BASE_OUT/depth_scale_calibration.json"
 CALIB_LOG="$BASE_OUT/depth_scale_calibration.log"
 CALIB_SAMPLES_PER_DATASET="${CALIB_SAMPLES_PER_DATASET:-8}"
 CALIB_MAX_PIXELS_PER_SAMPLE="${CALIB_MAX_PIXELS_PER_SAMPLE:-50000}"
+EVAL_LIMIT_PER_DATASET="${EVAL_LIMIT_PER_DATASET:-0}"
+EVAL_SUFFIX="valtestfull"
+if [[ "$EVAL_LIMIT_PER_DATASET" != "0" ]]; then
+  EVAL_SUFFIX="valtest${EVAL_LIMIT_PER_DATASET}"
+fi
 
 LUNA_CONFIG="configs/single_pano_4090_mixed4_pano_weighted_officialscale_luna_after_full_warmup_9h.yaml"
 LUNA_OUT="$LUNA/logs/mixed4_pano_weighted_officialscale_luna_after_full_warmup_4090_9h"
@@ -41,6 +46,7 @@ mkdir -p "$BASE_OUT" "$LUNA_OUT"
   echo "[sequence] cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
   echo "[sequence] panovggt_root=$PANOVGGT_ROOT"
   echo "[sequence] calibration_samples_per_dataset=$CALIB_SAMPLES_PER_DATASET"
+  echo "[sequence] eval_limit_per_dataset=$EVAL_LIMIT_PER_DATASET"
 } | tee -a "$SEQ_LOG"
 
 echo "[sequence] building/checking mixed4 official indexes under $PANOVGGT_ROOT $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
@@ -121,20 +127,20 @@ if [[ ! -s "$LUNA_OUT/last.pt" ]]; then
   exit 1
 fi
 
-echo "[sequence] mixed4 validation val/test100 started $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
+echo "[sequence] mixed4 validation $EVAL_SUFFIX started $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 "$PYTHON" scripts/evaluate_mixed4_depth_checkpoint.py \
   --config "$LUNA_CONFIG" \
   --checkpoint "$LUNA_OUT/last.pt" \
-  --output "$LUNA_OUT/validation_mixed4_by_dataset_valtest100_summary.json" \
-  --per-sample-csv "$LUNA_OUT/validation_mixed4_by_dataset_valtest100_per_sample.csv" \
+  --output "$LUNA_OUT/validation_mixed4_by_dataset_${EVAL_SUFFIX}_summary.json" \
+  --per-sample-csv "$LUNA_OUT/validation_mixed4_by_dataset_${EVAL_SUFFIX}_per_sample.csv" \
   --train-loss-csv "$LUNA_OUT/loss.csv" \
   --device cuda \
-  --limit-per-dataset 100 \
+  --limit-per-dataset "$EVAL_LIMIT_PER_DATASET" \
   --num-workers 2 \
   --seed 123 \
   --no-progress \
-  2>&1 | tee "$LUNA_OUT/validation_mixed4_by_dataset_valtest100_console.log"
-echo "[sequence] mixed4 validation val/test100 finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
+  2>&1 | tee "$LUNA_OUT/validation_mixed4_by_dataset_${EVAL_SUFFIX}_console.log"
+echo "[sequence] mixed4 validation $EVAL_SUFFIX finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 
 echo "[sequence] plotting loss curves $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 "$PYTHON" scripts/plot_loss_csv.py \

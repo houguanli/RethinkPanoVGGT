@@ -52,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--per-sample-csv", type=Path, default=None, help="Optional per-sample CSV path.")
     parser.add_argument("--train-loss-csv", type=Path, default=None, help="Optional training loss.csv for comparison.")
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
-    parser.add_argument("--limit-per-dataset", type=int, default=100, help="Held-out samples per dataset.")
+    parser.add_argument("--limit-per-dataset", type=int, default=100, help="Held-out samples per dataset. Use 0 for the full split.")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
