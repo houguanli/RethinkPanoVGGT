@@ -409,10 +409,12 @@ def _index_panocity_official(root: Path, split: str, scale: float) -> List[Dict]
     index_path = root / "cache" / f"panocity_{split}_index.json"
     rows = _read_json_list(index_path)
     if not rows and split != "all":
-        rows = _read_json_list(root / "cache" / "panocity_all_index.json")
-        if rows:
-            print(f"[WARN] Panocity {split} index not found under {root}; using panocity_all_index.json instead.")
-    if not rows:
+        raise FileNotFoundError(
+            f"Panocity {split} index not found: {index_path}. "
+            "Run scripts/build_panocity_official_index.py or scripts/build_mixed4_official_indexes.py "
+            "so train/val/test follow the official split instead of falling back to all data."
+        )
+    if not rows and split == "all":
         rows = build_panocity_official_rows(root)
     items: List[Dict] = []
     for row in rows:
@@ -420,7 +422,7 @@ def _index_panocity_official(root: Path, split: str, scale: float) -> List[Dict]
             continue
         rgb_path = _resolve_cached_path(root, row.get("rgb_path"))
         depth_path = _resolve_cached_path(root, row.get("depth_path"))
-        if rgb_path is None or depth_path is None or not rgb_path.exists() or not depth_path.exists():
+        if rgb_path is None or depth_path is None:
             continue
         items.append(
             _item(

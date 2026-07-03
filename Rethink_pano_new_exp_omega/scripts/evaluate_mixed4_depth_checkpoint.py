@@ -41,7 +41,7 @@ from training.train_pano_omega import (  # noqa: E402
 
 
 DATASETS = [
-    ("Panocity", "panocity", "val"),
+    ("Panocity", "panocity", "test"),
     ("Matterport3D", "matterport3d", "test"),
     ("Stanford2D3DS", "stanford2d3ds", "test"),
     ("Structured3D", "structured3d", "val"),
@@ -136,7 +136,7 @@ def main() -> None:
         "limit_per_dataset": int(args.limit_per_dataset),
         "dataset_root": str(train_args.dataset_root),
         "split_policy": {
-            "Panocity": "val (no test cache in current local official-layout bundle)",
+            "Panocity": "test (PanoVGGT official split when cache was built with official split JSONs)",
             "Matterport3D": "test",
             "Stanford2D3DS": "test",
             "Structured3D": "val (no test cache in current local bundle)",

@@ -30,13 +30,33 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_PANOCITY_SPLIT_DIR = REPO_ROOT / "training" / "data" / "splits" / "panocity"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True, help="Parent folder containing the four datasets.")
     parser.add_argument("--datasets", default="all", help="Comma list: panocity,matterport3d,stanford2d3ds,structured3d or all.")
-    parser.add_argument("--train-fraction", type=float, default=0.95, help="Panocity random train split fraction.")
+    parser.add_argument(
+        "--train-fraction",
+        type=float,
+        default=0.90,
+        help="Panocity generated fallback train fraction. Official splits are used by default when present.",
+    )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--panocity-split-source",
+        choices=("auto", "official", "generated"),
+        default="auto",
+        help="Use PanoVGGT official Panocity split JSONs or generate a fallback split.",
+    )
+    parser.add_argument(
+        "--panocity-split-dir",
+        type=Path,
+        default=DEFAULT_PANOCITY_SPLIT_DIR,
+        help="Directory containing panocity_{train,val,test}_index.json official split files.",
+    )
     parser.add_argument(
         "--structured3d-train-source",
         choices=("auto", "official", "generated", "val", "all", "not-val-test"),
@@ -62,12 +82,20 @@ def main() -> None:
         "root": str(root),
         "seed": int(args.seed),
         "panocity_train_fraction": float(args.train_fraction),
+        "panocity_split_source": args.panocity_split_source,
+        "panocity_split_dir": str(args.panocity_split_dir),
         "structured3d_train_source": args.structured3d_train_source,
         "datasets": {},
     }
 
     if "panocity" in datasets:
-        summary["datasets"]["panocity"] = build_panocity(root / "Panocity", args.train_fraction, args.seed)
+        summary["datasets"]["panocity"] = build_panocity(
+            root / "Panocity",
+            args.train_fraction,
+            args.seed,
+            split_source=args.panocity_split_source,
+            split_dir=args.panocity_split_dir,
+        )
     if "matterport3d" in datasets:
         summary["datasets"]["matterport3d"] = build_matterport3d(root / "Matterport3D")
     if "stanford2d3ds" in datasets:
@@ -113,37 +141,146 @@ def parse_dataset_names(raw: str) -> set[str]:
     return values
 
 
-def build_panocity(root: Path, train_fraction: float, seed: int) -> dict[str, Any]:
+def build_panocity(
+    root: Path,
+    train_fraction: float,
+    seed: int,
+    split_source: str = "auto",
+    split_dir: Path = DEFAULT_PANOCITY_SPLIT_DIR,
+) -> dict[str, Any]:
+    official_paths = {
+        split: split_dir / f"panocity_{split}_index.json"
+        for split in ("train", "val", "test")
+    }
+    official_available = all(path.exists() for path in official_paths.values())
+    if split_source in {"auto", "official"} and official_available:
+        return build_panocity_from_official_splits(root, official_paths)
+    if split_source == "official":
+        missing = [str(path) for path in official_paths.values() if not path.exists()]
+        raise FileNotFoundError(f"Missing official Panocity split files: {missing}")
+    if split_source == "auto":
+        print(f"[WARN] official Panocity split files not found under {split_dir}; generating fallback split.")
+    return build_panocity_generated(root, train_fraction, seed)
+
+
+def build_panocity_from_official_splits(root: Path, split_paths: dict[str, Path]) -> dict[str, Any]:
+    rows_by_split: dict[str, list[dict[str, Any]]] = {}
+    for split, path in split_paths.items():
+        split_rows = read_json(path)
+        if not isinstance(split_rows, list):
+            raise ValueError(f"Official Panocity split is not a list: {path}")
+        rows_by_split[split] = expand_panocity_official_split_rows(root, split_rows)
+
+    all_rows_by_path: dict[str, dict[str, Any]] = {}
+    for rows in rows_by_split.values():
+        for row in rows:
+            all_rows_by_path.setdefault(str(row.get("rgb_path")), row)
+    all_rows = sorted(
+        all_rows_by_path.values(),
+        key=lambda row: (row.get("city", ""), row.get("block", ""), row.get("scene_name", "")),
+    )
+
+    cache = root / "cache"
+    write_json(cache / "panocity_all_index.json", all_rows)
+    for split, rows in rows_by_split.items():
+        write_json(cache / f"panocity_{split}_index.json", rows)
+    write_json(
+        cache / "panocity_index_summary.json",
+        {
+            "root": str(root),
+            "split_source": "official",
+            "split_dir": str(next(iter(split_paths.values())).parent),
+            "total": len(all_rows),
+            "train": len(rows_by_split["train"]),
+            "val": len(rows_by_split["val"]),
+            "test": len(rows_by_split["test"]),
+            "official_trajectory_rows": {
+                split: len(read_json(path)) for split, path in split_paths.items()
+            },
+        },
+    )
+    return {
+        "root": str(root),
+        "split_source": "official",
+        "split_dir": str(next(iter(split_paths.values())).parent),
+        "all": split_summary(all_rows, "panocity"),
+        "train": split_summary(rows_by_split["train"], "panocity"),
+        "val": split_summary(rows_by_split["val"], "panocity"),
+        "test": split_summary(rows_by_split["test"], "panocity"),
+    }
+
+
+def expand_panocity_official_split_rows(root: Path, split_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for split_row in split_rows:
+        if not isinstance(split_row, dict):
+            continue
+        scene = str(split_row.get("scene") or "")
+        block = str(split_row.get("block") or "")
+        rgb_paths = split_row.get("pano_images") or []
+        depth_paths = split_row.get("panodepth_images") or []
+        if not scene or not block:
+            continue
+        if len(rgb_paths) != len(depth_paths):
+            print(f"[WARN] Panocity split row has mismatched RGB/depth counts: {scene}/{block}")
+            continue
+        for rgb_value, depth_value in zip(rgb_paths, depth_paths):
+            rgb_rel = Path(str(rgb_value))
+            depth_rel = Path(str(depth_value))
+            rows.append(
+                {
+                    "dataset": "Panocity",
+                    "city": scene,
+                    "block": block,
+                    "scene_name": f"{scene}_{block}_{rgb_rel.stem}",
+                    "rgb_path": str(rgb_rel),
+                    "depth_path": str(depth_rel),
+                    "pano_position_m": [0.0, 0.0, 0.0],
+                }
+            )
+    return rows
+
+
+def build_panocity_generated(root: Path, train_fraction: float, seed: int) -> dict[str, Any]:
     rows = build_panocity_rows(root)
     rows.sort(key=lambda row: (row.get("city", ""), row.get("block", ""), row.get("scene_name", "")))
     order = list(range(len(rows)))
     rng = random.Random(seed)
     rng.shuffle(order)
     train_count = int(round(len(order) * train_fraction))
+    val_count = int(round(len(order) * 0.05))
     train_indices = set(order[:train_count])
+    val_indices = set(order[train_count : train_count + val_count])
     train_rows = [row for index, row in enumerate(rows) if index in train_indices]
-    val_rows = [row for index, row in enumerate(rows) if index not in train_indices]
+    val_rows = [row for index, row in enumerate(rows) if index in val_indices]
+    test_rows = [row for index, row in enumerate(rows) if index not in train_indices and index not in val_indices]
 
     cache = root / "cache"
     write_json(cache / "panocity_all_index.json", rows)
     write_json(cache / "panocity_train_index.json", train_rows)
     write_json(cache / "panocity_val_index.json", val_rows)
+    write_json(cache / "panocity_test_index.json", test_rows)
     write_json(
         cache / "panocity_index_summary.json",
         {
             "root": str(root),
+            "split_source": "generated",
             "total": len(rows),
             "train": len(train_rows),
             "val": len(val_rows),
+            "test": len(test_rows),
             "train_fraction": train_fraction,
+            "val_fraction": 0.05,
             "seed": seed,
         },
     )
     return {
         "root": str(root),
+        "split_source": "generated",
         "all": split_summary(rows, "panocity"),
         "train": split_summary(train_rows, "panocity"),
         "val": split_summary(val_rows, "panocity"),
+        "test": split_summary(test_rows, "panocity"),
     }
 
 
@@ -460,6 +597,10 @@ def expanded_count(rows: list[Any], dataset: str) -> int:
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def write_lines(path: Path, values: Iterable[str]) -> None:

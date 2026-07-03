@@ -301,12 +301,15 @@ def _index_structured3d(root: Path, split: str) -> list[dict]:
 
 
 def _index_panocity_official(root: Path, split: str) -> list[dict]:
-    rows = _read_json_list(root / "cache" / f"panocity_{split}_index.json")
+    index_path = root / "cache" / f"panocity_{split}_index.json"
+    rows = _read_json_list(index_path)
     if not rows and split != "all":
-        rows = _read_json_list(root / "cache" / "panocity_all_index.json")
-        if rows:
-            print(f"[WARN] Panocity {split} index not found under {root}; using panocity_all_index.json instead.")
-    if not rows:
+        raise FileNotFoundError(
+            f"Panocity {split} index not found: {index_path}. "
+            "Run Rethink_pano_new_exp_omega/scripts/build_panocity_official_index.py or "
+            "scripts/build_mixed4_official_indexes.py so train/val/test follow the official split."
+        )
+    if not rows and split == "all":
         rows = _build_panocity_official_rows(root)
     items = []
     for row in rows:
@@ -314,7 +317,7 @@ def _index_panocity_official(root: Path, split: str) -> list[dict]:
             continue
         rgb_path = _resolve_cached_path(root, row.get("rgb_path"))
         depth_path = _resolve_cached_path(root, row.get("depth_path"))
-        if rgb_path is not None and depth_path is not None and rgb_path.exists() and depth_path.exists():
+        if rgb_path is not None and depth_path is not None:
             items.append(_item("Panocity", str(row.get("scene_name") or rgb_path.stem), rgb_path, depth_path, _PANOCITY_DEPTH_SCALE))
     return items
 
