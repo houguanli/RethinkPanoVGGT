@@ -14,13 +14,14 @@ from typing import Dict, Tuple
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from training.data import PanoCityPairedOmegaDataset, PanoVKittiOmegaDataset  # noqa: E402
+from training.data import PanoCityPairedOmegaDataset, PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E402
 from training.train_pano_omega import build_model, load_checkpoint, sample_depth_targets, set_seed  # noqa: E402
 from vggt_omega.models.layers.pano_position import pinhole_rays, rays_to_equirectangular  # noqa: E402
 from vggt_omega.utils.pose_enc import encoding_to_camera  # noqa: E402
@@ -32,10 +33,39 @@ DEFAULT_PANOCITY_PRED_DEPTH_SCALE = 5.491308212280273
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Export pano reconstruction previews from a trained LUNA checkpoint.")
     parser.add_argument("--dataset-root", type=Path, default=PROJECT_ROOT.parent / "dataset")
-    parser.add_argument("--dataset-format", choices=["vkitti", "panocity_paired"], default="vkitti")
+    parser.add_argument("--dataset-format", choices=["vkitti", "panocity_paired", "pano_minimal"], default="vkitti")
+    parser.add_argument("--pano-path", type=Path, default=None, help="Direct RGB panorama path. Bypasses dataset indexing.")
+    parser.add_argument("--depth-path", type=Path, default=None, help="Optional direct depth path used for GT preview/scale fitting.")
+    parser.add_argument("--direct-scene-name", type=str, default=None, help="Optional scene name for direct --pano-path export summary.")
+    parser.add_argument(
+        "--minimal-datasets",
+        default="all",
+        help=(
+            "For --dataset-format pano_minimal: comma-separated subset, e.g. "
+            "panocity,matterport3d,stanford2d3ds,structured3d."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-split",
+        choices=["train", "val", "test", "all"],
+        default="train",
+        help="For --dataset-format pano_minimal: split index to read.",
+    )
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--sample-index", type=int, default=0)
+    parser.add_argument(
+        "--sample-scene-name",
+        type=str,
+        default=None,
+        help="Optional exact scene_name selector. If no exact match exists, a unique substring match is accepted.",
+    )
+    parser.add_argument(
+        "--sample-rgb-path",
+        type=str,
+        default=None,
+        help="Optional RGB path/stem selector. Useful for pulling a specific mixed4 pano case.",
+    )
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--max-points", type=int, default=250000)
     parser.add_argument("--depth-max-m", type=float, default=80.0)
@@ -99,33 +129,48 @@ def main() -> None:
     if args.window_size is not None:
         model_args.window_size = args.window_size
 
-    dataset = build_dataset(args, pano_size_from_args(model_args))
-    sample = dataset[args.sample_index]
+    pano_size = pano_size_from_args(model_args)
+    if args.pano_path is not None:
+        sample = read_direct_sample(args, pano_size)
+        args.resolved_sample_index = None
+    else:
+        dataset = build_dataset(args, pano_size)
+        sample_index = resolve_sample_index(dataset, args)
+        args.resolved_sample_index = sample_index
+        sample = dataset[sample_index]
     model = build_model(model_args).to(device)
     load_checkpoint(model, args.checkpoint, strict=False)
     model.eval()
 
-    output_dir = args.output_dir
+    output_dir = resolve_output_dir(args, sample)
     output_dir.mkdir(parents=True, exist_ok=True)
     pano_image = sample["pano_image"][None].to(device)
-    pano_depth = sample["pano_depth"][None].to(device)
+    target_available = sample.get("pano_depth") is not None
 
     with torch.no_grad():
         predictions = model(pano_images=pano_image, return_sampler_output=True)
-        target_depth, target_valid = sample_depth_targets(
-            model,
-            pano_depth,
-            source_depth_semantics=args.gt_depth_semantics,
-            max_range_depth=args.depth_max_m,
-        )
+        if target_available:
+            pano_depth = sample["pano_depth"][None].to(device)
+            target_depth, target_valid = sample_depth_targets(
+                model,
+                pano_depth,
+                source_depth_semantics=args.gt_depth_semantics,
+                max_range_depth=args.depth_max_m,
+            )
 
     model_pred_depth = predictions["depth"][0, ..., 0].detach().float().cpu().numpy()
     pred_conf = predictions["depth_conf"][0].detach().float().cpu().numpy()
-    target_depth_np = target_depth[0, ..., 0].detach().float().cpu().numpy()
-    target_valid_np = target_valid[0, ..., 0].detach().cpu().numpy()
+    if target_available:
+        target_depth_np = target_depth[0, ..., 0].detach().float().cpu().numpy()
+        target_valid_np = target_valid[0, ..., 0].detach().cpu().numpy()
+    else:
+        target_depth_np = np.zeros_like(model_pred_depth, dtype=np.float32)
+        target_valid_np = np.zeros_like(model_pred_depth, dtype=bool)
     fitted_pred_depth_scale = None
     fitted_pred_depth_scale_valid_count = 0
     if args.fit_pred_depth_scale_from_target:
+        if not target_available:
+            raise ValueError("--fit-pred-depth-scale-from-target requires --depth-path or a dataset sample with depth.")
         pred_depth_scale, fitted_pred_depth_scale_valid_count = fit_pred_depth_scale_from_target(
             model_pred_depth,
             target_depth_np,
@@ -140,6 +185,8 @@ def main() -> None:
     pred_depth, pred_valid = apply_range_depth_modifier(raw_pred_depth, camera_meta, args.depth_max_m)
     pred_valid_after_range = pred_valid.copy()
     if args.mask_pred_by_target_valid:
+        if not target_available:
+            raise ValueError("--mask-pred-by-target-valid requires --depth-path or a dataset sample with depth.")
         pred_valid = pred_valid & target_valid_np.astype(bool)
         pred_depth = pred_depth.copy()
         pred_depth[~pred_valid] = np.inf
@@ -148,7 +195,8 @@ def main() -> None:
     save_contact_sheet(windows, output_dir / "sampled_windows.jpg")
     save_depth_sheet(raw_pred_depth, output_dir / "pred_z_depth_windows_unfiltered.jpg", max_depth=args.depth_max_m)
     save_depth_sheet(pred_depth, output_dir / "pred_z_depth_windows.jpg", max_depth=args.depth_max_m)
-    save_depth_sheet(target_depth_np, output_dir / "target_z_depth_windows.jpg", max_depth=args.depth_max_m)
+    if target_available:
+        save_depth_sheet(target_depth_np, output_dir / "target_z_depth_windows.jpg", max_depth=args.depth_max_m)
     save_conf_sheet(pred_conf, output_dir / "pred_conf_windows.jpg")
 
     pred_erp, valid_erp = splat_windows_to_erp(
@@ -157,9 +205,12 @@ def main() -> None:
         pano_hw=pano_np.shape[:2],
     )
     save_depth_image(pred_erp, valid_erp, output_dir / "pred_z_depth_erp_splat.png", max_depth=args.depth_max_m)
-    target_range_erp = erp_range_depth_image(sample["pano_depth"][0].numpy(), args.gt_depth_semantics)
-    target_range_valid = np.isfinite(target_range_erp) & (target_range_erp > 0) & (target_range_erp <= args.depth_max_m)
-    save_depth_image(target_range_erp, target_range_valid, output_dir / "target_range_depth_erp.png", max_depth=args.depth_max_m)
+    if target_available:
+        target_range_erp = erp_range_depth_image(sample["pano_depth"][0].numpy(), args.gt_depth_semantics)
+        target_range_valid = np.isfinite(target_range_erp) & (target_range_erp > 0) & (target_range_erp <= args.depth_max_m)
+        save_depth_image(target_range_erp, target_range_valid, output_dir / "target_range_depth_erp.png", max_depth=args.depth_max_m)
+    else:
+        target_range_valid = None
     write_official_point_cloud(
         output_dir / "pred_official_camera_points.ply",
         pred_depth_z=pred_depth,
@@ -191,44 +242,45 @@ def main() -> None:
         max_depth=args.depth_max_m,
         max_points=args.max_points,
     )
-    write_known_window_point_cloud(
-        output_dir / "target_known_window_camera_points.ply",
-        depth_z=target_depth_np,
-        windows=windows,
-        camera_meta=camera_meta,
-        max_depth=args.depth_max_m,
-        max_points=args.max_points,
-        extra_valid=target_valid_np,
-    )
-    write_erp_point_cloud(
-        output_dir / "target_erp_points.ply",
-        depth=sample["pano_depth"][0].numpy(),
-        rgb=pano_np,
-        max_depth=args.depth_max_m,
-        max_points=args.max_points,
-        depth_semantics=args.gt_depth_semantics,
-        extra_valid=target_range_valid,
-    )
-    if args.gt_depth_semantics != "range":
+    if target_available:
+        write_known_window_point_cloud(
+            output_dir / "target_known_window_camera_points.ply",
+            depth_z=target_depth_np,
+            windows=windows,
+            camera_meta=camera_meta,
+            max_depth=args.depth_max_m,
+            max_points=args.max_points,
+            extra_valid=target_valid_np,
+        )
         write_erp_point_cloud(
-            output_dir / "target_erp_points_legacy_radial.ply",
+            output_dir / "target_erp_points.ply",
             depth=sample["pano_depth"][0].numpy(),
             rgb=pano_np,
             max_depth=args.depth_max_m,
             max_points=args.max_points,
-            depth_semantics="range",
+            depth_semantics=args.gt_depth_semantics,
             extra_valid=target_range_valid,
         )
-    if args.gt_depth_semantics == "double_cubemap_z":
-        write_erp_point_cloud(
-            output_dir / "target_erp_points_single_cubemap_approx.ply",
-            depth=sample["pano_depth"][0].numpy(),
-            rgb=pano_np,
-            max_depth=args.depth_max_m,
-            max_points=args.max_points,
-            depth_semantics="cubemap_z",
-            extra_valid=target_range_valid,
-        )
+        if args.gt_depth_semantics != "range":
+            write_erp_point_cloud(
+                output_dir / "target_erp_points_legacy_radial.ply",
+                depth=sample["pano_depth"][0].numpy(),
+                rgb=pano_np,
+                max_depth=args.depth_max_m,
+                max_points=args.max_points,
+                depth_semantics="range",
+                extra_valid=target_range_valid,
+            )
+        if args.gt_depth_semantics == "double_cubemap_z":
+            write_erp_point_cloud(
+                output_dir / "target_erp_points_single_cubemap_approx.ply",
+                depth=sample["pano_depth"][0].numpy(),
+                rgb=pano_np,
+                max_depth=args.depth_max_m,
+                max_points=args.max_points,
+                depth_semantics="cubemap_z",
+                extra_valid=target_range_valid,
+            )
     write_summary(
         output_dir / "summary.json",
         args,
@@ -270,6 +322,55 @@ def pano_size_from_args(args: SimpleNamespace) -> Tuple[int, int] | None:
     return None
 
 
+def resolve_output_dir(args: argparse.Namespace, sample: Dict) -> Path:
+    if args.output_dir is not None:
+        return args.output_dir
+    scene_name = str(sample.get("scene_name") or Path(str(sample.get("rgb_path", "pano"))).stem)
+    safe_name = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in scene_name)[:120]
+    return PROJECT_ROOT / "logs" / f"reconstruct_{safe_name}"
+
+
+def read_direct_sample(args: argparse.Namespace, pano_size: Tuple[int, int] | None) -> Dict:
+    if args.pano_path is None:
+        raise ValueError("--pano-path is required for direct sample loading.")
+    image = read_rgb_tensor(args.pano_path)
+    depth = read_depth_tensor(args.depth_path, args.output_depth_scale, args.invalid_depth_value) if args.depth_path else None
+    if pano_size is not None:
+        height, width = pano_size
+        image = F.interpolate(image[None], size=(height, width), mode="bilinear", align_corners=False)[0]
+        if depth is not None:
+            depth = F.interpolate(depth[None], size=(height, width), mode="nearest")[0]
+    scene_name = args.direct_scene_name or args.pano_path.stem
+    return {
+        "pano_image": image,
+        "pano_depth": depth,
+        "sequence_name": "direct",
+        "scene_name": scene_name,
+        "rgb_path": str(args.pano_path),
+        "depth_path": str(args.depth_path) if args.depth_path else None,
+        "pano_position_m": torch.zeros(3, dtype=torch.float32),
+    }
+
+
+def read_rgb_tensor(path: Path) -> torch.Tensor:
+    with Image.open(path) as image:
+        array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
+def read_depth_tensor(path: Path, output_depth_scale: float, invalid_depth_value: float | None) -> torch.Tensor:
+    depth = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if depth is None:
+        raise FileNotFoundError(f"Cannot read depth map: {path}")
+    if depth.ndim == 3:
+        depth = depth[..., 0]
+    depth_m = depth.astype(np.float32) / float(output_depth_scale)
+    if invalid_depth_value is not None:
+        depth_m[depth.astype(np.float32) >= float(invalid_depth_value)] = np.inf
+    depth_m[depth_m <= 0] = np.inf
+    return torch.from_numpy(depth_m)[None].contiguous()
+
+
 def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
     if args.dataset_format == "vkitti":
         return PanoVKittiOmegaDataset(
@@ -283,7 +384,71 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
             output_depth_scale=args.output_depth_scale,
             invalid_depth_value=args.invalid_depth_value,
         )
+    if args.dataset_format == "pano_minimal":
+        return PanoMinimalDataset(
+            root=args.dataset_root,
+            pano_size=pano_size,
+            pano_sample_mode="single",
+            pano_min_count=1,
+            pano_max_count=1,
+            split=args.dataset_split,
+            datasets=args.minimal_datasets,
+            output_depth_scale=args.output_depth_scale,
+            invalid_depth_value=args.invalid_depth_value,
+        )
     raise ValueError(f"Unknown dataset format: {args.dataset_format}")
+
+
+def resolve_sample_index(dataset, args: argparse.Namespace) -> int:
+    if args.sample_scene_name:
+        return resolve_sample_index_from_items(dataset, "scene_name", args.sample_scene_name)
+    if args.sample_rgb_path:
+        return resolve_sample_index_from_items(dataset, "rgb_path", args.sample_rgb_path)
+    if len(dataset) <= 0:
+        raise IndexError("Dataset is empty.")
+    index = int(args.sample_index)
+    if index < 0:
+        index += len(dataset)
+    if index < 0 or index >= len(dataset):
+        raise IndexError(f"sample-index {args.sample_index} is outside dataset length {len(dataset)}.")
+    return index
+
+
+def resolve_sample_index_from_items(dataset, key: str, query: str) -> int:
+    items = getattr(dataset, "items", None)
+    groups = getattr(dataset, "groups", None)
+    if items is None or groups is None:
+        option = f"--sample-{key.replace('_', '-')}"
+        raise ValueError(f"{option} is only supported for datasets exposing items/groups.")
+    query_text = str(query)
+    exact_matches = []
+    substring_matches = []
+    for group_index, group in enumerate(groups):
+        if not group:
+            continue
+        item = items[int(group[0])]
+        value = str(item.get(key, ""))
+        if key.endswith("path"):
+            path = Path(value)
+            exact_candidates = {value, path.name, path.stem}
+            substring_candidates = {value, path.name, path.stem}
+        else:
+            exact_candidates = {value}
+            substring_candidates = {value}
+        if query_text in exact_candidates:
+            exact_matches.append(group_index)
+        elif any(query_text in candidate for candidate in substring_candidates):
+            substring_matches.append(group_index)
+    matches = exact_matches or substring_matches
+    if not matches:
+        raise ValueError(f"No sample matched {key}={query!r}.")
+    if len(matches) > 1 and not exact_matches:
+        preview = []
+        for group_index in matches[:10]:
+            item = items[int(groups[group_index][0])]
+            preview.append(str(item.get("scene_name", item.get(key, ""))))
+        raise ValueError(f"{key}={query!r} matched {len(matches)} samples; use a more specific value. Examples: {preview}")
+    return int(matches[0])
 
 
 def resolve_pred_camera_center_z(args: argparse.Namespace) -> float | None:
@@ -666,11 +831,20 @@ def write_summary(
     valid_pred_raw = np.isfinite(raw_pred_depth) & (raw_pred_depth > 0)
     valid_pred = np.isfinite(pred_depth) & (pred_depth > 0) & pred_valid
     valid_target = np.isfinite(target_depth) & (target_depth > 0) & target_valid
+    target_available = bool(sample.get("pano_depth") is not None)
     summary = {
         "checkpoint": str(args.checkpoint),
         "dataset_root": str(args.dataset_root),
         "dataset_format": args.dataset_format,
+        "pano_path": str(args.pano_path) if args.pano_path else None,
+        "direct_depth_path": str(args.depth_path) if args.depth_path else None,
+        "target_available": target_available,
         "sample_index": args.sample_index,
+        "resolved_sample_index": getattr(args, "resolved_sample_index", args.sample_index),
+        "minimal_datasets": getattr(args, "minimal_datasets", None),
+        "dataset_split": getattr(args, "dataset_split", None),
+        "sample_scene_name_selector": getattr(args, "sample_scene_name", None),
+        "sample_rgb_path_selector": getattr(args, "sample_rgb_path", None),
         "scene_name": sample["scene_name"],
         "rgb_path": sample["rgb_path"],
         "depth_path": sample.get("depth_path"),
