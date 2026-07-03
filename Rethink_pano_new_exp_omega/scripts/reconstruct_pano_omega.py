@@ -24,7 +24,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from training.data import PanoCityPairedOmegaDataset, PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E402
 from training.train_pano_omega import build_model, load_checkpoint, sample_depth_targets, set_seed  # noqa: E402
 from vggt_omega.models.layers.pano_position import pinhole_rays, rays_to_equirectangular  # noqa: E402
-from vggt_omega.utils.pose_enc import encoding_to_camera  # noqa: E402
 
 
 DEFAULT_PANOCITY_PRED_DEPTH_SCALE = 5.491308212280273
@@ -91,15 +90,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pano-width", type=int, default=None)
     parser.add_argument("--output-depth-scale", type=float, default=100.0)
     parser.add_argument("--invalid-depth-value", type=float, default=None)
-    parser.add_argument(
-        "--pred-camera-center-z",
-        type=float,
-        default=None,
-        help=(
-            "Override the exported official prediction camera center height in z-up coordinates. "
-            "Defaults to 0.0 for panocity_paired and leaves checkpoint pose unchanged otherwise."
-        ),
-    )
     parser.add_argument("--num-yaw", type=int, default=None, help="Override checkpoint window yaw count for eval/export.")
     parser.add_argument("--pitch-degrees", type=str, default=None, help="Override checkpoint pitch list for eval/export.")
     parser.add_argument("--fov-degrees", type=float, default=None, help="Override checkpoint window FOV for eval/export.")
@@ -116,7 +106,6 @@ def main() -> None:
     ckpt_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
     model_args = model_args_from_checkpoint(ckpt_args)
     pred_depth_scale = resolve_pred_depth_scale(args, ckpt_args)
-    pred_camera_center_z = resolve_pred_camera_center_z(args)
     if args.pano_height is not None and args.pano_width is not None:
         model_args.pano_height = args.pano_height
         model_args.pano_width = args.pano_width
@@ -211,31 +200,8 @@ def main() -> None:
         save_depth_image(target_range_erp, target_range_valid, output_dir / "target_range_depth_erp.png", max_depth=args.depth_max_m)
     else:
         target_range_valid = None
-    write_official_point_cloud(
-        output_dir / "pred_official_camera_points.ply",
-        pred_depth_z=pred_depth,
-        windows=windows,
-        pose_enc=predictions["pose_enc"][0].detach().float().cpu(),
-        max_depth=args.depth_max_m,
-        max_points=args.max_points,
-        display_y_up=True,
-        rotate_y_180=True,
-        camera_center_z=pred_camera_center_z,
-    )
-    write_official_point_cloud(
-        output_dir / "pred_official_camera_points_native.ply",
-        pred_depth_z=pred_depth,
-        windows=windows,
-        pose_enc=predictions["pose_enc"][0].detach().float().cpu(),
-        max_depth=args.depth_max_m,
-        max_points=args.max_points,
-        display_y_up=False,
-        rotate_y_180=False,
-        output_z_up=False,
-        camera_center_z=pred_camera_center_z,
-    )
     write_known_window_point_cloud(
-        output_dir / "pred_known_window_camera_points.ply",
+        output_dir / "pred_points.ply",
         depth_z=pred_depth,
         windows=windows,
         camera_meta=camera_meta,
@@ -243,17 +209,8 @@ def main() -> None:
         max_points=args.max_points,
     )
     if target_available:
-        write_known_window_point_cloud(
-            output_dir / "target_known_window_camera_points.ply",
-            depth_z=target_depth_np,
-            windows=windows,
-            camera_meta=camera_meta,
-            max_depth=args.depth_max_m,
-            max_points=args.max_points,
-            extra_valid=target_valid_np,
-        )
         write_erp_point_cloud(
-            output_dir / "target_erp_points.ply",
+            output_dir / "gt_points.ply",
             depth=sample["pano_depth"][0].numpy(),
             rgb=pano_np,
             max_depth=args.depth_max_m,
@@ -261,26 +218,6 @@ def main() -> None:
             depth_semantics=args.gt_depth_semantics,
             extra_valid=target_range_valid,
         )
-        if args.gt_depth_semantics != "range":
-            write_erp_point_cloud(
-                output_dir / "target_erp_points_legacy_radial.ply",
-                depth=sample["pano_depth"][0].numpy(),
-                rgb=pano_np,
-                max_depth=args.depth_max_m,
-                max_points=args.max_points,
-                depth_semantics="range",
-                extra_valid=target_range_valid,
-            )
-        if args.gt_depth_semantics == "double_cubemap_z":
-            write_erp_point_cloud(
-                output_dir / "target_erp_points_single_cubemap_approx.ply",
-                depth=sample["pano_depth"][0].numpy(),
-                rgb=pano_np,
-                max_depth=args.depth_max_m,
-                max_points=args.max_points,
-                depth_semantics="cubemap_z",
-                extra_valid=target_range_valid,
-            )
     write_summary(
         output_dir / "summary.json",
         args,
@@ -292,7 +229,6 @@ def main() -> None:
         target_valid_np,
         pred_valid_after_range,
         pred_depth_scale,
-        pred_camera_center_z,
         fitted_pred_depth_scale,
         fitted_pred_depth_scale_valid_count,
     )
@@ -309,6 +245,9 @@ def model_args_from_checkpoint(ckpt_args: Dict) -> SimpleNamespace:
         "pano_height": 0,
         "pano_width": 0,
         "enable_camera_head": True,
+        "enable_pano_global_token": False,
+        "luna_patch_layers": 2,
+        "luna_camera_layers": 2,
         "pred_depth_scale": 1.0,
         "smoke": False,
     }
@@ -449,14 +388,6 @@ def resolve_sample_index_from_items(dataset, key: str, query: str) -> int:
             preview.append(str(item.get("scene_name", item.get(key, ""))))
         raise ValueError(f"{key}={query!r} matched {len(matches)} samples; use a more specific value. Examples: {preview}")
     return int(matches[0])
-
-
-def resolve_pred_camera_center_z(args: argparse.Namespace) -> float | None:
-    if args.pred_camera_center_z is not None:
-        return float(args.pred_camera_center_z)
-    if args.dataset_format == "panocity_paired":
-        return 0.0
-    return None
 
 
 def resolve_pred_depth_scale(args: argparse.Namespace, ckpt_args: Dict) -> float:
@@ -630,74 +561,6 @@ def write_known_window_point_cloud(
     write_ply(path, points, colors, max_points)
 
 
-def write_official_point_cloud(
-    path: Path,
-    pred_depth_z: np.ndarray,
-    windows: np.ndarray,
-    pose_enc: torch.Tensor,
-    max_depth: float,
-    max_points: int,
-    display_y_up: bool,
-    rotate_y_180: bool = False,
-    output_z_up: bool = True,
-    extra_valid: np.ndarray | None = None,
-    camera_center_z: float | None = None,
-) -> None:
-    extrinsics, intrinsics = encoding_to_camera(pose_enc[None], pred_depth_z.shape[-2:])
-    extrinsics = extrinsics[0].numpy()
-    intrinsics = intrinsics[0].numpy()
-    num_frames, height, width = pred_depth_z.shape
-    y, x = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
-    x = np.broadcast_to(x[None], (num_frames, height, width))
-    y = np.broadcast_to(y[None], (num_frames, height, width))
-    fx = intrinsics[:, 0, 0][:, None, None]
-    fy = intrinsics[:, 1, 1][:, None, None]
-    cx = intrinsics[:, 0, 2][:, None, None]
-    cy = intrinsics[:, 1, 2][:, None, None]
-    depth = np.nan_to_num(pred_depth_z, nan=0.0, posinf=0.0, neginf=0.0)
-    camera_points = np.stack(
-        [(x - cx) / fx * depth, (y - cy) / fy * depth, depth],
-        axis=-1,
-    )
-    rotation = extrinsics[:, :3, :3]
-    translation = extrinsics[:, :3, 3]
-    if camera_center_z is not None:
-        translation = translation_for_camera_center_z(rotation, translation, camera_center_z)
-    points = np.einsum(
-        "sij,shwj->shwi",
-        np.transpose(rotation, (0, 2, 1)),
-        camera_points - translation[:, None, None, :],
-    )
-    if display_y_up:
-        points[..., 1] *= -1.0
-    if rotate_y_180:
-        points[..., 0] *= -1.0
-        points[..., 2] *= -1.0
-    radial_depth = np.linalg.norm(camera_points, axis=-1)
-    valid = (depth > 0) & (radial_depth <= max_depth) & np.isfinite(points).all(axis=-1)
-    if extra_valid is not None:
-        valid &= extra_valid
-    if output_z_up:
-        points = omega_y_up_to_z_up(points)
-    colors = np.clip(windows.transpose(0, 2, 3, 1)[valid] * 255.0, 0, 255).astype(np.uint8)
-    write_ply(path, points[valid], colors, max_points)
-
-
-def translation_for_camera_center_z(
-    rotation: np.ndarray,
-    translation: np.ndarray,
-    camera_center_z: float,
-) -> np.ndarray:
-    """Keep predicted orientation, but set camera center up-height in z-up exports.
-
-    Omega native coordinates are [right, up, forward], and z-up exports map native
-    up to output z. For a world-to-camera transform, camera center C = -R^T t.
-    """
-    centers = -np.einsum("sji,sj->si", rotation, translation)
-    centers[:, 1] = float(camera_center_z)
-    return -np.einsum("sij,sj->si", rotation, centers)
-
-
 def write_ply(path: Path, points: np.ndarray, colors: np.ndarray, max_points: int) -> None:
     if points.shape[0] > max_points:
         rng = np.random.default_rng(42)
@@ -824,7 +687,6 @@ def write_summary(
     target_valid: np.ndarray,
     pred_valid_after_range: np.ndarray,
     pred_depth_scale: float,
-    pred_camera_center_z: float | None,
     fitted_pred_depth_scale: float | None,
     fitted_pred_depth_scale_valid_count: int,
 ) -> None:
@@ -852,11 +714,14 @@ def write_summary(
         "gt_source_depth_semantics": args.gt_depth_semantics,
         "prediction_modifier": f"predictions with reconstructed radial range > {args.depth_max_m:g}m are marked non-output (inf)",
         "mask_pred_by_target_valid": bool(args.mask_pred_by_target_valid),
-        "official_point_cloud_coordinates": "pred_official_camera_points_native.ply is Omega native Y-up; comparison PLYs are exported as ERP/GT Z-up [forward, right, up]",
+        "point_cloud_outputs": {
+            "prediction": "pred_points.ply",
+            "ground_truth": "gt_points.ply" if target_available else None,
+            "coordinates": "single-pano Z-up export [forward, right, up] from fixed window geometry",
+        },
         "pred_depth_scale": pred_depth_scale,
         "fitted_pred_depth_scale": fitted_pred_depth_scale,
         "fitted_pred_depth_scale_valid_count": fitted_pred_depth_scale_valid_count,
-        "pred_camera_center_z": pred_camera_center_z,
         "pred_valid_ratio_before_modifier": float(valid_pred_raw.mean()),
         "pred_valid_ratio_after_range_modifier": float(pred_valid_after_range.mean()),
         "pred_valid_ratio": float(valid_pred.mean()),
