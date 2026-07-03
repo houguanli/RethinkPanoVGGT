@@ -42,6 +42,48 @@ from training.train_pano_omega import (  # noqa: E402
 )
 
 
+DEPTH_METRIC_KEYS = [
+    "depth_mae",
+    "depth_rmse",
+    "depth_abs_rel",
+    "depth_delta_1p25",
+    "depth_delta_1p25_2",
+    "depth_delta_1p25_3",
+    "depth_irls_scale",
+    "depth_irls_mae",
+    "depth_irls_rmse",
+    "depth_irls_abs_rel",
+    "depth_irls_delta_1p25",
+    "depth_irls_delta_1p25_2",
+    "depth_irls_delta_1p25_3",
+    "depth_valid_pixels",
+]
+
+DEPTH_ACCUMULATOR_KEYS = [
+    "depth_abs_error_sum",
+    "depth_sq_error_sum",
+    "depth_abs_rel_sum",
+    "depth_delta_1p25_count",
+    "depth_delta_1p25_2_count",
+    "depth_delta_1p25_3_count",
+    "depth_irls_abs_error_sum",
+    "depth_irls_sq_error_sum",
+    "depth_irls_abs_rel_sum",
+    "depth_irls_delta_1p25_count",
+    "depth_irls_delta_1p25_2_count",
+    "depth_irls_delta_1p25_3_count",
+]
+
+PANOVGGT_PRIMARY_METRICS = [
+    "depth_irls_abs_rel",
+    "depth_irls_delta_1p25",
+    "depth_irls_rmse",
+    "depth_abs_rel",
+    "depth_delta_1p25",
+    "depth_rmse",
+]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="Training config used to build model/dataset.")
@@ -269,10 +311,13 @@ def evaluate_run(
                 )
                 loss = loss_depth + float(eval_args.overlap_consistency_weight) * loss_overlap
 
+            depth_metrics = compute_depth_metrics(pred_depth, target_depth, target_valid)
             row = {
                 "run": name,
                 "dataset_index": int(indices[local_index]),
                 "seq_name": scalar_string(batch.get("scene_name") or batch.get("sequence_name")),
+                "rgb_path": scalar_string(batch.get("rgb_path")),
+                "depth_path": scalar_string(batch.get("depth_path")),
                 "quality_bin": scalar_string(batch.get("metadata_quality_bin"), default="unknown"),
                 "loss": float(loss.detach().cpu()),
                 "loss_depth": float(loss_depth.detach().cpu()),
@@ -282,6 +327,7 @@ def evaluate_run(
                 "metadata_valid_ratio": scalar_float(batch.get("metadata_valid_ratio")),
                 "metadata_structure_score": scalar_float(batch.get("metadata_structure_score")),
                 "sample_weight": scalar_float(batch.get("sample_weight"), default=1.0),
+                **depth_metrics,
             }
             rows.append(row)
             per_sample_rows.append(row)
@@ -297,14 +343,102 @@ def evaluate_run(
         "depth_summary": summarize_values([row["loss_depth"] for row in rows]),
         "overlap_summary": summarize_values([row["loss_overlap"] for row in rows]),
         "valid_fraction_summary": summarize_values([row["valid_fraction"] for row in rows]),
+        "depth_metric_summary": summarize_metric_rows(rows, DEPTH_METRIC_KEYS),
+        "panovggt_metric_summary": summarize_panovggt_rows(rows),
         "by_quality_bin": summarize_by_key(rows, "quality_bin", "loss"),
-        "worst_samples": sorted(rows, key=lambda row: row["loss"], reverse=True)[:10],
+        "best_samples": {
+            "by_loss": rank_samples(rows, "loss", reverse=False),
+            "by_depth_irls_abs_rel": rank_samples(rows, "depth_irls_abs_rel", reverse=False),
+            "by_depth_irls_delta_1p25": rank_samples(rows, "depth_irls_delta_1p25", reverse=True),
+        },
+        "worst_samples": {
+            "by_loss": rank_samples(rows, "loss", reverse=True),
+            "by_depth_irls_abs_rel": rank_samples(rows, "depth_irls_abs_rel", reverse=True),
+            "by_depth_irls_delta_1p25": rank_samples(rows, "depth_irls_delta_1p25", reverse=False),
+        },
     }
+
+
+def compute_depth_metrics(pred_depth: torch.Tensor, target_depth: torch.Tensor, target_valid: torch.Tensor) -> dict[str, float]:
+    pred = pred_depth.detach().float()
+    target = target_depth.detach().float()
+    valid = target_valid.detach().bool() & torch.isfinite(pred) & torch.isfinite(target) & (target > 0)
+    if valid.sum().item() == 0:
+        return {
+            "depth_mae": 0.0,
+            "depth_rmse": 0.0,
+            "depth_abs_rel": 0.0,
+            "depth_delta_1p25": 0.0,
+            "depth_delta_1p25_2": 0.0,
+            "depth_delta_1p25_3": 0.0,
+            "depth_irls_scale": 0.0,
+            "depth_irls_mae": 0.0,
+            "depth_irls_rmse": 0.0,
+            "depth_irls_abs_rel": 0.0,
+            "depth_irls_delta_1p25": 0.0,
+            "depth_irls_delta_1p25_2": 0.0,
+            "depth_irls_delta_1p25_3": 0.0,
+            "depth_valid_pixels": 0,
+            **{key: 0.0 for key in DEPTH_ACCUMULATOR_KEYS},
+        }
+    pred_values = pred[valid].clamp_min(1e-6)
+    target_values = target[valid].clamp_min(1e-6)
+    raw_metrics = depth_metrics_from_values(pred_values, target_values, prefix="depth")
+    irls_scale = fit_irls_scale(pred_values, target_values)
+    aligned_metrics = depth_metrics_from_values(pred_values * irls_scale, target_values, prefix="depth_irls")
+    return {
+        **raw_metrics,
+        **depth_metric_accumulators(pred_values, target_values, prefix="depth"),
+        "depth_irls_scale": float(irls_scale.cpu()),
+        **aligned_metrics,
+        **depth_metric_accumulators(pred_values * irls_scale, target_values, prefix="depth_irls"),
+        "depth_valid_pixels": int(valid.sum().item()),
+    }
+
+
+def depth_metrics_from_values(pred_values: torch.Tensor, target_values: torch.Tensor, prefix: str) -> dict[str, float]:
+    diff = pred_values - target_values
+    abs_diff = diff.abs()
+    ratio = torch.maximum(pred_values / target_values, target_values / pred_values)
+    return {
+        f"{prefix}_mae": float(abs_diff.mean().cpu()),
+        f"{prefix}_rmse": float(torch.sqrt((diff.square()).mean()).cpu()),
+        f"{prefix}_abs_rel": float((abs_diff / target_values).mean().cpu()),
+        f"{prefix}_delta_1p25": float((ratio < 1.25).float().mean().cpu()),
+        f"{prefix}_delta_1p25_2": float((ratio < 1.25**2).float().mean().cpu()),
+        f"{prefix}_delta_1p25_3": float((ratio < 1.25**3).float().mean().cpu()),
+    }
+
+
+def depth_metric_accumulators(pred_values: torch.Tensor, target_values: torch.Tensor, prefix: str) -> dict[str, float]:
+    diff = pred_values - target_values
+    abs_diff = diff.abs()
+    ratio = torch.maximum(pred_values / target_values, target_values / pred_values)
+    return {
+        f"{prefix}_abs_error_sum": float(abs_diff.sum().cpu()),
+        f"{prefix}_sq_error_sum": float(diff.square().sum().cpu()),
+        f"{prefix}_abs_rel_sum": float((abs_diff / target_values).sum().cpu()),
+        f"{prefix}_delta_1p25_count": float((ratio < 1.25).float().sum().cpu()),
+        f"{prefix}_delta_1p25_2_count": float((ratio < 1.25**2).float().sum().cpu()),
+        f"{prefix}_delta_1p25_3_count": float((ratio < 1.25**3).float().sum().cpu()),
+    }
+
+
+def fit_irls_scale(pred_values: torch.Tensor, target_values: torch.Tensor, iterations: int = 10) -> torch.Tensor:
+    scale = torch.median(target_values / pred_values).clamp_min(1e-6)
+    for _ in range(iterations):
+        residual = scale * pred_values - target_values
+        weights = 1.0 / residual.abs().clamp_min(1e-3)
+        denom = (weights * pred_values.square()).sum().clamp_min(1e-6)
+        scale = ((weights * pred_values * target_values).sum() / denom).clamp_min(1e-6)
+    return scale
 
 
 def sample_indices(length: int, limit: int, seed: int) -> list[int]:
     if length <= 0:
         return []
+    if int(limit) <= 0:
+        return list(range(length))
     limit = min(max(int(limit), 0), length)
     indices = list(range(length))
     random.Random(int(seed)).shuffle(indices)
@@ -336,6 +470,70 @@ def summarize_by_key(rows: list[dict[str, Any]], key: str, value_key: str) -> di
     for row in rows:
         grouped.setdefault(str(row.get(key, "unknown")), []).append(float(row[value_key]))
     return {group: summarize_values(values) for group, values in sorted(grouped.items())}
+
+
+def summarize_metric_rows(rows: list[dict[str, Any]], keys: list[str]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key in keys:
+        values = [float(row[key]) for row in rows if key in row and math.isfinite(float(row[key]))]
+        if values:
+            summary[key] = summarize_values(values)
+    return summary
+
+
+def summarize_panovggt_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "metric_meaning": {
+            "depth_irls_abs_rel": "Abs Rel after per-sample IRLS scale alignment; closest to PanoVGGT depth table protocol.",
+            "depth_irls_delta_1p25": "delta < 1.25 after per-sample IRLS scale alignment; closest to PanoVGGT depth table protocol.",
+            "depth_irls_rmse": "RMSE after per-sample IRLS scale alignment.",
+            "depth_abs_rel": "Raw-scale Abs Rel using the model/checkpoint predicted depth scale.",
+            "depth_delta_1p25": "Raw-scale delta < 1.25 using the model/checkpoint predicted depth scale.",
+            "depth_rmse": "Raw-scale RMSE using the model/checkpoint predicted depth scale.",
+        },
+        "macro_by_sample": summarize_metric_rows(rows, PANOVGGT_PRIMARY_METRICS),
+        "micro_by_valid_pixel": summarize_panovggt_micro(rows),
+    }
+
+
+def summarize_panovggt_micro(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    valid = sum(float(row.get("depth_valid_pixels", 0.0)) for row in rows)
+    if valid <= 0:
+        return {"depth_valid_pixels": 0}
+    summary: dict[str, Any] = {"depth_valid_pixels": int(valid)}
+    for prefix in ("depth", "depth_irls"):
+        abs_error_sum = sum(float(row.get(f"{prefix}_abs_error_sum", 0.0)) for row in rows)
+        sq_error_sum = sum(float(row.get(f"{prefix}_sq_error_sum", 0.0)) for row in rows)
+        abs_rel_sum = sum(float(row.get(f"{prefix}_abs_rel_sum", 0.0)) for row in rows)
+        summary[f"{prefix}_mae"] = abs_error_sum / valid
+        summary[f"{prefix}_rmse"] = math.sqrt(max(sq_error_sum / valid, 0.0))
+        summary[f"{prefix}_abs_rel"] = abs_rel_sum / valid
+        for label in ("1p25", "1p25_2", "1p25_3"):
+            count = sum(float(row.get(f"{prefix}_delta_{label}_count", 0.0)) for row in rows)
+            summary[f"{prefix}_delta_{label}"] = count / valid
+    return summary
+
+
+def rank_samples(rows: list[dict[str, Any]], key: str, reverse: bool, limit: int = 10) -> list[dict[str, Any]]:
+    candidates = [row for row in rows if key in row and math.isfinite(float(row[key]))]
+    ranked = sorted(candidates, key=lambda row: float(row[key]), reverse=reverse)[:limit]
+    fields = [
+        "dataset",
+        "split",
+        "run",
+        "dataset_index",
+        "seq_name",
+        "rgb_path",
+        "depth_path",
+        "loss",
+        "loss_depth",
+        "valid_fraction",
+        "depth_irls_abs_rel",
+        "depth_irls_delta_1p25",
+        "depth_abs_rel",
+        "depth_delta_1p25",
+    ]
+    return [{field: row.get(field) for field in fields if field in row} for row in ranked]
 
 
 def read_train_loss_reference(path: Path | None) -> dict[str, Any] | None:
@@ -370,6 +568,8 @@ def write_per_sample_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "run",
         "dataset_index",
         "seq_name",
+        "rgb_path",
+        "depth_path",
         "quality_bin",
         "loss",
         "loss_depth",
@@ -379,6 +579,8 @@ def write_per_sample_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "metadata_valid_ratio",
         "metadata_structure_score",
         "sample_weight",
+        *DEPTH_METRIC_KEYS,
+        *DEPTH_ACCUMULATOR_KEYS,
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
