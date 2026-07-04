@@ -10,6 +10,7 @@ PYTHON="${PYTHON:-/home/aoki/miniconda3/envs/RethinkPanoVGGT_omega/bin/python}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 
 PANOVGGT_ROOT="${PANOVGGT_ROOT:-$(cd "$ROOT/.." && pwd)/panovggt}"
+BASE_CHECKPOINT="${BASE_CHECKPOINT:-/home/aoki/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt}"
 
 BASE_CONFIG="mixed4_pano_low_to_high_4xrtx5000_full_warmup_3h_for_luna"
 BASE_OUT="$BASELINE/logs/$BASE_CONFIG"
@@ -37,6 +38,7 @@ mkdir -p "$BASE_OUT" "$LUNA_OUT"
   echo "[sequence] python=$PYTHON"
   echo "[sequence] nproc_per_node=$NPROC_PER_NODE"
   echo "[sequence] panovggt_root=$PANOVGGT_ROOT"
+  echo "[sequence] base_checkpoint=$BASE_CHECKPOINT"
   echo "[sequence] calibration_samples_per_dataset=$CALIB_SAMPLES_PER_DATASET"
 } | tee -a "$SEQ_LOG"
 
@@ -54,6 +56,7 @@ if [[ "${SKIP_CALIBRATION:-0}" != "1" ]]; then
   cd "$BASELINE"
   PYTHONPATH="$BASELINE${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/calibrate_mixed4_depth_scale.py \
     --root "$PANOVGGT_ROOT" \
+    --checkpoint "$BASE_CHECKPOINT" \
     --output "$CALIB_JSON" \
     --samples-per-dataset "$CALIB_SAMPLES_PER_DATASET" \
     --max-pixels-per-sample "$CALIB_MAX_PIXELS_PER_SAMPLE" \
@@ -101,6 +104,7 @@ else
     --standalone \
     --nproc_per_node="$NPROC_PER_NODE" \
     training/launch.py --config "$BASE_CONFIG" \
+    model.checkpoint_path="$BASE_CHECKPOINT" \
     loss.depth.pred_depth_scale="$PRED_DEPTH_SCALE" \
     loss.depth.mode=log_huber \
     2>&1 | tee -a "$BASE_OUT/train_3h_console.log"
