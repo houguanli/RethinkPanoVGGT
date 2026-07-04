@@ -90,7 +90,9 @@ fi
 echo "[sequence] unified pred_depth_scale=$PRED_DEPTH_SCALE" | tee -a "$SEQ_LOG"
 
 cd "$BASELINE"
+BASE_CKPT_PREEXISTING=0
 if [[ -s "$BASE_CKPT" && "${FORCE_WARMUP:-0}" != "1" ]]; then
+  BASE_CKPT_PREEXISTING=1
   echo "[sequence] stage1 baseline warmup skipped; existing checkpoint found: $BASE_CKPT" | tee -a "$SEQ_LOG"
 else
   echo "[sequence] stage1 baseline full warmup low384 started $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
@@ -118,11 +120,21 @@ if [[ -s "$LUNA_OUT/loss.csv" && ! -s "$LUNA_OUT/last.pt" && "${PRESERVE_CRASHED
   mkdir -p "$LUNA_OUT"
 fi
 echo "[sequence] stage2/3 multi-pano LUNA all384 started $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
+LUNA_DURATION_ARGS=()
+if [[ -n "${LUNA_MAX_DURATION_MINUTES:-}" ]]; then
+  LUNA_DURATION_ARGS=(--max-duration-minutes "$LUNA_MAX_DURATION_MINUTES")
+elif [[ "$BASE_CKPT_PREEXISTING" == "1" ]]; then
+  LUNA_DURATION_ARGS=(--max-duration-minutes 720.0)
+fi
+if [[ "${#LUNA_DURATION_ARGS[@]}" -gt 0 ]]; then
+  echo "[sequence] luna_duration_override=${LUNA_DURATION_ARGS[*]}" | tee -a "$SEQ_LOG"
+fi
 PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   "$PYTHON" -m torch.distributed.run \
   --standalone \
   --nproc_per_node="$NPROC_PER_NODE" \
   training/train_pano_omega.py --config "$LUNA_CONFIG" \
+  "${LUNA_DURATION_ARGS[@]}" \
   --pred-depth-scale "$PRED_DEPTH_SCALE" \
   --depth-loss-mode log_huber \
   2>&1 | tee -a "$LUNA_OUT/train_9h.log"
