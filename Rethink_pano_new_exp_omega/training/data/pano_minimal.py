@@ -357,10 +357,7 @@ def _index_matterport3d(root: Path, split: str, scale: float) -> List[Dict]:
         for pano_id in pano_ids:
             rgb_path = root / str(scan) / "pano_skybox_color" / f"{pano_id}.jpg"
             depth_path = root / str(scan) / "pano_depth" / f"{pano_id}.png"
-            pose_path = root / str(scan) / "pano_poses" / f"{pano_id}.txt"
-            if not rgb_path.exists() or not depth_path.exists():
-                continue
-            items.append(_item("Matterport3D", f"{scan}_{room_id}_{pano_id}", rgb_path, depth_path, _read_pose_translation(pose_path), scale))
+            items.append(_item("Matterport3D", f"{scan}_{room_id}_{pano_id}", rgb_path, depth_path, [0.0, 0.0, 0.0], scale))
     return items
 
 
@@ -399,9 +396,7 @@ def _index_structured3d(root: Path, split: str, scale: float) -> List[Dict]:
             pano_dir = root / str(scene) / "2D_rendering" / str(pano_id) / "panorama"
             rgb_path = pano_dir / "full" / "rgb_rawlight.png"
             depth_path = pano_dir / "full" / "depth.png"
-            if not rgb_path.exists() or not depth_path.exists():
-                continue
-            items.append(_item("Structured3D", f"{scene}_{pano_id}", rgb_path, depth_path, _read_structured3d_position(pano_dir / "camera_xyz.txt"), scale))
+            items.append(_item("Structured3D", f"{scene}_{pano_id}", rgb_path, depth_path, [0.0, 0.0, 0.0], scale))
     return items
 
 
