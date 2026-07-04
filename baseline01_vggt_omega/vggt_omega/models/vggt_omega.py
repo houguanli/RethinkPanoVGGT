@@ -26,9 +26,11 @@ class VGGTOmega(nn.Module):
         enable_alignment: bool = False,
         checkpoint_path: str | None = str(DEFAULT_CHECKPOINT_PATH),
         checkpoint_strict: bool = True,
+        activation_checkpointing: bool = False,
     ) -> None:
         super().__init__()
 
+        self.activation_checkpointing = bool(activation_checkpointing)
         self.aggregator = Aggregator(patch_size=patch_size, embed_dim=embed_dim)
         _warn_if_rope_not_max(self.aggregator)
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
