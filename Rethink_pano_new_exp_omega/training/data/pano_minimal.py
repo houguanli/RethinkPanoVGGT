@@ -166,7 +166,7 @@ class PanoMinimalDataset(Dataset):
             candidate_index = (start + offset) % len(self.items)
             try:
                 return self._read_item(self.items[candidate_index])
-            except (FileNotFoundError, OSError, ValueError) as exc:
+            except (FileNotFoundError, OSError, ValueError, SyntaxError) as exc:
                 last_error = exc
                 print(f"[WARN] skipping unreadable minimal pano sample {self.items[candidate_index].get('scene_name')}: {exc}")
         raise RuntimeError("All minimal pano samples failed to load.") from last_error
@@ -553,13 +553,19 @@ def _read_structured3d_position(path: Path) -> List[float]:
 
 
 def _read_rgb_tensor(path: Path) -> torch.Tensor:
-    with Image.open(path) as image:
-        array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    try:
+        with Image.open(path) as image:
+            array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    except (FileNotFoundError, OSError, ValueError, SyntaxError) as exc:
+        raise OSError(f"Cannot read RGB image: {path}: {exc}") from exc
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
 
 def _read_depth_tensor(path: Path, output_depth_scale: float, invalid_depth_value: Optional[float]) -> torch.Tensor:
-    depth = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    try:
+        depth = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    except (cv2.error, OSError, ValueError, SyntaxError) as exc:
+        raise OSError(f"Cannot read depth map: {path}: {exc}") from exc
     if depth is None:
         raise FileNotFoundError(f"Cannot read depth map: {path}")
     if depth.ndim == 3:
