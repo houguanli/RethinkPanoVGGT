@@ -137,7 +137,7 @@ PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   "${LUNA_DURATION_ARGS[@]}" \
   --pred-depth-scale "$PRED_DEPTH_SCALE" \
   --depth-loss-mode log_huber \
-  2>&1 | tee -a "$LUNA_OUT/train_9h.log"
+  2>&1 | tee -a "$LUNA_OUT/train_luna.log"
 echo "[sequence] stage2/3 multi-pano LUNA all384 finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 
 if [[ -s "$BASE_OUT/loss.csv" && -s "$LUNA_OUT/loss.csv" ]]; then
@@ -151,8 +151,8 @@ if [[ -s "$BASE_OUT/loss.csv" && -s "$LUNA_OUT/loss.csv" ]]; then
     --resample-seconds 10 \
     --clip-quantile 0.98 \
     --raw-alpha 0.10 \
-    --out "$LUNA_OUT/loss_curve_full12h_all384_multipano_smoothed_robust.png" \
-    --title "Mixed4 all384 3h warmup + 9h multi-pano LUNA robust smoothed loss" \
+    --out "$LUNA_OUT/loss_curve_all384_multipano_smoothed_robust.png" \
+    --title "Mixed4 all384 multi-pano robust smoothed loss" \
     2>&1 | tee -a "$SEQ_LOG"
 fi
 
