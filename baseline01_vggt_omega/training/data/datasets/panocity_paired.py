@@ -238,9 +238,12 @@ def _load_bad_samples(path: Optional[str], root: str) -> set[str]:
     if path in (None, ""):
         return set()
     resolved = Path(path)
+    candidates = [resolved]
     if not resolved.is_absolute():
-        resolved = Path(root) / resolved
-    if not resolved.exists():
+        candidates.append(Path(root) / resolved)
+    resolved = next((candidate for candidate in candidates if candidate.exists()), None)
+    if resolved is None:
+        print(f"[WARN] PanoCity bad sample list not found: {path}")
         return set()
     values: set[str] = set()
     with resolved.open("r", encoding="utf-8") as handle:
@@ -269,6 +272,8 @@ def _is_bad_sample(rgb_path: str, depth_path: str, bad_samples: set[str]) -> boo
         rgb.stem,
         depth.stem,
     }
+    keys.update(part for part in rgb.parts if part)
+    keys.update(part for part in depth.parts if part)
     return bool(keys & bad_samples)
 
 

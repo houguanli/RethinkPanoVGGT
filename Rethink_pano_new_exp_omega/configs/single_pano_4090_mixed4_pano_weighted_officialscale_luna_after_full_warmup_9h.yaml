@@ -8,7 +8,7 @@ data:
   train_split_fraction: 0.95
   split_seed: 42
   metadata_path: null
-  bad_sample_list: null
+  bad_sample_list: configs/structured3d_bad_scenes.txt
   curriculum_bins: null
   use_metadata_weights: false
   checkpoint: ../baseline01_vggt_omega/logs/mixed4_pano_weighted_officialscale_full_warmup_4090_3h_for_luna/ckpts/checkpoint.pt

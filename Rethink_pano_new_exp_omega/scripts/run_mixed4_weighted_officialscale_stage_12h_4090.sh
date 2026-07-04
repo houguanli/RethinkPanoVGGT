@@ -12,6 +12,7 @@ MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 BASE_PORT="${BASE_PORT:-29691}"
 LUNA_PORT="${LUNA_PORT:-29692}"
 PANOVGGT_ROOT="${PANOVGGT_ROOT:-/mnt/e/PanoVGGT_minimal_datasets/datasets}"
+BAD_SAMPLE_LIST="${BAD_SAMPLE_LIST:-$LUNA/configs/structured3d_bad_scenes.txt}"
 
 BASE_CONFIG="mixed4_pano_weighted_officialscale_full_warmup_4090_3h_for_luna"
 BASE_OUT="$BASELINE/logs/$BASE_CONFIG"
@@ -45,6 +46,7 @@ mkdir -p "$BASE_OUT" "$LUNA_OUT"
   echo "[sequence] python=$PYTHON"
   echo "[sequence] cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
   echo "[sequence] panovggt_root=$PANOVGGT_ROOT"
+  echo "[sequence] bad_sample_list=$BAD_SAMPLE_LIST"
   echo "[sequence] calibration_samples_per_dataset=$CALIB_SAMPLES_PER_DATASET"
   echo "[sequence] eval_limit_per_dataset=$EVAL_LIMIT_PER_DATASET"
 } | tee -a "$SEQ_LOG"
@@ -56,6 +58,7 @@ PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   --root "$PANOVGGT_ROOT" \
   --train-fraction 0.95 \
   --seed 42 \
+  --bad-scene-list "$BAD_SAMPLE_LIST" \
   2>&1 | tee -a "$SEQ_LOG"
 
 PRED_DEPTH_SCALE="${PRED_DEPTH_SCALE:-}"
@@ -73,6 +76,7 @@ if [[ "${SKIP_CALIBRATION:-0}" != "1" ]]; then
     --pitch-degrees -15.0 \
     --fov-degrees 75.0 \
     --depth-max-m 80.0 \
+    --bad-sample-list "$BAD_SAMPLE_LIST" \
     --device cuda \
     --print-scale \
     2>&1 | tee "$CALIB_LOG"

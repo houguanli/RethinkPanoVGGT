@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--structured3d-train-fraction", type=float, default=0.90)
     parser.add_argument("--structured3d-val-fraction", type=float, default=0.05)
+    parser.add_argument(
+        "--bad-scene-list",
+        type=Path,
+        default=None,
+        help="Optional newline-delimited scene ids or paths to exclude from Structured3D indexes.",
+    )
     parser.add_argument("--summary-name", default="mixed4_index_summary.json")
     return parser.parse_args()
 
@@ -107,6 +113,7 @@ def main() -> None:
             seed=args.seed,
             train_fraction=args.structured3d_train_fraction,
             val_fraction=args.structured3d_val_fraction,
+            bad_scene_list=args.bad_scene_list,
         )
 
     summary_path = root / args.summary_name
@@ -396,7 +403,14 @@ def build_stanford2d3ds(root: Path) -> dict[str, Any]:
     }
 
 
-def build_structured3d(root: Path, train_source: str, seed: int, train_fraction: float, val_fraction: float) -> dict[str, Any]:
+def build_structured3d(
+    root: Path,
+    train_source: str,
+    seed: int,
+    train_fraction: float,
+    val_fraction: float,
+    bad_scene_list: Path | None = None,
+) -> dict[str, Any]:
     if not (0.0 < train_fraction < 1.0):
         raise ValueError(f"--structured3d-train-fraction must be in (0, 1), got {train_fraction}")
     if not (0.0 <= val_fraction < 1.0):
@@ -410,6 +424,12 @@ def build_structured3d(root: Path, train_source: str, seed: int, train_fraction:
     val_scenes = sorted(read_name_set(root / "val.txt"))
     test_scenes = sorted(read_name_set(root / "test.txt"))
     train_txt = sorted(read_name_set(root / "train.txt"))
+    bad_scenes = read_bad_scene_set(bad_scene_list, root)
+    if bad_scenes:
+        all_scenes = [scene for scene in all_scenes if scene not in bad_scenes]
+        train_txt = [scene for scene in train_txt if scene not in bad_scenes]
+        val_scenes = [scene for scene in val_scenes if scene not in bad_scenes]
+        test_scenes = [scene for scene in test_scenes if scene not in bad_scenes]
 
     if train_source == "auto":
         if train_txt:
@@ -473,6 +493,7 @@ def build_structured3d(root: Path, train_source: str, seed: int, train_fraction:
                 "train_scenes": len(train_scenes),
                 "val_scenes": len(val_source_scenes),
                 "test_scenes": len(test_source_scenes),
+                "bad_scenes_excluded": len(bad_scenes),
             },
         )
 
@@ -487,6 +508,7 @@ def build_structured3d(root: Path, train_source: str, seed: int, train_fraction:
     return {
         "root": str(root),
         "resolved_train_source": resolved_train_source,
+        "bad_scenes_excluded": len(bad_scenes),
         "train": split_summary(rows_by_split["train"], "structured3d"),
         "val": split_summary(rows_by_split["val"], "structured3d"),
         "test": split_summary(rows_by_split["test"], "structured3d"),
@@ -612,6 +634,29 @@ def read_name_set(path: Path) -> set[str]:
     if not path.exists():
         return set()
     return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+
+def read_bad_scene_set(path: Path | None, root: Path) -> set[str]:
+    if path in (None, ""):
+        return set()
+    requested = Path(path)
+    candidates = [requested]
+    if not requested.is_absolute():
+        candidates.append(root / requested)
+    resolved = next((candidate for candidate in candidates if candidate.exists()), None)
+    if resolved is None:
+        print(f"[WARN] Structured3D bad scene list not found: {path}")
+        return set()
+    scenes: set[str] = set()
+    for line in resolved.read_text(encoding="utf-8").splitlines():
+        value = line.strip()
+        if not value or value.startswith("#"):
+            continue
+        parts = Path(value).parts
+        scene = next((part for part in parts if part.startswith("scene_")), Path(value).name)
+        scenes.add(scene)
+    print(f"[INFO] loaded Structured3D bad scenes = {len(scenes)} from {resolved}")
+    return scenes
 
 
 def first_match(folder: Path, pattern: str) -> Path | None:

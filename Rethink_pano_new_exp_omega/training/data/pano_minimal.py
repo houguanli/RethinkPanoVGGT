@@ -93,6 +93,7 @@ class PanoMinimalDataset(Dataset):
         train_split_fraction: float = 0.95,
         split_seed: int = 42,
         datasets: Optional[str | Iterable[str]] = None,
+        bad_sample_list: Optional[str | Path] = None,
         dataset_sampling_weights: Optional[str | Dict[str, float]] = None,
         output_depth_scale: float = 1000.0,
         invalid_depth_value: Optional[float] = 65535.0,
@@ -120,6 +121,7 @@ class PanoMinimalDataset(Dataset):
         self.train_split_fraction = float(train_split_fraction)
         self.split_seed = int(split_seed)
         self.dataset_names = _parse_dataset_names(datasets)
+        self.bad_samples = _load_bad_samples(bad_sample_list, self.root)
         self.dataset_sampling_weights = _parse_dataset_sampling_weights(dataset_sampling_weights)
         self.output_depth_scale = float(output_depth_scale)
         self.invalid_depth_value = None if invalid_depth_value is None else float(invalid_depth_value)
@@ -218,9 +220,62 @@ class PanoMinimalDataset(Dataset):
             items.extend(_index_structured3d(self.root / "Structured3D", self.split, _STRUCTURED3D_DEPTH_SCALE))
         if "panocity" in self.dataset_names:
             items.extend(_index_panocity_official(self.root / "Panocity", self.split, _PANOCITY_DEPTH_SCALE))
+        if self.bad_samples:
+            before = len(items)
+            items = [
+                item
+                for item in items
+                if not _is_bad_sample(
+                    str(item.get("rgb_path", "")),
+                    str(item.get("depth_path", "")),
+                    str(item.get("scene_name", "")),
+                    self.bad_samples,
+                )
+            ]
+            skipped = before - len(items)
+            if skipped > 0:
+                print(f"[INFO] skipped bad minimal pano samples from bad_sample_list = {skipped}")
         if max_samples is not None:
             items = items[: int(max_samples)]
         return items
+
+
+def _load_bad_samples(path: Optional[str | Path], root: Path) -> set[str]:
+    if path in (None, ""):
+        return set()
+    requested = Path(path)
+    candidates = [requested]
+    if not requested.is_absolute():
+        candidates.append(root / requested)
+    resolved = next((candidate for candidate in candidates if candidate.exists()), None)
+    if resolved is None:
+        print(f"[WARN] minimal pano bad_sample_list not found: {path}")
+        return set()
+    values: set[str] = set()
+    with resolved.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            path_value = Path(value)
+            values.add(value)
+            values.add(path_value.name)
+            values.add(path_value.stem)
+    print(f"[INFO] loaded minimal pano bad sample entries = {len(values)} from {resolved}")
+    return values
+
+
+def _is_bad_sample(rgb_path: str, depth_path: str, scene_name: str, bad_samples: set[str]) -> bool:
+    if not bad_samples:
+        return False
+    keys: set[str] = {scene_name}
+    for raw in (rgb_path, depth_path):
+        path = Path(raw)
+        keys.add(str(path))
+        keys.add(path.name)
+        keys.add(path.stem)
+        keys.update(part for part in path.parts if part)
+    return bool(keys & bad_samples)
 
 
 def _parse_dataset_names(raw: Optional[str | Iterable[str]]) -> set[str]:
