@@ -36,7 +36,7 @@ from vggt_omega.models.heads.dense_head import DenseHead  # noqa: E402
 from vggt_omega.models.layers import PatchEmbed  # noqa: E402
 from vggt_omega.models.layers.pano_position import pinhole_rays  # noqa: E402
 from vggt_omega.models.vggt_omega_luna import VGGTOmega_LUNA  # noqa: E402
-from vggt_omega.utils.rotation import mat_to_quat, quat_to_mat  # noqa: E402
+from vggt_omega.utils.rotation import mat_to_quat  # noqa: E402
 
 
 DEFAULT_DATASET_ROOT = Path("whitehole/AOKI/datasets/PANO_LUNA_omega")
@@ -1858,7 +1858,6 @@ def camera_alignment_loss(
         loss_t, loss_r, loss_consistency = pano_relative_pose_loss(
             pred_translation=pred_translation,
             pred_quat=pred_quat,
-            rotations_c2w=rotations_c2w,
             batch=batch,
             position_mode=position_mode,
             consistency_weight=pano_consistency_weight,
@@ -1913,134 +1912,168 @@ def camera_alignment_loss(
 def pano_relative_pose_loss(
     pred_translation: torch.Tensor,
     pred_quat: torch.Tensor,
-    rotations_c2w: torch.Tensor,
     batch: Dict,
     position_mode: str,
     consistency_weight: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # A multi-pano sample is flattened as [pano0 windows, pano1 windows, ...].
-    # The camera head still predicts one pose per virtual pinhole window, but the
-    # supervision here is pano-level: use predicted window rotation to recover
-    # the shared ERP camera center, and remove known yaw/pitch window rotation to
-    # recover each pano camera rotation. Targets are relative to pano0.
-    pred_window_w2c = quat_to_mat(F.normalize(pred_quat, dim=-1))
-    pred_window_c2w = pred_window_w2c.transpose(-1, -2).contiguous()
-    loss_t, loss_consistency = pano_relative_translation_loss(
-        pred_translation=pred_translation,
-        camera_c2w=pred_window_c2w,
+    # In pano_relative mode the camera head output is treated as a pano-level
+    # pose estimate. The repeated yaw/pitch windows for one pano are supervised
+    # against the same ERP camera target; window yaw/pitch only affects image
+    # sampling and LUNA metadata, not the camera target.
+    targets = build_relative_pano_pose_targets(
         batch=batch,
         position_mode=position_mode,
+        device=pred_translation.device,
+        dtype=pred_translation.dtype,
+    )
+    if targets is None:
+        zero = pred_translation.new_zeros(())
+        return zero, zero, zero
+    target_translation, target_quat, rotation_valid = targets
+    loss_t, loss_consistency = repeated_pano_translation_loss(
+        pred_translation=pred_translation,
+        target_translation=target_translation,
         consistency_weight=consistency_weight,
     )
-    loss_r = pano_relative_rotation_loss(
-        pred_window_c2w=pred_window_c2w,
-        rotations_c2w=rotations_c2w,
-        batch=batch,
+    loss_r = repeated_pano_rotation_loss(
+        pred_quat=pred_quat,
+        target_quat=target_quat,
+        rotation_valid=rotation_valid,
     )
     return loss_t, loss_r, loss_consistency
 
 
-def pano_relative_translation_loss(
+def repeated_pano_translation_loss(
     pred_translation: torch.Tensor,
-    camera_c2w: torch.Tensor,
-    batch: Dict,
-    position_mode: str,
+    target_translation: torch.Tensor,
     consistency_weight: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    pano_position = batch.get("pano_position_m", None)
-    if pano_position is None:
-        zero = pred_translation.new_zeros(())
-        return zero, zero
-
-    target_centers = build_relative_pano_centers(
-        pano_position=pano_position,
-        reference=position_mode,
-        device=pred_translation.device,
-        dtype=pred_translation.dtype,
-    )
-    if target_centers.ndim != 3 or target_centers.shape[1] < 2:
+    if target_translation.ndim != 3 or target_translation.shape[1] < 2:
         zero = pred_translation.new_zeros(())
         return zero, zero
 
     batch_size, total_views = pred_translation.shape[:2]
-    num_panos = target_centers.shape[1]
+    num_panos = target_translation.shape[1]
     if total_views % num_panos != 0:
         raise ValueError(f"Cannot map {total_views} views to {num_panos} panos.")
 
     views_per_pano = total_views // num_panos
-    pred_centers = (-(camera_c2w @ pred_translation[..., None])[..., 0]).reshape(
+    pred_per_pano = pred_translation.reshape(
         batch_size,
         num_panos,
         views_per_pano,
         3,
     )
-    pred_pano_centers = pred_centers.mean(dim=2)
-    loss_center = (pred_pano_centers - target_centers).abs().mean()
-    loss_consistency = (pred_centers - pred_pano_centers[:, :, None, :]).abs().mean()
-    return loss_center + consistency_weight * loss_consistency, loss_consistency
+    target = target_translation[:, :, None, :]
+    loss_pose = (pred_per_pano - target).abs().mean()
+    pred_mean = pred_per_pano.mean(dim=2)
+    loss_consistency = (pred_per_pano - pred_mean[:, :, None, :]).abs().mean()
+    return loss_pose + consistency_weight * loss_consistency, loss_consistency
 
 
-def pano_relative_rotation_loss(
-    pred_window_c2w: torch.Tensor,
-    rotations_c2w: torch.Tensor,
-    batch: Dict,
+def repeated_pano_rotation_loss(
+    pred_quat: torch.Tensor,
+    target_quat: torch.Tensor,
+    rotation_valid: torch.Tensor,
 ) -> torch.Tensor:
-    pano_rotation = batch.get("pano_rotation_c2w", None)
-    if pano_rotation is None:
-        return pred_window_c2w.new_zeros(())
-
-    target_pano_c2w = pano_rotation.to(device=pred_window_c2w.device, dtype=pred_window_c2w.dtype)
-    if target_pano_c2w.ndim == 2:
-        target_pano_c2w = target_pano_c2w[None, None, :, :]
-    elif target_pano_c2w.ndim == 3:
-        target_pano_c2w = target_pano_c2w[:, None, :, :]
-    if target_pano_c2w.ndim != 4 or target_pano_c2w.shape[-2:] != (3, 3):
-        return pred_window_c2w.new_zeros(())
-
-    batch_size, total_views = pred_window_c2w.shape[:2]
-    num_panos = target_pano_c2w.shape[1]
+    if target_quat.ndim != 3 or rotation_valid.ndim != 2:
+        return pred_quat.new_zeros(())
+    batch_size, total_views = pred_quat.shape[:2]
+    num_panos = target_quat.shape[1]
     if num_panos < 2 or total_views % num_panos != 0:
-        return pred_window_c2w.new_zeros(())
-
-    rotation_valid = batch.get("pano_rotation_valid", None)
-    if rotation_valid is None:
-        valid = torch.ones(batch_size, num_panos, device=pred_window_c2w.device, dtype=torch.bool)
-    else:
-        valid = rotation_valid.to(device=pred_window_c2w.device).bool()
-        if valid.ndim == 1:
-            valid = valid[None, :]
-        elif valid.ndim == 0:
-            valid = valid.reshape(1, 1).expand(batch_size, num_panos)
+        return pred_quat.new_zeros(())
+    valid = rotation_valid.to(device=pred_quat.device).bool()
     if valid.shape != (batch_size, num_panos):
-        return pred_window_c2w.new_zeros(())
-    valid = (valid & valid[:, :1]).clone()
-    valid[:, 0] = False
+        return pred_quat.new_zeros(())
+    valid = valid & valid[:, :1]
     if not bool(valid.any()):
-        return pred_window_c2w.new_zeros(())
+        return pred_quat.new_zeros(())
 
     views_per_pano = total_views // num_panos
-    pred_pano_c2w = (pred_window_c2w @ rotations_c2w.transpose(-1, -2)).reshape(
+    pred = F.normalize(pred_quat, dim=-1).reshape(
         batch_size,
         num_panos,
         views_per_pano,
-        3,
-        3,
+        4,
     )
-
-    pred_anchor_c2w = pred_pano_c2w[:, :1]
-    pred_rel = pred_anchor_c2w.transpose(-1, -2) @ pred_pano_c2w
-    target_anchor_c2w = target_pano_c2w[:, :1]
-    target_rel = target_anchor_c2w.transpose(-1, -2) @ target_pano_c2w
-    target_rel = target_rel[:, :, None].expand(batch_size, num_panos, views_per_pano, 3, 3)
-
-    pred_rel_quat = F.normalize(mat_to_quat(pred_rel), dim=-1)
-    target_rel_quat = F.normalize(mat_to_quat(target_rel), dim=-1)
+    target = F.normalize(target_quat, dim=-1)[:, :, None, :]
     per_view_loss = torch.minimum(
-        (pred_rel_quat - target_rel_quat).abs().sum(dim=-1),
-        (pred_rel_quat + target_rel_quat).abs().sum(dim=-1),
+        (pred - target).abs().sum(dim=-1),
+        (pred + target).abs().sum(dim=-1),
     )
     mask = valid[:, :, None].expand_as(per_view_loss)
     return per_view_loss[mask].mean()
+
+
+def build_relative_pano_pose_targets(
+    batch: Dict,
+    position_mode: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    pano_position = batch.get("pano_position_m", None)
+    if pano_position is None:
+        return None
+    centers = pano_position.to(device=device, dtype=dtype)
+    if centers.ndim == 1:
+        centers = centers[None, None, :]
+    elif centers.ndim == 2:
+        centers = centers[:, None, :]
+    if centers.ndim != 3 or centers.shape[1] < 2:
+        return None
+
+    pano_rotation = batch.get("pano_rotation_c2w", None)
+    if pano_rotation is None:
+        rotations_c2w = torch.eye(3, device=device, dtype=dtype).reshape(1, 1, 3, 3).expand(
+            centers.shape[0],
+            centers.shape[1],
+            3,
+            3,
+        )
+        rotation_valid = torch.zeros(centers.shape[:2], device=device, dtype=torch.bool)
+    else:
+        rotations_c2w = pano_rotation.to(device=device, dtype=dtype)
+        if rotations_c2w.ndim == 2:
+            rotations_c2w = rotations_c2w[None, None, :, :]
+        elif rotations_c2w.ndim == 3:
+            rotations_c2w = rotations_c2w[:, None, :, :]
+        if rotations_c2w.shape[:2] != centers.shape[:2] or rotations_c2w.shape[-2:] != (3, 3):
+            return None
+        rotation_valid_raw = batch.get("pano_rotation_valid", None)
+        if rotation_valid_raw is None:
+            rotation_valid = torch.ones(centers.shape[:2], device=device, dtype=torch.bool)
+        else:
+            rotation_valid = rotation_valid_raw.to(device=device).bool()
+            if rotation_valid.ndim == 1:
+                rotation_valid = rotation_valid[None, :]
+            elif rotation_valid.ndim == 0:
+                rotation_valid = rotation_valid.reshape(1, 1).expand(*centers.shape[:2])
+        if rotation_valid.shape != centers.shape[:2]:
+            return None
+
+    if position_mode in {"none", "local_zero"}:
+        target_centers = torch.zeros_like(centers)
+        target_rotations_c2w = torch.eye(3, device=device, dtype=dtype).reshape(1, 1, 3, 3).expand_as(rotations_c2w)
+        rotation_valid = torch.zeros_like(rotation_valid)
+    elif position_mode == "relative_anchor":
+        anchor_w2c = rotations_c2w[:, :1].transpose(-1, -2)
+        target_centers = (anchor_w2c @ (centers - centers[:, :1])[..., None])[..., 0]
+        target_rotations_c2w = anchor_w2c @ rotations_c2w
+        rotation_valid = rotation_valid & rotation_valid[:, :1]
+    elif position_mode == "relative_mean":
+        target_centers = centers - centers.mean(dim=1, keepdim=True)
+        target_rotations_c2w = rotations_c2w
+    elif position_mode == "world":
+        target_centers = centers
+        target_rotations_c2w = rotations_c2w
+    else:
+        raise ValueError(f"Unknown camera-position-mode: {position_mode}")
+
+    target_rotations_w2c = target_rotations_c2w.transpose(-1, -2).contiguous()
+    target_translation = (-(target_rotations_w2c @ target_centers[..., None])[..., 0]).contiguous()
+    target_quat = F.normalize(mat_to_quat(target_rotations_w2c), dim=-1)
+    return target_translation, target_quat, rotation_valid
 
 
 def build_relative_pano_centers(
