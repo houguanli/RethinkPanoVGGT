@@ -590,7 +590,7 @@ class Trainer:
 
             # compute gradient and do SGD step
             assert data_iter <= limit_train_batches  # allow for off by one errors
-            exact_epoch = self.epoch + float(data_iter) / limit_train_batches
+            exact_epoch = self.epoch + float(data_iter) / max(1, limit_train_batches)
             self.where = float(exact_epoch) / self.max_epochs
             
             assert self.where <= 1 + self.EPSILON
@@ -606,7 +606,8 @@ class Trainer:
             if self.steps[phase] % self.logging_conf.log_freq == 0:
                 for i, optim in enumerate(self.optims):
                     for j, param_group in enumerate(optim.optimizer.param_groups):
-                        for option in optim.schedulers[j]:
+                        scheduler_options = optim.schedulers[j] if optim.schedulers is not None else {}
+                        for option in scheduler_options:
                             optim_prefix = (
                                 f"{i}_"
                                 if len(self.optims) > 1
