@@ -25,6 +25,7 @@ CALIB_JSON="$BASE_OUT/depth_scale_calibration.json"
 CALIB_LOG="$BASE_OUT/depth_scale_calibration.log"
 CALIB_SAMPLES_PER_DATASET="${CALIB_SAMPLES_PER_DATASET:-8}"
 CALIB_MAX_PIXELS_PER_SAMPLE="${CALIB_MAX_PIXELS_PER_SAMPLE:-50000}"
+NUM_YAW="${NUM_YAW:-4}"
 
 LUNA_CONFIG="configs/multipano_rtx5000x4_mixed4_pano_all384_luna_after_full_warmup_9h.yaml"
 LUNA_OUT="$LUNA/logs/mixed4_pano_all384_4xrtx5000_multipano_after_full_warmup_9h"
@@ -46,6 +47,7 @@ mkdir -p "$BASE_OUT" "$LUNA_OUT"
   echo "[sequence] panovggt_root=$PANOVGGT_ROOT"
   echo "[sequence] base_checkpoint=$BASE_CHECKPOINT"
   echo "[sequence] calibration_samples_per_dataset=$CALIB_SAMPLES_PER_DATASET"
+  echo "[sequence] num_yaw=$NUM_YAW"
 } | tee -a "$SEQ_LOG"
 
 echo "[sequence] building mixed4 official indexes under $PANOVGGT_ROOT $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
@@ -68,7 +70,7 @@ if [[ "${SKIP_CALIBRATION:-0}" != "1" ]]; then
     --max-pixels-per-sample "$CALIB_MAX_PIXELS_PER_SAMPLE" \
     --image-size 384 \
     --patch-size 16 \
-    --num-yaw 8 \
+    --num-yaw "$NUM_YAW" \
     --pitch-degrees -15.0 \
     --fov-degrees 75.0 \
     --depth-max-m 80.0 \

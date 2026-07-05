@@ -20,6 +20,7 @@ CALIB_JSON="$BASE_OUT/depth_scale_calibration.json"
 CALIB_LOG="$BASE_OUT/depth_scale_calibration.log"
 CALIB_SAMPLES_PER_DATASET="${CALIB_SAMPLES_PER_DATASET:-8}"
 CALIB_MAX_PIXELS_PER_SAMPLE="${CALIB_MAX_PIXELS_PER_SAMPLE:-50000}"
+NUM_YAW="${NUM_YAW:-4}"
 EVAL_LIMIT_PER_DATASET="${EVAL_LIMIT_PER_DATASET:-0}"
 EVAL_SUFFIX="valtestfull"
 if [[ "$EVAL_LIMIT_PER_DATASET" != "0" ]]; then
@@ -46,6 +47,7 @@ mkdir -p "$BASE_OUT" "$LUNA_OUT"
   echo "[sequence] cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
   echo "[sequence] panovggt_root=$PANOVGGT_ROOT"
   echo "[sequence] calibration_samples_per_dataset=$CALIB_SAMPLES_PER_DATASET"
+  echo "[sequence] num_yaw=$NUM_YAW"
   echo "[sequence] eval_limit_per_dataset=$EVAL_LIMIT_PER_DATASET"
 } | tee -a "$SEQ_LOG"
 
@@ -69,7 +71,7 @@ if [[ "${SKIP_CALIBRATION:-0}" != "1" ]]; then
     --max-pixels-per-sample "$CALIB_MAX_PIXELS_PER_SAMPLE" \
     --image-size 384 \
     --patch-size 16 \
-    --num-yaw 8 \
+    --num-yaw "$NUM_YAW" \
     --pitch-degrees -15.0 \
     --fov-degrees 75.0 \
     --depth-max-m 80.0 \

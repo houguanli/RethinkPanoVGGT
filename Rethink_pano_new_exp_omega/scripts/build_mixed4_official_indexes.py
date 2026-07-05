@@ -219,6 +219,7 @@ def build_panocity_from_official_splits(root: Path, split_paths: dict[str, Path]
 
 def expand_panocity_official_split_rows(root: Path, split_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    pose_cache: dict[Path, dict[str, list[float]]] = {}
     for split_row in split_rows:
         if not isinstance(split_row, dict):
             continue
@@ -226,6 +227,8 @@ def expand_panocity_official_split_rows(root: Path, split_rows: list[dict[str, A
         block = str(split_row.get("block") or "")
         rgb_paths = split_row.get("pano_images") or []
         depth_paths = split_row.get("panodepth_images") or []
+        pose_path = root / str(split_row.get("poses_file") or "")
+        pose_by_name = load_panocity_pose_positions(pose_path, pose_cache)
         if not scene or not block:
             continue
         if len(rgb_paths) != len(depth_paths):
@@ -234,6 +237,13 @@ def expand_panocity_official_split_rows(root: Path, split_rows: list[dict[str, A
         for rgb_value, depth_value in zip(rgb_paths, depth_paths):
             rgb_rel = Path(str(rgb_value))
             depth_rel = Path(str(depth_value))
+            position = (
+                pose_by_name.get(rgb_rel.name)
+                or pose_by_name.get(depth_rel.name)
+                or pose_by_name.get(rgb_rel.stem)
+                or pose_by_name.get(depth_rel.stem)
+                or [0.0, 0.0, 0.0]
+            )
             rows.append(
                 {
                     "dataset": "Panocity",
@@ -242,7 +252,7 @@ def expand_panocity_official_split_rows(root: Path, split_rows: list[dict[str, A
                     "scene_name": f"{scene}_{block}_{rgb_rel.stem}",
                     "rgb_path": str(rgb_rel),
                     "depth_path": str(depth_rel),
-                    "pano_position_m": [0.0, 0.0, 0.0],
+                    "pano_position_m": position,
                 }
             )
     return rows
@@ -334,6 +344,35 @@ def build_panocity_rows(root: Path) -> list[dict[str, Any]]:
                 }
             )
     return rows
+
+
+def load_panocity_pose_positions(pose_path: Path, cache: dict[Path, dict[str, list[float]]]) -> dict[str, list[float]]:
+    if not pose_path.is_file():
+        return {}
+    pose_path = pose_path.resolve()
+    if pose_path in cache:
+        return cache[pose_path]
+    try:
+        payload = json.loads(pose_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"[WARN] skipping malformed Panocity pose file {pose_path}: {exc}")
+        cache[pose_path] = {}
+        return cache[pose_path]
+    positions: dict[str, list[float]] = {}
+    frames = payload.get("frames", []) if isinstance(payload, dict) else []
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        position = translation_from_matrix(frame.get("transformation_matrix") or [])
+        for key in (frame.get("name"), frame.get("depth")):
+            if not key:
+                continue
+            path_key = Path(str(key))
+            positions[str(key)] = position
+            positions[path_key.name] = position
+            positions[path_key.stem] = position
+    cache[pose_path] = positions
+    return positions
 
 
 def build_matterport3d(root: Path) -> dict[str, Any]:

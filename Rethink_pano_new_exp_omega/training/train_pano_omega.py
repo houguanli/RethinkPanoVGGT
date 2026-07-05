@@ -1936,6 +1936,9 @@ def pano_relative_translation_loss(
         raise ValueError(f"Cannot map {total_views} views to {num_panos} panos.")
 
     views_per_pano = total_views // num_panos
+    # The camera head predicts one pose per virtual yaw/pitch window. For multi-pano
+    # supervision we convert each window pose back to its panorama camera center,
+    # then supervise the shared pano center instead of a window-specific target.
     pred_centers = (-(rotations_c2w @ pred_translation[..., None])[..., 0]).reshape(
         batch_size,
         num_panos,

@@ -534,6 +534,8 @@ def _index_panocity_official(root: Path, split: str, scale: float) -> List[Dict]
     if not rows and split == "all":
         rows = build_panocity_official_rows(root)
     items: List[Dict] = []
+    pose_cache: Dict[Path, Dict[str, List[float]]] = {}
+    pose_path_cache: Dict[Tuple[str, str, str], Path] = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -541,13 +543,14 @@ def _index_panocity_official(root: Path, split: str, scale: float) -> List[Dict]
         depth_path = _resolve_cached_path(root, row.get("depth_path"))
         if rgb_path is None or depth_path is None:
             continue
+        position = _panocity_position_from_row(root, row, rgb_path, depth_path, pose_cache, pose_path_cache)
         items.append(
             _item(
                 "Panocity",
                 str(row.get("scene_name") or rgb_path.stem),
                 rgb_path,
                 depth_path,
-                [float(value) for value in row.get("pano_position_m", [0.0, 0.0, 0.0])[:3]],
+                position,
                 scale,
             )
         )
@@ -621,6 +624,100 @@ def _translation_from_matrix(matrix: object) -> List[float]:
     except (TypeError, ValueError, IndexError):
         pass
     return [0.0, 0.0, 0.0]
+
+
+def _panocity_position_from_row(
+    root: Path,
+    row: Dict,
+    rgb_path: Path,
+    depth_path: Path,
+    pose_cache: Dict[Path, Dict[str, List[float]]],
+    pose_path_cache: Dict[Tuple[str, str, str], Path],
+) -> List[float]:
+    position = _coerce_position(row.get("pano_position_m"))
+    if not _is_zero_position(position):
+        return position
+
+    pose_path = _panocity_pose_path(root, row, rgb_path, pose_path_cache)
+    pose_positions = _load_panocity_pose_positions(pose_path, pose_cache)
+    for key in (rgb_path.name, depth_path.name, rgb_path.stem, depth_path.stem):
+        if key in pose_positions:
+            return pose_positions[key]
+    return position
+
+
+def _coerce_position(raw: object) -> List[float]:
+    try:
+        values = list(raw) if raw is not None else []
+        if len(values) >= 3:
+            return [float(values[0]), float(values[1]), float(values[2])]
+    except (TypeError, ValueError):
+        pass
+    return [0.0, 0.0, 0.0]
+
+
+def _is_zero_position(position: List[float]) -> bool:
+    return all(abs(float(value)) <= 1e-8 for value in position[:3])
+
+
+def _panocity_pose_path(
+    root: Path,
+    row: Dict,
+    rgb_path: Path,
+    pose_path_cache: Dict[Tuple[str, str, str], Path],
+) -> Path:
+    pose_value = row.get("poses_file")
+    if pose_value not in (None, ""):
+        pose_path = Path(str(pose_value))
+        return pose_path if pose_path.is_absolute() else root / pose_path
+    block_dir = rgb_path.parents[1] if rgb_path.parent.name == "pano_images" else rgb_path.parent
+    city = str(row.get("city") or block_dir.parent.name)
+    block = str(row.get("block") or block_dir.name)
+    cache_key = (str(block_dir), city, block)
+    if cache_key in pose_path_cache:
+        return pose_path_cache[cache_key]
+    block_suffix = block[len(city) + 1 :] if block.startswith(f"{city}_") else block
+    direct = block_dir / f"{city}_Pano_{block_suffix}_poses.json"
+    if direct.exists():
+        pose_path_cache[cache_key] = direct
+        return direct
+    candidates = sorted(block_dir.glob("*_poses.json"))
+    resolved = candidates[0] if candidates else block_dir / "_missing_poses.json"
+    pose_path_cache[cache_key] = resolved
+    return resolved
+
+
+def _load_panocity_pose_positions(
+    pose_path: Path,
+    cache: Dict[Path, Dict[str, List[float]]],
+) -> Dict[str, List[float]]:
+    if not pose_path.is_file():
+        return {}
+    pose_path = pose_path.resolve()
+    if pose_path in cache:
+        return cache[pose_path]
+    try:
+        payload = json.loads(pose_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"[WARN] skipping malformed Panocity pose file {pose_path}: {exc}")
+        cache[pose_path] = {}
+        return cache[pose_path]
+
+    positions: Dict[str, List[float]] = {}
+    frames = payload.get("frames", []) if isinstance(payload, dict) else []
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        position = _translation_from_matrix(frame.get("transformation_matrix") or [])
+        for key in (frame.get("name"), frame.get("depth")):
+            if not key:
+                continue
+            path_key = Path(str(key))
+            positions[str(key)] = position
+            positions[path_key.name] = position
+            positions[path_key.stem] = position
+    cache[pose_path] = positions
+    return positions
 
 
 def _read_json_list(path: Path) -> List:
