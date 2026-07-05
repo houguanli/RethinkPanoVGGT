@@ -10,6 +10,7 @@ import json
 import math
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -253,6 +254,9 @@ def evaluate_run(
     per_sample_rows: list[dict[str, Any]],
     shard_rank: int = 0,
     num_shards: int = 1,
+    progress_file: Path | None = None,
+    progress_every: int = 25,
+    progress_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if int(num_shards) < 1:
         raise ValueError(f"num_shards must be >= 1, got {num_shards}")
@@ -267,6 +271,22 @@ def evaluate_run(
     dataset = build_dataset(eval_args, pano_size)
     indices = sample_indices(len(dataset), limit, seed)
     selected_indices = indices[int(shard_rank) :: int(num_shards)]
+    write_eval_progress(
+        progress_file,
+        {
+            **(progress_context or {}),
+            "state": "running",
+            "run": name,
+            "split": split,
+            "dataset_size": len(dataset),
+            "candidate_samples": len(indices),
+            "shard_samples": len(selected_indices),
+            "processed_samples": 0,
+            "shard_rank": int(shard_rank),
+            "num_shards": int(num_shards),
+            "updated_at": time.time(),
+        },
+    )
     subset = Subset(dataset, selected_indices)
     loader = DataLoader(
         subset,
@@ -339,8 +359,29 @@ def evaluate_run(
             }
             rows.append(row)
             per_sample_rows.append(row)
+            processed = local_index + 1
+            if progress_file is not None and (processed == 1 or processed == len(selected_indices) or processed % max(int(progress_every), 1) == 0):
+                write_eval_progress(
+                    progress_file,
+                    {
+                        **(progress_context or {}),
+                        "state": "running",
+                        "run": name,
+                        "split": split,
+                        "dataset_size": len(dataset),
+                        "candidate_samples": len(indices),
+                        "shard_samples": len(selected_indices),
+                        "processed_samples": processed,
+                        "last_dataset_index": int(selected_indices[local_index]),
+                        "last_loss": row["loss"],
+                        "last_depth_irls_abs_rel": row["depth_irls_abs_rel"],
+                        "shard_rank": int(shard_rank),
+                        "num_shards": int(num_shards),
+                        "updated_at": time.time(),
+                    },
+                )
 
-    return {
+    result = {
         "name": name,
         "split": split,
         "curriculum_bins": curriculum_bins or "all",
@@ -368,6 +409,32 @@ def evaluate_run(
             "by_depth_irls_delta_1p25": rank_samples(rows, "depth_irls_delta_1p25", reverse=False),
         },
     }
+    write_eval_progress(
+        progress_file,
+        {
+            **(progress_context or {}),
+            "state": "done",
+            "run": name,
+            "split": split,
+            "dataset_size": len(dataset),
+            "candidate_samples": len(indices),
+            "shard_samples": len(selected_indices),
+            "processed_samples": len(rows),
+            "shard_rank": int(shard_rank),
+            "num_shards": int(num_shards),
+            "updated_at": time.time(),
+        },
+    )
+    return result
+
+
+def write_eval_progress(path: Path | None, payload: dict[str, Any]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def compute_depth_metrics(pred_depth: torch.Tensor, target_depth: torch.Tensor, target_valid: torch.Tensor) -> dict[str, float]:

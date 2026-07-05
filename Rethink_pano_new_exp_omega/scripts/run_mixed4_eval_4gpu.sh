@@ -16,8 +16,12 @@ EVAL_DATASETS="${EVAL_DATASETS:-all}"
 NUM_WORKERS_PER_GPU="${NUM_WORKERS_PER_GPU:-2}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
 SEED="${SEED:-123}"
+PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
+PROGRESS_INTERVAL_SECONDS="${PROGRESS_INTERVAL_SECONDS:-30}"
+SHOW_PROGRESS="${SHOW_PROGRESS:-1}"
 
-mkdir -p "$EVAL_OUT/shards"
+mkdir -p "$EVAL_OUT/shards" "$EVAL_OUT/progress"
+rm -f "$EVAL_OUT"/progress/shard_*.json
 
 EVAL_CHECKPOINT="$CHECKPOINT"
 if [[ -n "${BASE_CHECKPOINT_OVERRIDE:-}" ]]; then
@@ -58,18 +62,45 @@ fi
   echo "[eval-4gpu] gpus=$GPUS num_shards=$NUM_SHARDS"
   echo "[eval-4gpu] datasets=$EVAL_DATASETS"
   echo "[eval-4gpu] limit_per_dataset=$LIMIT_PER_DATASET"
+  echo "[eval-4gpu] progress_interval_seconds=$PROGRESS_INTERVAL_SECONDS"
 } | tee "$EVAL_OUT/eval_4gpu.log"
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi -L 2>/dev/null | sed 's/^/[eval-4gpu][gpu] /' | tee -a "$EVAL_OUT/eval_4gpu.log" || true
+fi
 
 cd "$LUNA"
 PIDS=()
+trap 'echo "[eval-4gpu] interrupted; terminating shard processes" | tee -a "$EVAL_OUT/eval_4gpu.log"; for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done' INT TERM
 for rank in "${!GPU_LIST[@]}"; do
   gpu="${GPU_LIST[$rank]}"
   shard_json="$EVAL_OUT/shards/shard_${rank}.json"
   shard_csv="$EVAL_OUT/shards/shard_${rank}.csv"
   shard_log="$EVAL_OUT/shards/shard_${rank}.log"
+  progress_file="$EVAL_OUT/progress/shard_${rank}.json"
   echo "[eval-4gpu] launching shard $rank/$NUM_SHARDS on gpu=$gpu" | tee -a "$EVAL_OUT/eval_4gpu.log"
+  "$PYTHON" - "$progress_file" "$rank" "$NUM_SHARDS" "$gpu" <<'PY'
+import json
+import os
+import sys
+import time
+
+path, rank, num_shards, gpu = sys.argv[1:5]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "state": "launched",
+            "shard_rank": int(rank),
+            "num_shards": int(num_shards),
+            "cuda_visible_devices": str(gpu),
+            "processed_samples": 0,
+            "updated_at": time.time(),
+        },
+        handle,
+    )
+PY
   (
-    CUDA_VISIBLE_DEVICES="$gpu" PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/evaluate_mixed4_depth_checkpoint.py \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$gpu" PYTHONUNBUFFERED=1 PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/evaluate_mixed4_depth_checkpoint.py \
       --config "$CONFIG" \
       --checkpoint "$EVAL_CHECKPOINT" \
       --output "$shard_json" \
@@ -83,10 +114,83 @@ for rank in "${!GPU_LIST[@]}"; do
       --seed "$SEED" \
       --num-shards "$NUM_SHARDS" \
       --shard-rank "$rank" \
+      --progress-file "$progress_file" \
+      --progress-every "$PROGRESS_EVERY" \
       --no-progress
   ) >"$shard_log" 2>&1 &
-  PIDS+=("$!")
+  child_pid="$!"
+  PIDS+=("$child_pid")
+  "$PYTHON" - "$progress_file" "$child_pid" <<'PY'
+import json
+import sys
+import time
+
+path, pid = sys.argv[1:3]
+try:
+    payload = json.load(open(path, "r", encoding="utf-8"))
+except Exception:
+    payload = {}
+payload["pid"] = int(pid)
+payload["updated_at"] = time.time()
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False)
+PY
+  echo "[eval-4gpu] shard $rank pid=$child_pid log=$shard_log progress=$progress_file" | tee -a "$EVAL_OUT/eval_4gpu.log"
 done
+
+if [[ "$SHOW_PROGRESS" == "1" ]]; then
+  while true; do
+    alive=0
+    for pid in "${PIDS[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        alive=1
+        break
+      fi
+    done
+    "$PYTHON" - "$EVAL_OUT/progress" "$NUM_SHARDS" <<'PY' | tee -a "$EVAL_OUT/eval_4gpu.log"
+import datetime as _dt
+import glob
+import json
+import os
+import sys
+import time
+
+progress_dir = sys.argv[1]
+num_shards = int(sys.argv[2])
+now = time.time()
+items = []
+for rank in range(num_shards):
+    path = os.path.join(progress_dir, f"shard_{rank}.json")
+    if not os.path.exists(path):
+        items.append(f"rank{rank}:missing")
+        continue
+    try:
+        payload = json.load(open(path, "r", encoding="utf-8"))
+    except Exception as exc:
+        items.append(f"rank{rank}:bad_progress:{exc}")
+        continue
+    state = payload.get("state", "?")
+    run = payload.get("run", "-")
+    done = int(payload.get("processed_samples", 0) or 0)
+    total = int(payload.get("shard_samples", 0) or 0)
+    gpu = payload.get("cuda_visible_devices", "")
+    pid = payload.get("pid", "")
+    age = now - float(payload.get("updated_at", now) or now)
+    loss = payload.get("last_loss")
+    loss_text = f" loss={float(loss):.4g}" if isinstance(loss, (float, int)) else ""
+    items.append(f"rank{rank}@gpu{gpu}:pid={pid} {state} {run} {done}/{total} age={age:.0f}s{loss_text}")
+stamp = _dt.datetime.now().isoformat(timespec="seconds")
+print(f"[eval-4gpu][progress] {stamp} " + " | ".join(items))
+PY
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      nvidia-smi --query-compute-apps=gpu_bus_id,pid,used_memory --format=csv,noheader,nounits 2>/dev/null \
+        | sed 's/^/[eval-4gpu][gpu-proc] /' \
+        | tee -a "$EVAL_OUT/eval_4gpu.log" || true
+    fi
+    [[ "$alive" -eq 0 ]] && break
+    sleep "$PROGRESS_INTERVAL_SECONDS"
+  done
+fi
 
 status=0
 for pid in "${PIDS[@]}"; do

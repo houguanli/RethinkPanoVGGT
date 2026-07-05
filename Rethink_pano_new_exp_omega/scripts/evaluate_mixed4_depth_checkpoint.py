@@ -12,7 +12,9 @@ import argparse
 import copy
 import csv
 import json
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,7 @@ from scripts.evaluate_depth_checkpoint import (  # noqa: E402
     read_train_loss_reference,
     summarize_metric_rows,
     summarize_panovggt_rows,
+    write_eval_progress,
 )
 from training.train_pano_omega import (  # noqa: E402
     parse_args as parse_training_args,
@@ -83,6 +86,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default=None)
     parser.add_argument("--num-shards", type=int, default=1, help="Split each dataset over this many independent eval workers.")
     parser.add_argument("--shard-rank", type=int, default=0, help="Shard id for this worker, in [0, num_shards).")
+    parser.add_argument("--progress-file", type=Path, default=None, help="Optional JSON file updated periodically with shard progress.")
+    parser.add_argument("--progress-every", type=int, default=25, help="Samples between progress-file updates.")
     parser.add_argument("--progress", action="store_true", default=True)
     parser.add_argument("--no-progress", dest="progress", action="store_false")
     return parser
@@ -92,6 +97,19 @@ def main() -> None:
     args = build_parser().parse_args()
     set_seed(args.seed)
     device = resolve_device(args.device, {"distributed": False, "local_rank": 0})
+    write_eval_progress(
+        args.progress_file,
+        {
+            "state": "initializing_model",
+            "pid": os.getpid(),
+            "shard_rank": int(args.shard_rank),
+            "num_shards": int(args.num_shards),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            "torch_cuda_device_count": torch_cuda_device_count(),
+            "requested_datasets": str(args.datasets),
+            "updated_at": time.time(),
+        },
+    )
 
     train_args = parse_training_args(["--config", str(args.config)])
     train_args.device = args.device
@@ -109,6 +127,19 @@ def main() -> None:
     model.eval()
 
     selected_datasets = select_datasets(args.datasets)
+    write_eval_progress(
+        args.progress_file,
+        {
+            "state": "model_ready",
+            "pid": os.getpid(),
+            "shard_rank": int(args.shard_rank),
+            "num_shards": int(args.num_shards),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            "torch_cuda_device_count": torch_cuda_device_count(),
+            "selected_datasets": sorted(selected_datasets),
+            "updated_at": time.time(),
+        },
+    )
     runs: list[dict[str, Any]] = []
     per_sample_rows: list[dict[str, Any]] = []
     for dataset_index, (display_name, minimal_name, split) in enumerate(DATASETS):
@@ -133,6 +164,14 @@ def main() -> None:
             per_sample_rows=per_sample_rows,
             shard_rank=args.shard_rank,
             num_shards=args.num_shards,
+            progress_file=args.progress_file,
+            progress_every=args.progress_every,
+            progress_context={
+                "pid": os.getpid(),
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+                "torch_cuda_device_count": torch_cuda_device_count(),
+                "selected_datasets": sorted(selected_datasets),
+            },
         )
         run["dataset"] = display_name
         run["minimal_dataset"] = minimal_name
@@ -203,6 +242,15 @@ def select_datasets(raw: str) -> set[str]:
     if not selected:
         raise ValueError("No datasets selected")
     return selected
+
+
+def torch_cuda_device_count() -> int:
+    try:
+        import torch
+
+        return int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:
+        return 0
 
 
 def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
