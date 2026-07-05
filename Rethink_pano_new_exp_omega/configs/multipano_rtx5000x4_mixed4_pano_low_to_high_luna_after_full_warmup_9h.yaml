@@ -58,7 +58,7 @@ supervision:
   camera_supervision_mode: pano_relative
   camera_loss_weight: 1.0
   camera_translation_weight: 1.0
-  camera_rotation_weight: 0.0
+  camera_rotation_weight: 1.0
   camera_fov_weight: 0.0
   pano_translation_consistency_weight: 0.1
   camera_position_mode: relative_anchor

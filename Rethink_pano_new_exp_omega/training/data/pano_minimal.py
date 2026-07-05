@@ -159,6 +159,8 @@ class PanoMinimalDataset(Dataset):
             "rgb_path": [sample["rgb_path"] for sample in samples],
             "depth_path": [sample["depth_path"] for sample in samples],
             "pano_position_m": torch.stack([sample["pano_position_m"] for sample in samples], dim=0),
+            "pano_rotation_c2w": torch.stack([sample["pano_rotation_c2w"] for sample in samples], dim=0),
+            "pano_rotation_valid": torch.stack([sample["pano_rotation_valid"] for sample in samples], dim=0),
             "sample_weight": torch.stack([sample["sample_weight"] for sample in samples], dim=0),
             "metadata_valid_ratio": torch.stack([sample["metadata_valid_ratio"] for sample in samples], dim=0),
             "metadata_structure_score": torch.stack([sample["metadata_structure_score"] for sample in samples], dim=0),
@@ -196,6 +198,8 @@ class PanoMinimalDataset(Dataset):
             "rgb_path": str(item["rgb_path"]),
             "depth_path": str(item["depth_path"]),
             "pano_position_m": torch.tensor(item["pano_position_m"], dtype=torch.float32),
+            "pano_rotation_c2w": torch.tensor(item.get("pano_rotation_c2w", _identity_rotation()), dtype=torch.float32),
+            "pano_rotation_valid": torch.tensor(bool(item.get("pano_rotation_valid", False)), dtype=torch.bool),
             "sample_weight": torch.tensor(1.0, dtype=torch.float32),
             "metadata_valid_ratio": torch.tensor(1.0, dtype=torch.float32),
             "metadata_structure_score": torch.tensor(0.0, dtype=torch.float32),
@@ -461,14 +465,17 @@ def _index_matterport3d(root: Path, split: str, scale: float) -> List[Dict]:
             rgb_path = root / str(scan) / "pano_skybox_color" / f"{pano_id}.jpg"
             depth_path = root / str(scan) / "pano_depth" / f"{pano_id}.png"
             pose_path = root / str(scan) / "pano_poses" / f"{pano_id}.txt"
+            position, rotation, rotation_valid = _read_pose_position_rotation(pose_path)
             items.append(
                 _item(
                     "Matterport3D",
                     f"{scan}_{room_id}_{pano_id}",
                     rgb_path,
                     depth_path,
-                    _read_pose_translation(pose_path),
+                    position,
                     scale,
+                    rotation_c2w=rotation,
+                    rotation_valid=rotation_valid,
                 )
             )
     return items
@@ -486,7 +493,19 @@ def _index_stanford2d3ds(root: Path, split: str, scale: float) -> List[Dict]:
             pose_path = _first_match(root / str(area) / "pano" / "pose", f"camera_{pano_id}_*_pose.json")
             if rgb_path is None or depth_path is None:
                 continue
-            items.append(_item("Stanford2D3DS", f"{area}_{room_name}_{pano_id}", rgb_path, depth_path, _read_stanford_position(pose_path), scale))
+            position, rotation, rotation_valid = _read_stanford_pose(pose_path)
+            items.append(
+                _item(
+                    "Stanford2D3DS",
+                    f"{area}_{room_name}_{pano_id}",
+                    rgb_path,
+                    depth_path,
+                    position,
+                    scale,
+                    rotation_c2w=rotation,
+                    rotation_valid=rotation_valid,
+                )
+            )
     return items
 
 
@@ -517,6 +536,8 @@ def _index_structured3d(root: Path, split: str, scale: float) -> List[Dict]:
                     depth_path,
                     _read_structured3d_position(pano_dir / "camera_xyz.txt"),
                     scale,
+                    rotation_c2w=_identity_rotation(),
+                    rotation_valid=False,
                 )
             )
     return items
@@ -543,7 +564,7 @@ def _index_panocity_official(root: Path, split: str, scale: float) -> List[Dict]
         depth_path = _resolve_cached_path(root, row.get("depth_path"))
         if rgb_path is None or depth_path is None:
             continue
-        position = _panocity_position_from_row(root, row, rgb_path, depth_path, pose_cache, pose_path_cache)
+        position, rotation, rotation_valid = _panocity_pose_from_row(root, row, rgb_path, depth_path, pose_cache, pose_path_cache)
         items.append(
             _item(
                 "Panocity",
@@ -552,6 +573,8 @@ def _index_panocity_official(root: Path, split: str, scale: float) -> List[Dict]
                 depth_path,
                 position,
                 scale,
+                rotation_c2w=rotation,
+                rotation_valid=rotation_valid,
             )
         )
     return items
@@ -583,6 +606,7 @@ def build_panocity_official_rows(root: Path) -> List[Dict]:
             if not rgb_path.exists() or not depth_path.exists():
                 continue
             matrix = frame.get("transformation_matrix") or []
+            rotation = _rotation_from_matrix_c2w(matrix)
             position = _translation_from_matrix(matrix)
             rows.append(
                 {
@@ -593,12 +617,23 @@ def build_panocity_official_rows(root: Path) -> List[Dict]:
                     "rgb_path": str(rgb_path.relative_to(root)),
                     "depth_path": str(depth_path.relative_to(root)),
                     "pano_position_m": position,
+                    "pano_rotation_c2w": rotation,
+                    "pano_rotation_valid": rotation is not None,
                 }
             )
     return rows
 
 
-def _item(sequence_name: str, scene_name: str, rgb_path: Path, depth_path: Path, position: List[float], scale: float) -> Dict:
+def _item(
+    sequence_name: str,
+    scene_name: str,
+    rgb_path: Path,
+    depth_path: Path,
+    position: List[float],
+    scale: float,
+    rotation_c2w: Optional[List[List[float]]] = None,
+    rotation_valid: bool = False,
+) -> Dict:
     return {
         "dataset": sequence_name,
         "sequence_name": sequence_name,
@@ -606,6 +641,8 @@ def _item(sequence_name: str, scene_name: str, rgb_path: Path, depth_path: Path,
         "rgb_path": rgb_path,
         "depth_path": depth_path,
         "pano_position_m": position,
+        "pano_rotation_c2w": rotation_c2w if rotation_c2w is not None else _identity_rotation(),
+        "pano_rotation_valid": bool(rotation_valid and rotation_c2w is not None),
         "output_depth_scale": scale,
     }
 
@@ -626,24 +663,67 @@ def _translation_from_matrix(matrix: object) -> List[float]:
     return [0.0, 0.0, 0.0]
 
 
-def _panocity_position_from_row(
+def _rotation_from_matrix_c2w(matrix: object) -> Optional[List[List[float]]]:
+    try:
+        if len(matrix) >= 3:
+            rotation = [[float(matrix[row][col]) for col in range(3)] for row in range(3)]
+            return _orthonormalize_rotation(rotation)
+    except (TypeError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _orthonormalize_rotation(rotation: List[List[float]]) -> List[List[float]]:
+    matrix = np.asarray(rotation, dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+        return _identity_rotation()
+    u, _s, vh = np.linalg.svd(matrix)
+    ortho = u @ vh
+    if np.linalg.det(ortho) < 0:
+        u[:, -1] *= -1.0
+        ortho = u @ vh
+    return [[float(value) for value in row] for row in ortho.astype(np.float32)]
+
+
+def _identity_rotation() -> List[List[float]]:
+    return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+
+def _read_pose_position_rotation(path: Path) -> Tuple[List[float], List[List[float]], bool]:
+    if not path.exists():
+        return [0.0, 0.0, 0.0], _identity_rotation(), False
+    matrix = np.loadtxt(path, dtype=np.float32)
+    if matrix.shape == (4, 4):
+        rotation = _rotation_from_matrix_c2w(matrix)
+        return [float(value) for value in matrix[:3, 3]], rotation or _identity_rotation(), rotation is not None
+    return [0.0, 0.0, 0.0], _identity_rotation(), False
+
+
+def _panocity_pose_from_row(
     root: Path,
     row: Dict,
     rgb_path: Path,
     depth_path: Path,
-    pose_cache: Dict[Path, Dict[str, List[float]]],
+    pose_cache: Dict[Path, Dict[str, Dict]],
     pose_path_cache: Dict[Tuple[str, str, str], Path],
-) -> List[float]:
+) -> Tuple[List[float], List[List[float]], bool]:
     position = _coerce_position(row.get("pano_position_m"))
-    if not _is_zero_position(position):
-        return position
+    rotation = _coerce_rotation(row.get("pano_rotation_c2w"))
+    rotation_valid = bool(row.get("pano_rotation_valid", rotation is not None))
+    if not _is_zero_position(position) and rotation is not None and rotation_valid:
+        return position, rotation, True
 
     pose_path = _panocity_pose_path(root, row, rgb_path, pose_path_cache)
-    pose_positions = _load_panocity_pose_positions(pose_path, pose_cache)
+    pose_records = _load_panocity_pose_records(pose_path, pose_cache)
     for key in (rgb_path.name, depth_path.name, rgb_path.stem, depth_path.stem):
-        if key in pose_positions:
-            return pose_positions[key]
-    return position
+        if key in pose_records:
+            record = pose_records[key]
+            return (
+                record.get("position", position),
+                record.get("rotation_c2w", rotation or _identity_rotation()),
+                bool(record.get("rotation_valid", False)),
+            )
+    return position, rotation or _identity_rotation(), bool(rotation_valid and rotation is not None)
 
 
 def _coerce_position(raw: object) -> List[float]:
@@ -654,6 +734,17 @@ def _coerce_position(raw: object) -> List[float]:
     except (TypeError, ValueError):
         pass
     return [0.0, 0.0, 0.0]
+
+
+def _coerce_rotation(raw: object) -> Optional[List[List[float]]]:
+    try:
+        rows = list(raw) if raw is not None else []
+        if len(rows) >= 3:
+            rotation = [[float(rows[row][col]) for col in range(3)] for row in range(3)]
+            return _orthonormalize_rotation(rotation)
+    except (TypeError, ValueError, IndexError):
+        pass
+    return None
 
 
 def _is_zero_position(position: List[float]) -> bool:
@@ -687,10 +778,10 @@ def _panocity_pose_path(
     return resolved
 
 
-def _load_panocity_pose_positions(
+def _load_panocity_pose_records(
     pose_path: Path,
-    cache: Dict[Path, Dict[str, List[float]]],
-) -> Dict[str, List[float]]:
+    cache: Dict[Path, Dict[str, Dict]],
+) -> Dict[str, Dict]:
     if not pose_path.is_file():
         return {}
     pose_path = pose_path.resolve()
@@ -703,21 +794,27 @@ def _load_panocity_pose_positions(
         cache[pose_path] = {}
         return cache[pose_path]
 
-    positions: Dict[str, List[float]] = {}
+    records: Dict[str, Dict] = {}
     frames = payload.get("frames", []) if isinstance(payload, dict) else []
     for frame in frames:
         if not isinstance(frame, dict):
             continue
-        position = _translation_from_matrix(frame.get("transformation_matrix") or [])
+        matrix = frame.get("transformation_matrix") or []
+        rotation = _rotation_from_matrix_c2w(matrix)
+        record = {
+            "position": _translation_from_matrix(matrix),
+            "rotation_c2w": rotation or _identity_rotation(),
+            "rotation_valid": rotation is not None,
+        }
         for key in (frame.get("name"), frame.get("depth")):
             if not key:
                 continue
             path_key = Path(str(key))
-            positions[str(key)] = position
-            positions[path_key.name] = position
-            positions[path_key.stem] = position
-    cache[pose_path] = positions
-    return positions
+            records[str(key)] = record
+            records[path_key.name] = record
+            records[path_key.stem] = record
+    cache[pose_path] = records
+    return records
 
 
 def _read_json_list(path: Path) -> List:
@@ -734,27 +831,30 @@ def _first_match(folder: Path, pattern: str) -> Optional[Path]:
     return matches[0] if matches else None
 
 
-def _read_pose_translation(path: Path) -> List[float]:
-    if not path.exists():
-        return [0.0, 0.0, 0.0]
-    matrix = np.loadtxt(path, dtype=np.float32)
-    if matrix.shape == (4, 4):
-        return [float(value) for value in matrix[:3, 3]]
-    return [0.0, 0.0, 0.0]
-
-
-def _read_stanford_position(path: Optional[Path]) -> List[float]:
+def _read_stanford_pose(path: Optional[Path]) -> Tuple[List[float], List[List[float]], bool]:
     if path is None or not path.exists():
-        return [0.0, 0.0, 0.0]
+        return [0.0, 0.0, 0.0], _identity_rotation(), False
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return [0.0, 0.0, 0.0]
+        return [0.0, 0.0, 0.0], _identity_rotation(), False
+    position = [0.0, 0.0, 0.0]
     for key in ("camera_location", "position", "translation"):
         value = data.get(key)
         if isinstance(value, list) and len(value) >= 3:
-            return [float(value[0]), float(value[1]), float(value[2])]
-    return [0.0, 0.0, 0.0]
+            position = [float(value[0]), float(value[1]), float(value[2])]
+            break
+    rt_matrix = data.get("camera_rt_matrix")
+    rotation = None
+    try:
+        rt = np.asarray(rt_matrix, dtype=np.float32)
+        if rt.shape[0] >= 3 and rt.shape[1] >= 3:
+            # Stanford stores camera_rt_matrix as world-to-camera. Convert it to
+            # camera-to-world so all pano rotations share the same convention.
+            rotation = _orthonormalize_rotation(rt[:3, :3].T.tolist())
+    except (TypeError, ValueError, IndexError):
+        rotation = None
+    return position, rotation or _identity_rotation(), rotation is not None
 
 
 def _read_structured3d_position(path: Path) -> List[float]:

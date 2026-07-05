@@ -30,6 +30,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
+import numpy as np
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PANOCITY_SPLIT_DIR = REPO_ROOT / "training" / "data" / "splits" / "panocity"
 
@@ -219,7 +221,7 @@ def build_panocity_from_official_splits(root: Path, split_paths: dict[str, Path]
 
 def expand_panocity_official_split_rows(root: Path, split_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    pose_cache: dict[Path, dict[str, list[float]]] = {}
+    pose_cache: dict[Path, dict[str, dict[str, Any]]] = {}
     for split_row in split_rows:
         if not isinstance(split_row, dict):
             continue
@@ -228,7 +230,7 @@ def expand_panocity_official_split_rows(root: Path, split_rows: list[dict[str, A
         rgb_paths = split_row.get("pano_images") or []
         depth_paths = split_row.get("panodepth_images") or []
         pose_path = root / str(split_row.get("poses_file") or "")
-        pose_by_name = load_panocity_pose_positions(pose_path, pose_cache)
+        pose_by_name = load_panocity_pose_records(pose_path, pose_cache)
         if not scene or not block:
             continue
         if len(rgb_paths) != len(depth_paths):
@@ -238,11 +240,17 @@ def expand_panocity_official_split_rows(root: Path, split_rows: list[dict[str, A
             rgb_rel = Path(str(rgb_value))
             depth_rel = Path(str(depth_value))
             position = (
-                pose_by_name.get(rgb_rel.name)
-                or pose_by_name.get(depth_rel.name)
-                or pose_by_name.get(rgb_rel.stem)
-                or pose_by_name.get(depth_rel.stem)
+                (pose_by_name.get(rgb_rel.name) or {}).get("position")
+                or (pose_by_name.get(depth_rel.name) or {}).get("position")
+                or (pose_by_name.get(rgb_rel.stem) or {}).get("position")
+                or (pose_by_name.get(depth_rel.stem) or {}).get("position")
                 or [0.0, 0.0, 0.0]
+            )
+            rotation = (
+                (pose_by_name.get(rgb_rel.name) or {}).get("rotation_c2w")
+                or (pose_by_name.get(depth_rel.name) or {}).get("rotation_c2w")
+                or (pose_by_name.get(rgb_rel.stem) or {}).get("rotation_c2w")
+                or (pose_by_name.get(depth_rel.stem) or {}).get("rotation_c2w")
             )
             rows.append(
                 {
@@ -253,6 +261,8 @@ def expand_panocity_official_split_rows(root: Path, split_rows: list[dict[str, A
                     "rgb_path": str(rgb_rel),
                     "depth_path": str(depth_rel),
                     "pano_position_m": position,
+                    "pano_rotation_c2w": rotation or identity_rotation(),
+                    "pano_rotation_valid": rotation is not None,
                 }
             )
     return rows
@@ -332,6 +342,7 @@ def build_panocity_rows(root: Path) -> list[dict[str, Any]]:
             depth_name = str(depth_name)
             if rgb_name not in rgb_names or depth_name not in depth_names:
                 continue
+            rotation = rotation_from_matrix_c2w(frame.get("transformation_matrix") or [])
             rows.append(
                 {
                     "dataset": "Panocity",
@@ -341,12 +352,14 @@ def build_panocity_rows(root: Path) -> list[dict[str, Any]]:
                     "rgb_path": str(Path(city) / block / "pano_images" / rgb_name),
                     "depth_path": str(Path(city) / block / "panodepth_images" / depth_name),
                     "pano_position_m": translation_from_matrix(frame.get("transformation_matrix") or []),
+                    "pano_rotation_c2w": rotation or identity_rotation(),
+                    "pano_rotation_valid": rotation is not None,
                 }
             )
     return rows
 
 
-def load_panocity_pose_positions(pose_path: Path, cache: dict[Path, dict[str, list[float]]]) -> dict[str, list[float]]:
+def load_panocity_pose_records(pose_path: Path, cache: dict[Path, dict[str, dict[str, Any]]]) -> dict[str, dict[str, Any]]:
     if not pose_path.is_file():
         return {}
     pose_path = pose_path.resolve()
@@ -358,21 +371,27 @@ def load_panocity_pose_positions(pose_path: Path, cache: dict[Path, dict[str, li
         print(f"[WARN] skipping malformed Panocity pose file {pose_path}: {exc}")
         cache[pose_path] = {}
         return cache[pose_path]
-    positions: dict[str, list[float]] = {}
+    records: dict[str, dict[str, Any]] = {}
     frames = payload.get("frames", []) if isinstance(payload, dict) else []
     for frame in frames:
         if not isinstance(frame, dict):
             continue
-        position = translation_from_matrix(frame.get("transformation_matrix") or [])
+        matrix = frame.get("transformation_matrix") or []
+        rotation = rotation_from_matrix_c2w(matrix)
+        record = {
+            "position": translation_from_matrix(matrix),
+            "rotation_c2w": rotation or identity_rotation(),
+            "rotation_valid": rotation is not None,
+        }
         for key in (frame.get("name"), frame.get("depth")):
             if not key:
                 continue
             path_key = Path(str(key))
-            positions[str(key)] = position
-            positions[path_key.name] = position
-            positions[path_key.stem] = position
-    cache[pose_path] = positions
-    return positions
+            records[str(key)] = record
+            records[path_key.name] = record
+            records[path_key.stem] = record
+    cache[pose_path] = records
+    return records
 
 
 def build_matterport3d(root: Path) -> dict[str, Any]:
@@ -710,6 +729,32 @@ def translation_from_matrix(matrix: object) -> list[float]:
     except (TypeError, ValueError, IndexError):
         pass
     return [0.0, 0.0, 0.0]
+
+
+def rotation_from_matrix_c2w(matrix: object) -> list[list[float]] | None:
+    try:
+        if len(matrix) >= 3:
+            rotation = [[float(matrix[row][col]) for col in range(3)] for row in range(3)]
+            return orthonormalize_rotation(rotation)
+    except (TypeError, ValueError, IndexError):
+        pass
+    return None
+
+
+def orthonormalize_rotation(rotation: list[list[float]]) -> list[list[float]]:
+    matrix = np.asarray(rotation, dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+        return identity_rotation()
+    u, _s, vh = np.linalg.svd(matrix)
+    ortho = u @ vh
+    if np.linalg.det(ortho) < 0:
+        u[:, -1] *= -1.0
+        ortho = u @ vh
+    return [[float(value) for value in row] for row in ortho.astype(np.float32)]
+
+
+def identity_rotation() -> list[list[float]]:
+    return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
 
 
 if __name__ == "__main__":
