@@ -331,6 +331,7 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
         loss_grad: Gradient loss (0 if not specified)
         loss_reg: Regular L2 loss
     """
+    gradient_loss_fn = gradient_loss_fn or ""
     bb, ss, hh, ww, nc = pred.shape
 
     # Compute L2 distance between predicted and ground truth points
