@@ -243,16 +243,15 @@ def _index_matterport3d(root: Path, split: str) -> list[dict]:
         for pano_id in pano_ids:
             rgb_path = root / str(scan) / "pano_skybox_color" / f"{pano_id}.jpg"
             depth_path = root / str(scan) / "pano_depth" / f"{pano_id}.png"
-            if rgb_path.exists() and depth_path.exists():
-                items.append(
-                    _item(
-                        "Matterport3D",
-                        f"{scan}_{room_id}_{pano_id}",
-                        rgb_path,
-                        depth_path,
-                        _MATTERPORT3D_DEPTH_SCALE,
-                    )
+            items.append(
+                _item(
+                    "Matterport3D",
+                    f"{scan}_{room_id}_{pano_id}",
+                    rgb_path,
+                    depth_path,
+                    _MATTERPORT3D_DEPTH_SCALE,
                 )
+            )
     return items
 
 
@@ -295,8 +294,7 @@ def _index_structured3d(root: Path, split: str) -> list[dict]:
             pano_dir = root / str(scene) / "2D_rendering" / str(pano_id) / "panorama" / "full"
             rgb_path = pano_dir / "rgb_rawlight.png"
             depth_path = pano_dir / "depth.png"
-            if rgb_path.exists() and depth_path.exists():
-                items.append(_item("Structured3D", f"{scene}_{pano_id}", rgb_path, depth_path, _STRUCTURED3D_DEPTH_SCALE))
+            items.append(_item("Structured3D", f"{scene}_{pano_id}", rgb_path, depth_path, _STRUCTURED3D_DEPTH_SCALE))
     return items
 
 

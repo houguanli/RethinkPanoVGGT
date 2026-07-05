@@ -93,6 +93,7 @@ class PanoMinimalDataset(Dataset):
         train_split_fraction: float = 0.95,
         split_seed: int = 42,
         datasets: Optional[str | Iterable[str]] = None,
+        bad_sample_list: Optional[str | Path] = None,
         dataset_sampling_weights: Optional[str | Dict[str, float]] = None,
         output_depth_scale: float = 1000.0,
         invalid_depth_value: Optional[float] = 65535.0,
@@ -120,6 +121,7 @@ class PanoMinimalDataset(Dataset):
         self.train_split_fraction = float(train_split_fraction)
         self.split_seed = int(split_seed)
         self.dataset_names = _parse_dataset_names(datasets)
+        self.bad_samples = _load_bad_samples(bad_sample_list, self.root)
         self.dataset_sampling_weights = _parse_dataset_sampling_weights(dataset_sampling_weights)
         self.output_depth_scale = float(output_depth_scale)
         self.invalid_depth_value = None if invalid_depth_value is None else float(invalid_depth_value)
@@ -132,6 +134,10 @@ class PanoMinimalDataset(Dataset):
         self.groups = self._build_groups()
         if strict and not self.items:
             raise FileNotFoundError(f"No minimal PanoVGGT samples found under {self.root}.")
+        if strict and self.pano_sample_mode != "single" and not self.groups:
+            raise FileNotFoundError(
+                f"No minimal PanoVGGT multi-pano groups with at least {self.pano_min_count} panos found under {self.root}."
+            )
 
     def __len__(self) -> int:
         return len(self.groups)
@@ -166,7 +172,7 @@ class PanoMinimalDataset(Dataset):
             candidate_index = (start + offset) % len(self.items)
             try:
                 return self._read_item(self.items[candidate_index])
-            except (FileNotFoundError, OSError, ValueError) as exc:
+            except (FileNotFoundError, OSError, ValueError, SyntaxError) as exc:
                 last_error = exc
                 print(f"[WARN] skipping unreadable minimal pano sample {self.items[candidate_index].get('scene_name')}: {exc}")
         raise RuntimeError("All minimal pano samples failed to load.") from last_error
@@ -200,11 +206,38 @@ class PanoMinimalDataset(Dataset):
         sample_indices = self.sample_indices if self.sample_indices else list(range(len(self.items)))
         if self.pano_sample_mode == "single":
             return [[idx] for idx in sample_indices]
+
+        indices_by_scene: Dict[str, List[int]] = {}
+        for item_index, item in enumerate(self.items):
+            indices_by_scene.setdefault(_scene_group_key(item), []).append(item_index)
+        offset_by_index: Dict[int, int] = {}
+        for scene_indices in indices_by_scene.values():
+            for offset, item_index in enumerate(scene_indices):
+                offset_by_index[item_index] = offset
+
         groups = []
         for idx in sample_indices:
-            group = list(range(idx, min(idx + self.pano_max_count, len(self.items))))
-            if len(group) < self.pano_max_count and self.items:
-                group.extend(range(0, self.pano_max_count - len(group)))
+            item = self.items[idx]
+            scene_indices = indices_by_scene.get(_scene_group_key(item), [idx])
+            if len(scene_indices) < self.pano_min_count:
+                continue
+            anchor_offset = offset_by_index.get(idx, 0)
+            radius = max(self.pano_max_count * 4, self.pano_min_count)
+            start = max(0, anchor_offset - radius)
+            end = min(len(scene_indices), anchor_offset + radius + 1)
+            candidates = scene_indices[start:end]
+            if self.grouping == "nearest":
+                candidates.sort(
+                    key=lambda candidate: (
+                        candidate != idx,
+                        _position_distance_sq(item, self.items[candidate]),
+                        abs(candidate - idx),
+                        candidate,
+                    )
+                )
+            else:
+                candidates.sort(key=lambda candidate: (abs(candidate - idx), candidate != idx, candidate))
+            group = candidates[: self.pano_max_count]
             groups.append(group)
         return groups
 
@@ -218,9 +251,79 @@ class PanoMinimalDataset(Dataset):
             items.extend(_index_structured3d(self.root / "Structured3D", self.split, _STRUCTURED3D_DEPTH_SCALE))
         if "panocity" in self.dataset_names:
             items.extend(_index_panocity_official(self.root / "Panocity", self.split, _PANOCITY_DEPTH_SCALE))
+        if self.bad_samples:
+            before = len(items)
+            items = [
+                item
+                for item in items
+                if not _is_bad_sample(
+                    str(item.get("rgb_path", "")),
+                    str(item.get("depth_path", "")),
+                    str(item.get("scene_name", "")),
+                    self.bad_samples,
+                )
+            ]
+            skipped = before - len(items)
+            if skipped > 0:
+                print(f"[INFO] skipped bad minimal pano samples from bad_sample_list = {skipped}")
         if max_samples is not None:
             items = items[: int(max_samples)]
         return items
+
+
+def _load_bad_samples(path: Optional[str | Path], root: Path) -> set[str]:
+    if path in (None, ""):
+        return set()
+    requested = Path(path)
+    candidates = [requested]
+    if not requested.is_absolute():
+        candidates.append(Path(__file__).resolve().parents[2] / requested)
+        candidates.append(root / requested)
+    resolved = next((candidate for candidate in candidates if candidate.exists()), None)
+    if resolved is None:
+        print(f"[WARN] minimal pano bad_sample_list not found: {path}")
+        return set()
+    values: set[str] = set()
+    with resolved.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            path_value = Path(value)
+            values.add(value)
+            values.add(path_value.name)
+            values.add(path_value.stem)
+    print(f"[INFO] loaded minimal pano bad sample entries = {len(values)} from {resolved}")
+    return values
+
+
+def _is_bad_sample(rgb_path: str, depth_path: str, scene_name: str, bad_samples: set[str]) -> bool:
+    if not bad_samples:
+        return False
+    keys: set[str] = {scene_name}
+    for raw in (rgb_path, depth_path):
+        path = Path(raw)
+        keys.add(str(path))
+        keys.add(path.name)
+        keys.add(path.stem)
+        keys.update(part for part in path.parts if part)
+    return bool(keys & bad_samples)
+
+
+def _scene_group_key(item: Dict) -> str:
+    dataset = str(item.get("dataset") or item.get("sequence_name") or "unknown")
+    scene_name = str(item.get("scene_name") or "")
+    scene_prefix = scene_name.rsplit("_", 1)[0] if "_" in scene_name else scene_name
+    return f"{dataset}:{scene_prefix}"
+
+
+def _position_distance_sq(anchor: Dict, candidate: Dict) -> float:
+    try:
+        a = anchor.get("pano_position_m", [0.0, 0.0, 0.0])
+        b = candidate.get("pano_position_m", [0.0, 0.0, 0.0])
+        return float(sum((float(a[i]) - float(b[i])) ** 2 for i in range(3)))
+    except (TypeError, ValueError, IndexError):
+        return 0.0
 
 
 def _parse_dataset_names(raw: Optional[str | Iterable[str]]) -> set[str]:
@@ -358,9 +461,16 @@ def _index_matterport3d(root: Path, split: str, scale: float) -> List[Dict]:
             rgb_path = root / str(scan) / "pano_skybox_color" / f"{pano_id}.jpg"
             depth_path = root / str(scan) / "pano_depth" / f"{pano_id}.png"
             pose_path = root / str(scan) / "pano_poses" / f"{pano_id}.txt"
-            if not rgb_path.exists() or not depth_path.exists():
-                continue
-            items.append(_item("Matterport3D", f"{scan}_{room_id}_{pano_id}", rgb_path, depth_path, _read_pose_translation(pose_path), scale))
+            items.append(
+                _item(
+                    "Matterport3D",
+                    f"{scan}_{room_id}_{pano_id}",
+                    rgb_path,
+                    depth_path,
+                    _read_pose_translation(pose_path),
+                    scale,
+                )
+            )
     return items
 
 
@@ -399,9 +509,16 @@ def _index_structured3d(root: Path, split: str, scale: float) -> List[Dict]:
             pano_dir = root / str(scene) / "2D_rendering" / str(pano_id) / "panorama"
             rgb_path = pano_dir / "full" / "rgb_rawlight.png"
             depth_path = pano_dir / "full" / "depth.png"
-            if not rgb_path.exists() or not depth_path.exists():
-                continue
-            items.append(_item("Structured3D", f"{scene}_{pano_id}", rgb_path, depth_path, _read_structured3d_position(pano_dir / "camera_xyz.txt"), scale))
+            items.append(
+                _item(
+                    "Structured3D",
+                    f"{scene}_{pano_id}",
+                    rgb_path,
+                    depth_path,
+                    _read_structured3d_position(pano_dir / "camera_xyz.txt"),
+                    scale,
+                )
+            )
     return items
 
 
@@ -553,13 +670,19 @@ def _read_structured3d_position(path: Path) -> List[float]:
 
 
 def _read_rgb_tensor(path: Path) -> torch.Tensor:
-    with Image.open(path) as image:
-        array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    try:
+        with Image.open(path) as image:
+            array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    except (FileNotFoundError, OSError, ValueError, SyntaxError) as exc:
+        raise OSError(f"Cannot read RGB image: {path}: {exc}") from exc
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
 
 def _read_depth_tensor(path: Path, output_depth_scale: float, invalid_depth_value: Optional[float]) -> torch.Tensor:
-    depth = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    try:
+        depth = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    except (cv2.error, OSError, ValueError, SyntaxError) as exc:
+        raise OSError(f"Cannot read depth map: {path}: {exc}") from exc
     if depth is None:
         raise FileNotFoundError(f"Cannot read depth map: {path}")
     if depth.ndim == 3:

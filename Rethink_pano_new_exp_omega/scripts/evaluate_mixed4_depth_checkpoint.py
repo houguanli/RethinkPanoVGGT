@@ -12,7 +12,9 @@ import argparse
 import copy
 import csv
 import json
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.evaluate_depth_checkpoint import (  # noqa: E402
+    DEPTH_ACCUMULATOR_KEYS,
     DEPTH_METRIC_KEYS,
     PANOVGGT_PRIMARY_METRICS,
     apply_checkpoint_eval_defaults,
@@ -32,6 +35,7 @@ from scripts.evaluate_depth_checkpoint import (  # noqa: E402
     read_train_loss_reference,
     summarize_metric_rows,
     summarize_panovggt_rows,
+    write_eval_progress,
 )
 from training.train_pano_omega import (  # noqa: E402
     parse_args as parse_training_args,
@@ -44,7 +48,7 @@ DATASETS = [
     ("Panocity", "panocity", "test"),
     ("Matterport3D", "matterport3d", "test"),
     ("Stanford2D3DS", "stanford2d3ds", "test"),
-    ("Structured3D", "structured3d", "val"),
+    ("Structured3D", "structured3d", "test"),
 ]
 
 PANOVGGT_TABLE3_MONOCULAR = {
@@ -70,11 +74,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--per-sample-csv", type=Path, default=None, help="Optional per-sample CSV path.")
     parser.add_argument("--train-loss-csv", type=Path, default=None, help="Optional training loss.csv for comparison.")
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument(
+        "--datasets",
+        default="all",
+        help="Comma-separated dataset ids/names to evaluate: all, panocity, matterport3d, stanford2d3ds, structured3d.",
+    )
     parser.add_argument("--limit-per-dataset", type=int, default=100, help="Held-out samples per dataset. Use 0 for the full split.")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default=None)
+    parser.add_argument("--num-shards", type=int, default=1, help="Split each dataset over this many independent eval workers.")
+    parser.add_argument("--shard-rank", type=int, default=0, help="Shard id for this worker, in [0, num_shards).")
+    parser.add_argument("--progress-file", type=Path, default=None, help="Optional JSON file updated periodically with shard progress.")
+    parser.add_argument("--progress-every", type=int, default=25, help="Samples between progress-file updates.")
     parser.add_argument("--progress", action="store_true", default=True)
     parser.add_argument("--no-progress", dest="progress", action="store_false")
     return parser
@@ -84,6 +97,19 @@ def main() -> None:
     args = build_parser().parse_args()
     set_seed(args.seed)
     device = resolve_device(args.device, {"distributed": False, "local_rank": 0})
+    write_eval_progress(
+        args.progress_file,
+        {
+            "state": "initializing_model",
+            "pid": os.getpid(),
+            "shard_rank": int(args.shard_rank),
+            "num_shards": int(args.num_shards),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            "torch_cuda_device_count": torch_cuda_device_count(),
+            "requested_datasets": str(args.datasets),
+            "updated_at": time.time(),
+        },
+    )
 
     train_args = parse_training_args(["--config", str(args.config)])
     train_args.device = args.device
@@ -100,9 +126,25 @@ def main() -> None:
     model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
     model.eval()
 
+    selected_datasets = select_datasets(args.datasets)
+    write_eval_progress(
+        args.progress_file,
+        {
+            "state": "model_ready",
+            "pid": os.getpid(),
+            "shard_rank": int(args.shard_rank),
+            "num_shards": int(args.num_shards),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            "torch_cuda_device_count": torch_cuda_device_count(),
+            "selected_datasets": sorted(selected_datasets),
+            "updated_at": time.time(),
+        },
+    )
     runs: list[dict[str, Any]] = []
     per_sample_rows: list[dict[str, Any]] = []
     for dataset_index, (display_name, minimal_name, split) in enumerate(DATASETS):
+        if minimal_name not in selected_datasets:
+            continue
         dataset_args = copy.copy(train_args)
         dataset_args.dataset_format = "pano_minimal"
         dataset_args.minimal_datasets = minimal_name
@@ -120,6 +162,16 @@ def main() -> None:
             num_workers=args.num_workers,
             progress=args.progress,
             per_sample_rows=per_sample_rows,
+            shard_rank=args.shard_rank,
+            num_shards=args.num_shards,
+            progress_file=args.progress_file,
+            progress_every=args.progress_every,
+            progress_context={
+                "pid": os.getpid(),
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+                "torch_cuda_device_count": torch_cuda_device_count(),
+                "selected_datasets": sorted(selected_datasets),
+            },
         )
         run["dataset"] = display_name
         run["minimal_dataset"] = minimal_name
@@ -134,12 +186,15 @@ def main() -> None:
         "device": str(device),
         "seed": args.seed,
         "limit_per_dataset": int(args.limit_per_dataset),
+        "datasets": sorted(selected_datasets),
+        "shard_rank": int(args.shard_rank),
+        "num_shards": int(args.num_shards),
         "dataset_root": str(train_args.dataset_root),
         "split_policy": {
             "Panocity": "test (PanoVGGT official split when cache was built with official split JSONs)",
             "Matterport3D": "test",
             "Stanford2D3DS": "test",
-            "Structured3D": "val (no test cache in current local bundle)",
+            "Structured3D": "test (official split when cache was built with official split files)",
         },
         "train_loss_reference": read_train_loss_reference(args.train_loss_csv),
         "runs": runs,
@@ -158,6 +213,44 @@ def main() -> None:
     if args.per_sample_csv is not None:
         write_per_sample_csv(args.per_sample_csv, per_sample_rows)
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def select_datasets(raw: str) -> set[str]:
+    aliases = {
+        "panocity": "panocity",
+        "pano_city": "panocity",
+        "matterport3d": "matterport3d",
+        "matterport": "matterport3d",
+        "mp3d": "matterport3d",
+        "stanford2d3ds": "stanford2d3ds",
+        "stanford": "stanford2d3ds",
+        "s2d3ds": "stanford2d3ds",
+        "structured3d": "structured3d",
+        "s3d": "structured3d",
+    }
+    if raw is None or str(raw).strip().lower() in {"", "all", "*"}:
+        return {minimal_name for _, minimal_name, _ in DATASETS}
+    selected: set[str] = set()
+    for token in str(raw).split(","):
+        key = token.strip().lower()
+        if not key:
+            continue
+        if key not in aliases:
+            known = ", ".join(sorted(aliases))
+            raise ValueError(f"Unknown dataset '{token}'. Expected one of: all, {known}")
+        selected.add(aliases[key])
+    if not selected:
+        raise ValueError("No datasets selected")
+    return selected
+
+
+def torch_cuda_device_count() -> int:
+    try:
+        import torch
+
+        return int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:
+        return 0
 
 
 def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -267,6 +360,7 @@ def write_per_sample_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "metadata_structure_score",
         "sample_weight",
         *DEPTH_METRIC_KEYS,
+        *DEPTH_ACCUMULATOR_KEYS,
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")

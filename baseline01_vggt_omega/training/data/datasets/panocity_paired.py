@@ -170,7 +170,7 @@ class PanoCityPairedPinholeDataset(BaseDataset):
                     depth_max_m=self.depth_max_m,
                 )
                 return candidate, image, range_depth
-            except (FileNotFoundError, OSError, ValueError) as exc:
+            except (FileNotFoundError, OSError, ValueError, SyntaxError) as exc:
                 last_error = exc
                 print(f"[WARN] skipping unreadable PanoCity sample {candidate.get('name')}: {exc}")
         raise RuntimeError("All PanoCity samples failed to load.") from last_error
@@ -238,9 +238,12 @@ def _load_bad_samples(path: Optional[str], root: str) -> set[str]:
     if path in (None, ""):
         return set()
     resolved = Path(path)
+    candidates = [resolved]
     if not resolved.is_absolute():
-        resolved = Path(root) / resolved
-    if not resolved.exists():
+        candidates.append(Path(root) / resolved)
+    resolved = next((candidate for candidate in candidates if candidate.exists()), None)
+    if resolved is None:
+        print(f"[WARN] PanoCity bad sample list not found: {path}")
         return set()
     values: set[str] = set()
     with resolved.open("r", encoding="utf-8") as handle:
@@ -269,6 +272,8 @@ def _is_bad_sample(rgb_path: str, depth_path: str, bad_samples: set[str]) -> boo
         rgb.stem,
         depth.stem,
     }
+    keys.update(part for part in rgb.parts if part)
+    keys.update(part for part in depth.parts if part)
     return bool(keys & bad_samples)
 
 
@@ -328,7 +333,10 @@ def _depth_path_for_rgb(rgb_path: str, depth_dir: str) -> Optional[str]:
 
 
 def _read_rgb(path: str) -> np.ndarray:
-    image = cv2.imread(path, cv2.IMREAD_COLOR)
+    try:
+        image = cv2.imread(path, cv2.IMREAD_COLOR)
+    except (cv2.error, OSError, ValueError, SyntaxError) as exc:
+        raise OSError(f"Cannot read RGB image: {path}: {exc}") from exc
     if image is None:
         raise FileNotFoundError(f"Cannot read RGB image: {path}")
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -340,7 +348,10 @@ def _read_depth(
     invalid_depth_value: Optional[float],
     depth_max_m: float,
 ) -> np.ndarray:
-    depth = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    try:
+        depth = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    except (cv2.error, OSError, ValueError, SyntaxError) as exc:
+        raise OSError(f"Cannot read depth map: {path}: {exc}") from exc
     if depth is None:
         raise FileNotFoundError(f"Cannot read depth map: {path}")
     if depth.ndim == 3:

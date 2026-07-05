@@ -8,13 +8,13 @@ data:
   train_split_fraction: 0.95
   split_seed: 42
   metadata_path: null
-  bad_sample_list: null
+  bad_sample_list: configs/structured3d_bad_scenes.txt
   curriculum_bins: null
   use_metadata_weights: false
   checkpoint: ../baseline01_vggt_omega/logs/mixed4_pano_low_to_high_4xrtx5000_full_warmup_3h_for_luna/ckpts/checkpoint.pt
   pano_sample_mode: variable_neighborhood
   pano_min_count: 2
-  pano_max_count: 4
+  pano_max_count: 8
   pano_grouping: nearest
   output_depth_scale: 1000.0
   invalid_depth_value: 65535.0
@@ -23,7 +23,7 @@ data:
 sampler:
   patch_size: 16
   window_size: 384
-  # 2..4 panos x 4 yaw windows keeps the max at 16 VGGT views.
+  # 2..8 panos x 4 yaw windows stress-tests up to 32 VGGT views at 384.
   num_yaw: 4
   pitch_degrees: "-15"
   fov_degrees: 75.0

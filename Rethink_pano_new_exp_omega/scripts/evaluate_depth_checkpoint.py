@@ -10,6 +10,7 @@ import json
 import math
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -251,7 +252,17 @@ def evaluate_run(
     num_workers: int,
     progress: bool,
     per_sample_rows: list[dict[str, Any]],
+    shard_rank: int = 0,
+    num_shards: int = 1,
+    progress_file: Path | None = None,
+    progress_every: int = 25,
+    progress_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if int(num_shards) < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+    if int(shard_rank) < 0 or int(shard_rank) >= int(num_shards):
+        raise ValueError(f"shard_rank must be in [0, {int(num_shards) - 1}], got {shard_rank}")
+
     eval_args = copy.copy(base_args)
     eval_args.dataset_split = split
     eval_args.curriculum_bins = None if curriculum_bins in (None, "", "all") else str(curriculum_bins)
@@ -259,7 +270,24 @@ def evaluate_run(
     pano_size = (eval_args.pano_height, eval_args.pano_width) if eval_args.pano_height > 0 and eval_args.pano_width > 0 else None
     dataset = build_dataset(eval_args, pano_size)
     indices = sample_indices(len(dataset), limit, seed)
-    subset = Subset(dataset, indices)
+    selected_indices = indices[int(shard_rank) :: int(num_shards)]
+    write_eval_progress(
+        progress_file,
+        {
+            **(progress_context or {}),
+            "state": "running",
+            "run": name,
+            "split": split,
+            "dataset_size": len(dataset),
+            "candidate_samples": len(indices),
+            "shard_samples": len(selected_indices),
+            "processed_samples": 0,
+            "shard_rank": int(shard_rank),
+            "num_shards": int(num_shards),
+            "updated_at": time.time(),
+        },
+    )
+    subset = Subset(dataset, selected_indices)
     loader = DataLoader(
         subset,
         batch_size=1,
@@ -314,7 +342,7 @@ def evaluate_run(
             depth_metrics = compute_depth_metrics(pred_depth, target_depth, target_valid)
             row = {
                 "run": name,
-                "dataset_index": int(indices[local_index]),
+                "dataset_index": int(selected_indices[local_index]),
                 "seq_name": scalar_string(batch.get("scene_name") or batch.get("sequence_name")),
                 "rgb_path": scalar_string(batch.get("rgb_path")),
                 "depth_path": scalar_string(batch.get("depth_path")),
@@ -331,14 +359,38 @@ def evaluate_run(
             }
             rows.append(row)
             per_sample_rows.append(row)
+            processed = local_index + 1
+            if progress_file is not None and (processed == 1 or processed == len(selected_indices) or processed % max(int(progress_every), 1) == 0):
+                write_eval_progress(
+                    progress_file,
+                    {
+                        **(progress_context or {}),
+                        "state": "running",
+                        "run": name,
+                        "split": split,
+                        "dataset_size": len(dataset),
+                        "candidate_samples": len(indices),
+                        "shard_samples": len(selected_indices),
+                        "processed_samples": processed,
+                        "last_dataset_index": int(selected_indices[local_index]),
+                        "last_loss": row["loss"],
+                        "last_depth_irls_abs_rel": row["depth_irls_abs_rel"],
+                        "shard_rank": int(shard_rank),
+                        "num_shards": int(num_shards),
+                        "updated_at": time.time(),
+                    },
+                )
 
-    return {
+    result = {
         "name": name,
         "split": split,
         "curriculum_bins": curriculum_bins or "all",
         "dataset_size": len(dataset),
         "requested_samples": int(limit),
+        "candidate_samples": len(indices),
         "evaluated_samples": len(rows),
+        "shard_rank": int(shard_rank),
+        "num_shards": int(num_shards),
         "summary": summarize_values([row["loss"] for row in rows]),
         "depth_summary": summarize_values([row["loss_depth"] for row in rows]),
         "overlap_summary": summarize_values([row["loss_overlap"] for row in rows]),
@@ -357,6 +409,39 @@ def evaluate_run(
             "by_depth_irls_delta_1p25": rank_samples(rows, "depth_irls_delta_1p25", reverse=False),
         },
     }
+    write_eval_progress(
+        progress_file,
+        {
+            **(progress_context or {}),
+            "state": "done",
+            "run": name,
+            "split": split,
+            "dataset_size": len(dataset),
+            "candidate_samples": len(indices),
+            "shard_samples": len(selected_indices),
+            "processed_samples": len(rows),
+            "shard_rank": int(shard_rank),
+            "num_shards": int(num_shards),
+            "updated_at": time.time(),
+        },
+    )
+    return result
+
+
+def write_eval_progress(path: Path | None, payload: dict[str, Any]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if "started_at" not in payload and path.exists():
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+            if "started_at" in previous:
+                payload["started_at"] = previous["started_at"]
+        except (OSError, json.JSONDecodeError):
+            pass
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def compute_depth_metrics(pred_depth: torch.Tensor, target_depth: torch.Tensor, target_valid: torch.Tensor) -> dict[str, float]:

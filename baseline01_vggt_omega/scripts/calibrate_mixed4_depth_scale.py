@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--datasets", default="all", help="Comma list or all.")
     parser.add_argument("--split", default="train")
+    parser.add_argument("--bad-sample-list", type=Path, default=None)
     parser.add_argument("--samples-per-dataset", type=int, default=32)
     parser.add_argument("--max-pixels-per-sample", type=int, default=50000)
     parser.add_argument("--num-yaw", type=int, default=8)
@@ -161,7 +162,7 @@ def calibrate_dataset(
         train_split_fraction=0.95,
         split_seed=args.seed,
         metadata_path=None,
-        bad_sample_list=None,
+        bad_sample_list=args.bad_sample_list,
         curriculum_bins=None,
         use_metadata_weights=False,
     )
