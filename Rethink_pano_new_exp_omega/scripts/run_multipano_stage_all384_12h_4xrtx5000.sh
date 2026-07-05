@@ -9,7 +9,13 @@ BASELINE="$ROOT/baseline01_vggt_omega"
 PYTHON="${PYTHON:-/home/aoki/miniconda3/envs/RethinkPanoVGGT_omega/bin/python}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 
-PANOVGGT_ROOT="${PANOVGGT_ROOT:-$(cd "$ROOT/.." && pwd)/panovggt}"
+if [[ -z "${PANOVGGT_ROOT:-}" ]]; then
+  if [[ -d /mnt/e/PanoVGGT_minimal_datasets/datasets ]]; then
+    PANOVGGT_ROOT="/mnt/e/PanoVGGT_minimal_datasets/datasets"
+  else
+    PANOVGGT_ROOT="$(cd "$ROOT/.." && pwd)/panovggt"
+  fi
+fi
 BASE_CHECKPOINT="${BASE_CHECKPOINT:-/home/aoki/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt}"
 
 BASE_CONFIG="mixed4_pano_low_to_high_4xrtx5000_full_warmup_3h_for_luna"
@@ -104,6 +110,7 @@ else
     --standalone \
     --nproc_per_node="$NPROC_PER_NODE" \
     training/launch.py --config "$BASE_CONFIG" \
+    data.train.dataset.dataset_configs.0.root="$PANOVGGT_ROOT" \
     model.checkpoint_path="$BASE_CHECKPOINT" \
     loss.depth.pred_depth_scale="$PRED_DEPTH_SCALE" \
     loss.depth.mode=log_huber \
@@ -139,6 +146,7 @@ PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   --nproc_per_node="$NPROC_PER_NODE" \
   training/train_pano_omega.py --config "$LUNA_CONFIG" \
   "${LUNA_DURATION_ARGS[@]}" \
+  --dataset-root "$PANOVGGT_ROOT" \
   --pred-depth-scale "$PRED_DEPTH_SCALE" \
   --depth-loss-mode log_huber \
   2>&1 | tee -a "$LUNA_OUT/train_luna.log"
