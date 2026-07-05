@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.evaluate_depth_checkpoint import (  # noqa: E402
+    DEPTH_ACCUMULATOR_KEYS,
     DEPTH_METRIC_KEYS,
     PANOVGGT_PRIMARY_METRICS,
     apply_checkpoint_eval_defaults,
@@ -75,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default=None)
+    parser.add_argument("--num-shards", type=int, default=1, help="Split each dataset over this many independent eval workers.")
+    parser.add_argument("--shard-rank", type=int, default=0, help="Shard id for this worker, in [0, num_shards).")
     parser.add_argument("--progress", action="store_true", default=True)
     parser.add_argument("--no-progress", dest="progress", action="store_false")
     return parser
@@ -120,6 +123,8 @@ def main() -> None:
             num_workers=args.num_workers,
             progress=args.progress,
             per_sample_rows=per_sample_rows,
+            shard_rank=args.shard_rank,
+            num_shards=args.num_shards,
         )
         run["dataset"] = display_name
         run["minimal_dataset"] = minimal_name
@@ -134,6 +139,8 @@ def main() -> None:
         "device": str(device),
         "seed": args.seed,
         "limit_per_dataset": int(args.limit_per_dataset),
+        "shard_rank": int(args.shard_rank),
+        "num_shards": int(args.num_shards),
         "dataset_root": str(train_args.dataset_root),
         "split_policy": {
             "Panocity": "test (PanoVGGT official split when cache was built with official split JSONs)",
@@ -267,6 +274,7 @@ def write_per_sample_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "metadata_structure_score",
         "sample_weight",
         *DEPTH_METRIC_KEYS,
+        *DEPTH_ACCUMULATOR_KEYS,
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")

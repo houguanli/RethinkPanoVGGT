@@ -251,7 +251,14 @@ def evaluate_run(
     num_workers: int,
     progress: bool,
     per_sample_rows: list[dict[str, Any]],
+    shard_rank: int = 0,
+    num_shards: int = 1,
 ) -> dict[str, Any]:
+    if int(num_shards) < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+    if int(shard_rank) < 0 or int(shard_rank) >= int(num_shards):
+        raise ValueError(f"shard_rank must be in [0, {int(num_shards) - 1}], got {shard_rank}")
+
     eval_args = copy.copy(base_args)
     eval_args.dataset_split = split
     eval_args.curriculum_bins = None if curriculum_bins in (None, "", "all") else str(curriculum_bins)
@@ -259,7 +266,8 @@ def evaluate_run(
     pano_size = (eval_args.pano_height, eval_args.pano_width) if eval_args.pano_height > 0 and eval_args.pano_width > 0 else None
     dataset = build_dataset(eval_args, pano_size)
     indices = sample_indices(len(dataset), limit, seed)
-    subset = Subset(dataset, indices)
+    selected_indices = indices[int(shard_rank) :: int(num_shards)]
+    subset = Subset(dataset, selected_indices)
     loader = DataLoader(
         subset,
         batch_size=1,
@@ -314,7 +322,7 @@ def evaluate_run(
             depth_metrics = compute_depth_metrics(pred_depth, target_depth, target_valid)
             row = {
                 "run": name,
-                "dataset_index": int(indices[local_index]),
+                "dataset_index": int(selected_indices[local_index]),
                 "seq_name": scalar_string(batch.get("scene_name") or batch.get("sequence_name")),
                 "rgb_path": scalar_string(batch.get("rgb_path")),
                 "depth_path": scalar_string(batch.get("depth_path")),
@@ -338,7 +346,10 @@ def evaluate_run(
         "curriculum_bins": curriculum_bins or "all",
         "dataset_size": len(dataset),
         "requested_samples": int(limit),
+        "candidate_samples": len(indices),
         "evaluated_samples": len(rows),
+        "shard_rank": int(shard_rank),
+        "num_shards": int(num_shards),
         "summary": summarize_values([row["loss"] for row in rows]),
         "depth_summary": summarize_values([row["loss_depth"] for row in rows]),
         "overlap_summary": summarize_values([row["loss_overlap"] for row in rows]),
