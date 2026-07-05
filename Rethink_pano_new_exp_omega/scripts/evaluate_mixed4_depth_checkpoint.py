@@ -45,7 +45,7 @@ DATASETS = [
     ("Panocity", "panocity", "test"),
     ("Matterport3D", "matterport3d", "test"),
     ("Stanford2D3DS", "stanford2d3ds", "test"),
-    ("Structured3D", "structured3d", "val"),
+    ("Structured3D", "structured3d", "test"),
 ]
 
 PANOVGGT_TABLE3_MONOCULAR = {
@@ -146,7 +146,7 @@ def main() -> None:
             "Panocity": "test (PanoVGGT official split when cache was built with official split JSONs)",
             "Matterport3D": "test",
             "Stanford2D3DS": "test",
-            "Structured3D": "val (no test cache in current local bundle)",
+            "Structured3D": "test (official split when cache was built with official split files)",
         },
         "train_loss_reference": read_train_loss_reference(args.train_loss_csv),
         "runs": runs,
