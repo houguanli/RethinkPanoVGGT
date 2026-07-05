@@ -51,7 +51,7 @@ except ImportError:
     from train_utils.general import *
     from train_utils.logging import setup_logging
     from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
-    from train_utils.optimizer import construct_optimizers
+from train_utils.optimizer import construct_optimizers
 from vggt_omega.utils.lora import apply_lora_to_model
 
 
@@ -335,6 +335,16 @@ class Trainer:
         if self.mode in ["train"]:
             self.train_dataset = instantiate(self.data_conf.train, _recursive_=False)
             self.train_dataset.seed = self.seed_value
+            if self.rank == 0 and hasattr(self.train_dataset, "dataset"):
+                dataset = self.train_dataset.dataset
+                logging.info(
+                    "Train dataset: %s split=%s samples=%s train_fraction=%s split_seed=%s",
+                    dataset.__class__.__name__,
+                    getattr(dataset, "split", "n/a"),
+                    len(dataset),
+                    getattr(dataset, "train_split_fraction", "n/a"),
+                    getattr(dataset, "split_seed", "n/a"),
+                )
 
     def _setup_ddp_distributed_training(self, distributed_conf: Dict, device: str):
         """Wraps the model with DistributedDataParallel (DDP)."""
@@ -823,6 +833,9 @@ class Trainer:
     def _process_batch(self, batch: Mapping):      
         if self.data_conf.train.common_config.repeat_batch:
             batch = self._apply_batch_repetition(batch)
+
+        if not self.normalize_scene_scale:
+            return batch
         
         # Normalize camera extrinsics and points. The function returns new tensors.
         normalized_extrinsics, normalized_cam_points, normalized_world_points, normalized_depths = \
