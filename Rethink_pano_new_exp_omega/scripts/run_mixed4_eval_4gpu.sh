@@ -12,6 +12,7 @@ CHECKPOINT="${CHECKPOINT:-$LUNA_OUT/last.pt}"
 TRAIN_LOSS_CSV="${TRAIN_LOSS_CSV:-$LUNA_OUT/loss.csv}"
 EVAL_OUT="${EVAL_OUT:-$LUNA_OUT/eval_full_4gpu}"
 LIMIT_PER_DATASET="${LIMIT_PER_DATASET:-0}"
+EVAL_DATASETS="${EVAL_DATASETS:-all}"
 NUM_WORKERS_PER_GPU="${NUM_WORKERS_PER_GPU:-2}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
 SEED="${SEED:-123}"
@@ -55,6 +56,7 @@ fi
   echo "[eval-4gpu] train_loss_csv=$TRAIN_LOSS_CSV"
   echo "[eval-4gpu] eval_out=$EVAL_OUT"
   echo "[eval-4gpu] gpus=$GPUS num_shards=$NUM_SHARDS"
+  echo "[eval-4gpu] datasets=$EVAL_DATASETS"
   echo "[eval-4gpu] limit_per_dataset=$LIMIT_PER_DATASET"
 } | tee "$EVAL_OUT/eval_4gpu.log"
 
@@ -73,6 +75,7 @@ for rank in "${!GPU_LIST[@]}"; do
       --output "$shard_json" \
       --per-sample-csv "$shard_csv" \
       --train-loss-csv "$TRAIN_LOSS_CSV" \
+      --datasets "$EVAL_DATASETS" \
       --limit-per-dataset "$LIMIT_PER_DATASET" \
       --device cuda \
       --num-workers "$NUM_WORKERS_PER_GPU" \

@@ -71,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--per-sample-csv", type=Path, default=None, help="Optional per-sample CSV path.")
     parser.add_argument("--train-loss-csv", type=Path, default=None, help="Optional training loss.csv for comparison.")
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument(
+        "--datasets",
+        default="all",
+        help="Comma-separated dataset ids/names to evaluate: all, panocity, matterport3d, stanford2d3ds, structured3d.",
+    )
     parser.add_argument("--limit-per-dataset", type=int, default=100, help="Held-out samples per dataset. Use 0 for the full split.")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -103,9 +108,12 @@ def main() -> None:
     model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
     model.eval()
 
+    selected_datasets = select_datasets(args.datasets)
     runs: list[dict[str, Any]] = []
     per_sample_rows: list[dict[str, Any]] = []
     for dataset_index, (display_name, minimal_name, split) in enumerate(DATASETS):
+        if minimal_name not in selected_datasets:
+            continue
         dataset_args = copy.copy(train_args)
         dataset_args.dataset_format = "pano_minimal"
         dataset_args.minimal_datasets = minimal_name
@@ -139,6 +147,7 @@ def main() -> None:
         "device": str(device),
         "seed": args.seed,
         "limit_per_dataset": int(args.limit_per_dataset),
+        "datasets": sorted(selected_datasets),
         "shard_rank": int(args.shard_rank),
         "num_shards": int(args.num_shards),
         "dataset_root": str(train_args.dataset_root),
@@ -165,6 +174,35 @@ def main() -> None:
     if args.per_sample_csv is not None:
         write_per_sample_csv(args.per_sample_csv, per_sample_rows)
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def select_datasets(raw: str) -> set[str]:
+    aliases = {
+        "panocity": "panocity",
+        "pano_city": "panocity",
+        "matterport3d": "matterport3d",
+        "matterport": "matterport3d",
+        "mp3d": "matterport3d",
+        "stanford2d3ds": "stanford2d3ds",
+        "stanford": "stanford2d3ds",
+        "s2d3ds": "stanford2d3ds",
+        "structured3d": "structured3d",
+        "s3d": "structured3d",
+    }
+    if raw is None or str(raw).strip().lower() in {"", "all", "*"}:
+        return {minimal_name for _, minimal_name, _ in DATASETS}
+    selected: set[str] = set()
+    for token in str(raw).split(","):
+        key = token.strip().lower()
+        if not key:
+            continue
+        if key not in aliases:
+            known = ", ".join(sorted(aliases))
+            raise ValueError(f"Unknown dataset '{token}'. Expected one of: all, {known}")
+        selected.add(aliases[key])
+    if not selected:
+        raise ValueError("No datasets selected")
+    return selected
 
 
 def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
