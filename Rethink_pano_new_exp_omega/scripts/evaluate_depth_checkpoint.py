@@ -432,6 +432,13 @@ def write_eval_progress(path: Path | None, payload: dict[str, Any]) -> None:
     if path is None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
+    if "started_at" not in payload and path.exists():
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+            if "started_at" in previous:
+                payload["started_at"] = previous["started_at"]
+        except (OSError, json.JSONDecodeError):
+            pass
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp_path.replace(path)

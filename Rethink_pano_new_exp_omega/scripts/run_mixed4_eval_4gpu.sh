@@ -19,6 +19,9 @@ SEED="${SEED:-123}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
 PROGRESS_INTERVAL_SECONDS="${PROGRESS_INTERVAL_SECONDS:-30}"
 SHOW_PROGRESS="${SHOW_PROGRESS:-1}"
+PROGRESS_STYLE="${PROGRESS_STYLE:-bar}"
+PROGRESS_BAR_WIDTH="${PROGRESS_BAR_WIDTH:-32}"
+SHOW_GPU_PROC="${SHOW_GPU_PROC:-0}"
 
 mkdir -p "$EVAL_OUT/shards" "$EVAL_OUT/progress"
 rm -f "$EVAL_OUT"/progress/shard_*.json
@@ -63,6 +66,7 @@ fi
   echo "[eval-4gpu] datasets=$EVAL_DATASETS"
   echo "[eval-4gpu] limit_per_dataset=$LIMIT_PER_DATASET"
   echo "[eval-4gpu] progress_interval_seconds=$PROGRESS_INTERVAL_SECONDS"
+  echo "[eval-4gpu] progress_style=$PROGRESS_STYLE"
 } | tee "$EVAL_OUT/eval_4gpu.log"
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi -L 2>/dev/null | sed 's/^/[eval-4gpu][gpu] /' | tee -a "$EVAL_OUT/eval_4gpu.log" || true
@@ -85,6 +89,7 @@ import sys
 import time
 
 path, rank, num_shards, gpu = sys.argv[1:5]
+now = time.time()
 os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(
@@ -94,7 +99,8 @@ with open(path, "w", encoding="utf-8") as handle:
             "num_shards": int(num_shards),
             "cuda_visible_devices": str(gpu),
             "processed_samples": 0,
-            "updated_at": time.time(),
+            "started_at": now,
+            "updated_at": now,
         },
         handle,
     )
@@ -139,6 +145,7 @@ PY
 done
 
 if [[ "$SHOW_PROGRESS" == "1" ]]; then
+  PROGRESS_PRINTED=0
   while true; do
     alive=0
     for pid in "${PIDS[@]}"; do
@@ -147,9 +154,8 @@ if [[ "$SHOW_PROGRESS" == "1" ]]; then
         break
       fi
     done
-    "$PYTHON" - "$EVAL_OUT/progress" "$NUM_SHARDS" <<'PY' | tee -a "$EVAL_OUT/eval_4gpu.log"
+    progress_line="$("$PYTHON" - "$EVAL_OUT/progress" "$NUM_SHARDS" "$PROGRESS_BAR_WIDTH" "$EVAL_OUT/eval_4gpu.log" <<'PY'
 import datetime as _dt
-import glob
 import json
 import os
 import sys
@@ -157,8 +163,16 @@ import time
 
 progress_dir = sys.argv[1]
 num_shards = int(sys.argv[2])
+bar_width = int(sys.argv[3])
+log_path = sys.argv[4]
 now = time.time()
 items = []
+processed_total = 0
+sample_total = 0
+active_runs = []
+started_at_values = []
+last_losses = []
+states = []
 for rank in range(num_shards):
     path = os.path.join(progress_dir, f"shard_{rank}.json")
     if not os.path.exists(path):
@@ -179,17 +193,68 @@ for rank in range(num_shards):
     loss = payload.get("last_loss")
     loss_text = f" loss={float(loss):.4g}" if isinstance(loss, (float, int)) else ""
     items.append(f"rank{rank}@gpu{gpu}:pid={pid} {state} {run} {done}/{total} age={age:.0f}s{loss_text}")
+    processed_total += done
+    sample_total += total
+    if run not in ("", "-"):
+        active_runs.append(str(run))
+    if isinstance(loss, (float, int)):
+        last_losses.append(float(loss))
+    states.append(str(state))
+    started_at = payload.get("started_at")
+    if isinstance(started_at, (float, int)):
+        started_at_values.append(float(started_at))
 stamp = _dt.datetime.now().isoformat(timespec="seconds")
-print(f"[eval-4gpu][progress] {stamp} " + " | ".join(items))
+detail = f"[eval-4gpu][progress] {stamp} " + " | ".join(items)
+with open(log_path, "a", encoding="utf-8") as handle:
+    handle.write(detail + "\n")
+run_label = "-"
+if active_runs:
+    unique_runs = sorted(set(active_runs))
+    run_label = unique_runs[0] if len(unique_runs) == 1 else "mixed:" + ",".join(unique_runs[:3])
+ratio = (processed_total / sample_total) if sample_total > 0 else 0.0
+filled = min(bar_width, max(0, int(round(ratio * bar_width))))
+bar = "#" * filled + " " * (bar_width - filled)
+percent = ratio * 100.0
+elapsed = now - min(started_at_values) if started_at_values else 0.0
+rate = processed_total / elapsed if elapsed > 0 and processed_total > 0 else 0.0
+remaining = (sample_total - processed_total) / rate if rate > 0 and sample_total > processed_total else 0.0
+eta_text = f"{remaining/60:.1f}m" if remaining >= 60 else f"{remaining:.0f}s"
+loss_text = f", loss={last_losses[-1]:.4g}" if last_losses else ""
+state_text = "done" if states and all(state == "done" for state in states) else ("init" if not sample_total else "running")
+print(
+    f"Eval {run_label}: {percent:5.1f}%|{bar}| {processed_total}/{sample_total} "
+    f"[{elapsed/60:.1f}m<{eta_text}, {rate:.2f} samples/s, state={state_text}{loss_text}]"
+)
 PY
+)"
+    if [[ -t 1 && "$PROGRESS_STYLE" == "bar" ]]; then
+      printf '\r\033[K%s' "$progress_line"
+      PROGRESS_PRINTED=1
+    else
+      echo "$progress_line"
+    fi
     if command -v nvidia-smi >/dev/null 2>&1; then
-      nvidia-smi --query-compute-apps=gpu_bus_id,pid,used_memory --format=csv,noheader,nounits 2>/dev/null \
-        | sed 's/^/[eval-4gpu][gpu-proc] /' \
-        | tee -a "$EVAL_OUT/eval_4gpu.log" || true
+      gpu_proc_text="$(nvidia-smi --query-compute-apps=gpu_bus_id,pid,used_memory --format=csv,noheader,nounits 2>/dev/null || true)"
+      if [[ -n "$gpu_proc_text" ]]; then
+        while IFS= read -r line; do
+          [[ -n "$line" ]] || continue
+          echo "[eval-4gpu][gpu-proc] $line" >> "$EVAL_OUT/eval_4gpu.log"
+          if [[ "$SHOW_GPU_PROC" == "1" ]]; then
+            if [[ "$PROGRESS_PRINTED" == "1" ]]; then
+              printf '\n'
+              PROGRESS_PRINTED=0
+            fi
+            echo "[eval-4gpu][gpu-proc] $line"
+          fi
+        done <<< "$gpu_proc_text"
+      fi
     fi
     [[ "$alive" -eq 0 ]] && break
     sleep "$PROGRESS_INTERVAL_SECONDS"
   done
+  if [[ "$PROGRESS_PRINTED" == "1" ]]; then
+    printf '\n'
+  fi
 fi
 
 status=0
