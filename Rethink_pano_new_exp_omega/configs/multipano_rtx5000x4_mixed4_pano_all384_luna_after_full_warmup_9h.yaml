@@ -34,6 +34,9 @@ sampler:
 
 model:
   enable_pano_global_token: true
+  # Keep 2..8 panos x 4 yaw as the model context, but decode dense depth in
+  # smaller frame chunks so a full 32-window sample fits on 32GB RTX5000 cards.
+  dense_head_frames_chunk_size: 4
 
 supervision:
   gt_depth_semantics: range
@@ -74,6 +77,7 @@ optimization:
     - name: multipano_residual_fit_all384
       until_minutes: 360.0
       window_size: 384
+      dense_head_frames_chunk_size: 4
       trainable: luna_residual_heads
       lr: 5.0e-5
       pred_depth_scale_lr: 5.0e-5
@@ -85,6 +89,7 @@ optimization:
       learn_pred_depth_scale: true
     - name: multipano_residual_low_lr_all384
       window_size: 384
+      dense_head_frames_chunk_size: 4
       trainable: luna_residual_heads
       lr: 1.0e-5
       pred_depth_scale_lr: 1.0e-5

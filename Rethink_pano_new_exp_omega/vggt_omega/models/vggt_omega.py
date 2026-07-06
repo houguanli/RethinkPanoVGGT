@@ -55,10 +55,15 @@ class VGGTOmega(nn.Module):
         luna_camera_meta_dim: int = 16,
         luna_hidden_dim: Optional[int] = None,
         aggregator_kwargs: Optional[dict] = None,
+        dense_head_frames_chunk_size: Optional[int] = 8,
         checkpoint_path: Optional[str] = str(DEFAULT_CHECKPOINT_PATH),
         checkpoint_strict: bool = True,
     ) -> None:
         super().__init__()
+        self.dense_head_frames_chunk_size = (
+            None if dense_head_frames_chunk_size is None or int(dense_head_frames_chunk_size) <= 0
+            else int(dense_head_frames_chunk_size)
+        )
 
         aggregator_kwargs = dict(aggregator_kwargs or {})
         self.aggregator = Aggregator(
@@ -90,6 +95,7 @@ class VGGTOmega(nn.Module):
         pano_fov: Optional[torch.Tensor] = None,
         pano_token_meta: Optional[Dict[str, torch.Tensor]] = None,
         pano_camera_meta: Optional[torch.Tensor] = None,
+        dense_head_frames_chunk_size: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
@@ -130,10 +136,16 @@ class VGGTOmega(nn.Module):
                 )
 
             if self.dense_head is not None:
+                frames_chunk_size = (
+                    self.dense_head_frames_chunk_size
+                    if dense_head_frames_chunk_size is None
+                    else dense_head_frames_chunk_size
+                )
                 depth, depth_conf = self.dense_head(
                     aggregated_tokens_list,
                     images=images,
                     patch_token_start=patch_token_start,
+                    frames_chunk_size=frames_chunk_size,
                 )
                 predictions["depth"] = depth
                 predictions["depth_conf"] = depth_conf

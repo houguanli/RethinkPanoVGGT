@@ -236,6 +236,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Clamp residual log-depth correction to +/- this value.",
     )
     parser.add_argument(
+        "--dense-head-frames-chunk-size",
+        type=int,
+        default=8,
+        help=(
+            "Number of sampled windows decoded by DenseHead at once. Smaller values reduce "
+            "activation memory while preserving the full pano/window context in the aggregator; "
+            "set <=0 to disable DenseHead chunking."
+        ),
+    )
+    parser.add_argument(
         "--gt-depth-semantics",
         choices=["range", "cubemap_z", "double_cubemap_z"],
         default="range",
@@ -484,6 +494,10 @@ def train(args: argparse.Namespace) -> None:
             "[INFO] depth_loss = "
             f"{args.depth_loss_mode} huber_delta={args.depth_log_huber_delta} "
             f"clip={args.depth_log_error_clip}",
+            dist_state,
+        )
+        rank0_print(
+            f"[INFO] dense_head_frames_chunk_size = {args.dense_head_frames_chunk_size}",
             dist_state,
         )
         rank0_print(
@@ -935,6 +949,7 @@ def capture_default_sampler_args(args: argparse.Namespace) -> None:
     args.default_num_yaw = int(args.num_yaw)
     args.default_pitch_degrees = str(args.pitch_degrees)
     args.default_fov_degrees = float(args.fov_degrees)
+    args.default_dense_head_frames_chunk_size = int(args.dense_head_frames_chunk_size)
 
 
 def apply_stage_sampler_overrides(
@@ -958,6 +973,12 @@ def apply_stage_sampler_overrides(
     base_model = unwrap_model(model)
     if isinstance(base_model, DepthPredictionAdapter):
         base_model = base_model.model
+    dense_chunk = (
+        stage.get("dense_head_frames_chunk_size", args.default_dense_head_frames_chunk_size)
+        if stage
+        else args.default_dense_head_frames_chunk_size
+    )
+    set_dense_head_frames_chunk_size(base_model, args, dense_chunk)
     aggregator = getattr(base_model, "aggregator", None)
     model_patch_size = int(getattr(aggregator, "patch_size", patch_size))
     if patch_size != model_patch_size:
@@ -984,6 +1005,30 @@ def apply_stage_sampler_overrides(
     args.pitch_degrees = pitch_degrees
     args.fov_degrees = fov_degrees
     return current_sampler_status(model, args)
+
+
+def normalize_dense_head_frames_chunk_size(value: int | None) -> int | None:
+    if value is None:
+        return None
+    value = int(value)
+    if value <= 0:
+        return None
+    return value
+
+
+def set_dense_head_frames_chunk_size(
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+    value: int | None,
+) -> int | None:
+    dense_chunk = normalize_dense_head_frames_chunk_size(value)
+    base_model = unwrap_model(model)
+    if isinstance(base_model, DepthPredictionAdapter):
+        base_model = base_model.model
+    if hasattr(base_model, "dense_head_frames_chunk_size"):
+        base_model.dense_head_frames_chunk_size = dense_chunk
+    args.dense_head_frames_chunk_size = 0 if dense_chunk is None else int(dense_chunk)
+    return dense_chunk
 
 
 def current_sampler_status(model: torch.nn.Module, args: argparse.Namespace) -> Dict[str, int | float | str]:
@@ -1108,6 +1153,8 @@ def format_training_stages(stages: Sequence[Dict[str, Any]]) -> str:
             boundary.append(f"until_step={int(stage['until_steps'])}")
         if stage.get("window_size") is not None:
             boundary.append(f"window={int(stage['window_size'])}")
+        if stage.get("dense_head_frames_chunk_size") is not None:
+            boundary.append(f"dense_chunk={int(stage['dense_head_frames_chunk_size'])}")
         parts.append(f"{idx + 1}:{stage.get('name', f'stage{idx + 1}')}({','.join(boundary) or 'final'})")
     return "; ".join(parts)
 
@@ -1125,6 +1172,7 @@ def format_stage_status(
         f"trainable_mode={stage.get('trainable', 'default')} "
         f"lr={stage.get('lr', 'default')} "
         f"window={stage.get('window_size', 'default')} "
+        f"dense_chunk={stage.get('dense_head_frames_chunk_size', 'default')} "
         f"optimizer={stage.get('optimizer_type', 'default')} "
         f"luna_forward={stage.get('enable_luna_forward', 'default')} "
         f"depth_residual={stage.get('enable_depth_residual', 'default')} "
@@ -1207,6 +1255,7 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
             luna_patch_layers=args.luna_patch_layers,
             luna_camera_layers=args.luna_camera_layers,
             sampler=sampler,
+            dense_head_frames_chunk_size=normalize_dense_head_frames_chunk_size(args.dense_head_frames_chunk_size),
             aggregator_kwargs={
                 "depth": 24,
                 "num_heads": 4,
@@ -1241,6 +1290,7 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
         luna_patch_layers=args.luna_patch_layers,
         luna_camera_layers=args.luna_camera_layers,
         sampler=sampler,
+        dense_head_frames_chunk_size=normalize_dense_head_frames_chunk_size(args.dense_head_frames_chunk_size),
         checkpoint_path=None,
     )
 

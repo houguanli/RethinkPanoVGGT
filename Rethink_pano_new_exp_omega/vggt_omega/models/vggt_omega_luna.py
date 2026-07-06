@@ -42,6 +42,7 @@ class VGGTOmega_LUNA(VGGTOmega):
         luna_hidden_dim: Optional[int] = None,
         sampler: Optional[dict] = None,
         aggregator_kwargs: Optional[dict] = None,
+        dense_head_frames_chunk_size: Optional[int] = 8,
         checkpoint_path: Optional[str] = str(DEFAULT_CHECKPOINT_PATH),
         checkpoint_strict: bool = False,
     ) -> None:
@@ -60,6 +61,7 @@ class VGGTOmega_LUNA(VGGTOmega):
             luna_camera_meta_dim=luna_camera_meta_dim,
             luna_hidden_dim=luna_hidden_dim,
             aggregator_kwargs=aggregator_kwargs,
+            dense_head_frames_chunk_size=dense_head_frames_chunk_size,
             checkpoint_path=checkpoint_path,
             checkpoint_strict=checkpoint_strict,
         )

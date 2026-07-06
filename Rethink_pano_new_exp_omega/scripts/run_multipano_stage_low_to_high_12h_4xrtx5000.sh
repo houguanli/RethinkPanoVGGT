@@ -8,6 +8,7 @@ BASELINE="$ROOT/baseline01_vggt_omega"
 
 PYTHON="${PYTHON:-python}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 PANOVGGT_ROOT="${PANOVGGT_ROOT:-$(cd "$ROOT/.." && pwd)/panovggt}"
 
@@ -37,6 +38,7 @@ mkdir -p "$BASE_OUT" "$LUNA_OUT"
   echo "[sequence] luna_config=$LUNA_CONFIG"
   echo "[sequence] python=$PYTHON"
   echo "[sequence] nproc_per_node=$NPROC_PER_NODE"
+  echo "[sequence] pytorch_cuda_alloc_conf=$PYTORCH_CUDA_ALLOC_CONF"
   echo "[sequence] panovggt_root=$PANOVGGT_ROOT"
   echo "[sequence] calibration_samples_per_dataset=$CALIB_SAMPLES_PER_DATASET"
   echo "[sequence] num_yaw=$NUM_YAW"
