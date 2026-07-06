@@ -139,6 +139,7 @@ class Trainer:
         self.normalize_scene_scale = bool(normalize_scene_scale)
         self.save_checkpoint_on_exit = bool(save_checkpoint_on_exit)
         self.stop_requested = False
+        self._duration_stop_logged = False
         self.progress_bar_enabled = bool(self.logging_conf.get("progress_bar", True))
         self.progress_log_every = int(self.logging_conf.get("progress_log_every", 50))
         
@@ -443,8 +444,10 @@ class Trainer:
             self.train_epoch(dataloader)
             
             # Save checkpoint after each training epoch
+            self._distributed_barrier()
             if self.save_checkpoint_on_exit:
                 self.save_checkpoint(self.epoch)
+                self._distributed_barrier()
 
             # Clean up memory
             del dataloader
@@ -632,8 +635,7 @@ class Trainer:
         for data_iter, batch in enumerate(train_loader):
             if data_iter > limit_train_batches:
                 break
-            if self._duration_limit_reached():
-                self.stop_requested = True
+            if self._request_stop_if_duration_limit_reached():
                 break
             
             # measure data loading time
@@ -739,12 +741,7 @@ class Trainer:
                     postfix["loss"] = f"{float(loss_meter.val):.4f}"
                 progress_bar.set_postfix(**postfix)
 
-            if self._duration_limit_reached():
-                self.stop_requested = True
-                logging.info(
-                    f"Stopping after reaching max_duration_minutes="
-                    f"{self.max_duration_seconds / 60.0:.2f}"
-                )
+            if self._request_stop_if_duration_limit_reached():
                 break
 
         if progress_bar is not None:
@@ -884,6 +881,32 @@ class Trainer:
             return False
         elapsed = time.time() - self.start_time + self.ckpt_time_elapsed
         return elapsed >= self.max_duration_seconds
+
+    def _distributed_duration_limit_reached(self) -> bool:
+        if self.max_duration_seconds <= 0:
+            return False
+        local_reached = 1 if self._duration_limit_reached() else 0
+        if not is_dist_avail_and_initialized():
+            return bool(local_reached)
+        flag = torch.tensor([local_reached], device=self.device, dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(flag.item())
+
+    def _request_stop_if_duration_limit_reached(self) -> bool:
+        if not self._distributed_duration_limit_reached():
+            return False
+        self.stop_requested = True
+        if self.rank == 0 and not self._duration_stop_logged:
+            logging.info(
+                f"Stopping after reaching max_duration_minutes="
+                f"{self.max_duration_seconds / 60.0:.2f}"
+            )
+            self._duration_stop_logged = True
+        return True
+
+    def _distributed_barrier(self) -> None:
+        if is_dist_avail_and_initialized():
+            dist.barrier()
 
     def _append_metrics_csv(self, batch: Mapping, loss_dict: Mapping) -> None:
         def scalar(name: str) -> float:
