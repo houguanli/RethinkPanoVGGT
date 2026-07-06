@@ -12,6 +12,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .utils import create_uv_grid, position_grid_to_embed
 
@@ -75,32 +76,84 @@ class DenseHead(nn.Module):
         images: torch.Tensor,
         patch_token_start: int,
         frames_chunk_size: int | None = 8,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        use_checkpoint: bool = False,
+        return_confidence: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if patch_token_start is None:
             raise ValueError("patch_token_start is required for DenseHead")
 
         _, num_frames, _, _, _ = images.shape
 
         if frames_chunk_size is None or frames_chunk_size >= num_frames:
-            return self._forward_impl(aggregated_tokens_list, images, patch_token_start)
+            depth, depth_conf = self._forward_impl(
+                aggregated_tokens_list,
+                images,
+                patch_token_start,
+                return_confidence=return_confidence,
+            )
+            return depth, depth_conf if return_confidence else None
 
         assert frames_chunk_size > 0
 
         depth_chunks = []
         depth_conf_chunks = []
+        checkpoint_inputs = tuple(aggregated_tokens_list[idx] for idx in self.intermediate_layer_idx)
         for frames_start_idx in range(0, num_frames, frames_chunk_size):
             frames_end_idx = min(frames_start_idx + frames_chunk_size, num_frames)
-            depth_chunk, depth_conf_chunk = self._forward_impl(
-                aggregated_tokens_list,
-                images,
-                patch_token_start,
-                frames_start_idx,
-                frames_end_idx,
-            )
+            if use_checkpoint and self.training and torch.is_grad_enabled():
+                depth_chunk, depth_conf_chunk = checkpoint(
+                    self._forward_checkpoint_chunk,
+                    *checkpoint_inputs,
+                    images,
+                    torch.tensor(frames_start_idx, device=images.device),
+                    torch.tensor(frames_end_idx, device=images.device),
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                    patch_token_start=patch_token_start,
+                    return_confidence=return_confidence,
+                )
+            else:
+                depth_chunk, depth_conf_chunk = self._forward_impl(
+                    aggregated_tokens_list,
+                    images,
+                    patch_token_start,
+                    frames_start_idx,
+                    frames_end_idx,
+                    return_confidence=return_confidence,
+                )
             depth_chunks.append(depth_chunk)
-            depth_conf_chunks.append(depth_conf_chunk)
+            if return_confidence:
+                depth_conf_chunks.append(depth_conf_chunk)
 
-        return torch.cat(depth_chunks, dim=1), torch.cat(depth_conf_chunks, dim=1)
+        depth = torch.cat(depth_chunks, dim=1)
+        depth_conf = torch.cat(depth_conf_chunks, dim=1) if return_confidence else None
+        return depth, depth_conf
+
+    def _forward_checkpoint_chunk(
+        self,
+        *inputs,
+        patch_token_start: int,
+        return_confidence: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_feature_layers = len(self.intermediate_layer_idx)
+        layer_tensors = inputs[:num_feature_layers]
+        images = inputs[num_feature_layers]
+        frames_start_idx = int(inputs[num_feature_layers + 1].item())
+        frames_end_idx = int(inputs[num_feature_layers + 2].item())
+        chunked_layers: list[torch.Tensor | None] = [None] * (max(self.intermediate_layer_idx) + 1)
+        for layer_idx, layer_tensor in zip(self.intermediate_layer_idx, layer_tensors):
+            chunked_layers[layer_idx] = layer_tensor
+        depth, depth_conf = self._forward_impl(
+            chunked_layers,
+            images,
+            patch_token_start,
+            frames_start_idx,
+            frames_end_idx,
+            return_confidence=return_confidence,
+        )
+        if depth_conf is None:
+            depth_conf = depth.new_empty((0,))
+        return depth, depth_conf
 
     def _forward_impl(
         self,
@@ -109,7 +162,8 @@ class DenseHead(nn.Module):
         patch_token_start: int,
         frames_start_idx: int | None = None,
         frames_end_idx: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_confidence: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if frames_start_idx is not None and frames_end_idx is not None:
             images = images[:, frames_start_idx:frames_end_idx].contiguous()
 
@@ -142,18 +196,24 @@ class DenseHead(nn.Module):
         depth_logits = F.pixel_shuffle(depth_logits, self.final_shuffle_factor)
         depth_logits = depth_logits.permute(0, 2, 3, 1)
 
+        depth = torch.exp(depth_logits)
+        depth = depth.view(batch_size, num_frames, *depth.shape[1:])
+
+        if depth.dtype != torch.float32:
+            raise TypeError(f"DenseHead outputs must be fp32, got depth={depth.dtype}")
+
+        if not return_confidence:
+            return depth, None
+
         confidence_logits = self.proj_conf(fused)
         confidence_logits = F.pixel_shuffle(confidence_logits, self.final_shuffle_factor)
         confidence_logits = confidence_logits.permute(0, 2, 3, 1).squeeze(-1)
 
-        depth = torch.exp(depth_logits)
         depth_conf = 1.0 + torch.exp(confidence_logits)
-
-        depth = depth.view(batch_size, num_frames, *depth.shape[1:])
         depth_conf = depth_conf.view(batch_size, num_frames, *depth_conf.shape[1:])
 
-        if depth.dtype != torch.float32 or depth_conf.dtype != torch.float32:
-            raise TypeError(f"DenseHead outputs must be fp32, got depth={depth.dtype}, conf={depth_conf.dtype}")
+        if depth_conf.dtype != torch.float32:
+            raise TypeError(f"DenseHead confidence outputs must be fp32, got conf={depth_conf.dtype}")
 
         return depth, depth_conf
 

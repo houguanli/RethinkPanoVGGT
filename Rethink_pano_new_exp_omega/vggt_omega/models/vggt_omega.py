@@ -54,8 +54,11 @@ class VGGTOmega(nn.Module):
         luna_sphere_dim: int = 7,
         luna_camera_meta_dim: int = 16,
         luna_hidden_dim: Optional[int] = None,
+        aggregator_use_checkpoint: bool = False,
         aggregator_kwargs: Optional[dict] = None,
         dense_head_frames_chunk_size: Optional[int] = 8,
+        dense_head_use_checkpoint: bool = False,
+        dense_head_return_confidence: bool = True,
         checkpoint_path: Optional[str] = str(DEFAULT_CHECKPOINT_PATH),
         checkpoint_strict: bool = True,
     ) -> None:
@@ -64,6 +67,8 @@ class VGGTOmega(nn.Module):
             None if dense_head_frames_chunk_size is None or int(dense_head_frames_chunk_size) <= 0
             else int(dense_head_frames_chunk_size)
         )
+        self.dense_head_use_checkpoint = bool(dense_head_use_checkpoint)
+        self.dense_head_return_confidence = bool(dense_head_return_confidence)
 
         aggregator_kwargs = dict(aggregator_kwargs or {})
         self.aggregator = Aggregator(
@@ -77,6 +82,7 @@ class VGGTOmega(nn.Module):
             luna_sphere_dim=luna_sphere_dim,
             luna_camera_meta_dim=luna_camera_meta_dim,
             luna_hidden_dim=luna_hidden_dim,
+            use_checkpoint=aggregator_use_checkpoint,
             **aggregator_kwargs,
         )
         _warn_if_rope_not_max(self.aggregator)
@@ -96,6 +102,8 @@ class VGGTOmega(nn.Module):
         pano_token_meta: Optional[Dict[str, torch.Tensor]] = None,
         pano_camera_meta: Optional[torch.Tensor] = None,
         dense_head_frames_chunk_size: Optional[int] = None,
+        dense_head_use_checkpoint: Optional[bool] = None,
+        dense_head_return_confidence: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
@@ -141,14 +149,27 @@ class VGGTOmega(nn.Module):
                     if dense_head_frames_chunk_size is None
                     else dense_head_frames_chunk_size
                 )
+                use_checkpoint = (
+                    self.dense_head_use_checkpoint
+                    if dense_head_use_checkpoint is None
+                    else bool(dense_head_use_checkpoint)
+                )
+                return_confidence = (
+                    self.dense_head_return_confidence
+                    if dense_head_return_confidence is None
+                    else bool(dense_head_return_confidence)
+                )
                 depth, depth_conf = self.dense_head(
                     aggregated_tokens_list,
                     images=images,
                     patch_token_start=patch_token_start,
                     frames_chunk_size=frames_chunk_size,
+                    use_checkpoint=use_checkpoint,
+                    return_confidence=return_confidence,
                 )
                 predictions["depth"] = depth
-                predictions["depth_conf"] = depth_conf
+                if depth_conf is not None:
+                    predictions["depth_conf"] = depth_conf
 
             if self.text_alignment_head is not None:
                 predictions.update(

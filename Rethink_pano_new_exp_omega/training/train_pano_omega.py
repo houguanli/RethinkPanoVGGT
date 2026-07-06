@@ -150,6 +150,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-pano-global-token", dest="enable_pano_global_token", action="store_true", default=True)
     parser.add_argument("--disable-pano-global-token", dest="enable_pano_global_token", action="store_false")
     parser.add_argument(
+        "--aggregator-checkpoint",
+        dest="aggregator_use_checkpoint",
+        action="store_true",
+        default=False,
+        help="Checkpoint each aggregator attention layer to reduce activation memory at the cost of recompute.",
+    )
+    parser.add_argument("--no-aggregator-checkpoint", dest="aggregator_use_checkpoint", action="store_false")
+    parser.add_argument(
         "--training-stages",
         default=None,
         help=argparse.SUPPRESS,
@@ -245,6 +253,22 @@ def build_parser() -> argparse.ArgumentParser:
             "set <=0 to disable DenseHead chunking."
         ),
     )
+    parser.add_argument(
+        "--dense-head-checkpoint",
+        dest="dense_head_use_checkpoint",
+        action="store_true",
+        default=False,
+        help="Recompute DenseHead chunks during backward to reduce activation memory.",
+    )
+    parser.add_argument("--no-dense-head-checkpoint", dest="dense_head_use_checkpoint", action="store_false")
+    parser.add_argument(
+        "--dense-head-return-confidence",
+        dest="dense_head_return_confidence",
+        action="store_true",
+        default=True,
+        help="Return DenseHead confidence maps. Disable for training losses that do not consume depth_conf.",
+    )
+    parser.add_argument("--no-dense-head-return-confidence", dest="dense_head_return_confidence", action="store_false")
     parser.add_argument(
         "--gt-depth-semantics",
         choices=["range", "cubemap_z", "double_cubemap_z"],
@@ -476,6 +500,7 @@ def train(args: argparse.Namespace) -> None:
             dist_state,
         )
         rank0_print(f"[INFO] enable_pano_global_token = {args.enable_pano_global_token}", dist_state)
+        rank0_print(f"[INFO] aggregator_checkpoint = {args.aggregator_use_checkpoint}", dist_state)
         rank0_print(
             "[INFO] camera_supervision = "
             f"{args.camera_supervision_mode} position={args.camera_position_mode} "
@@ -497,7 +522,10 @@ def train(args: argparse.Namespace) -> None:
             dist_state,
         )
         rank0_print(
-            f"[INFO] dense_head_frames_chunk_size = {args.dense_head_frames_chunk_size}",
+            "[INFO] dense_head = "
+            f"frames_chunk_size={args.dense_head_frames_chunk_size} "
+            f"checkpoint={args.dense_head_use_checkpoint} "
+            f"return_confidence={args.dense_head_return_confidence}",
             dist_state,
         )
         rank0_print(
@@ -1254,8 +1282,11 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
             enable_luna=True,
             luna_patch_layers=args.luna_patch_layers,
             luna_camera_layers=args.luna_camera_layers,
+            aggregator_use_checkpoint=args.aggregator_use_checkpoint,
             sampler=sampler,
             dense_head_frames_chunk_size=normalize_dense_head_frames_chunk_size(args.dense_head_frames_chunk_size),
+            dense_head_use_checkpoint=args.dense_head_use_checkpoint,
+            dense_head_return_confidence=args.dense_head_return_confidence,
             aggregator_kwargs={
                 "depth": 24,
                 "num_heads": 4,
@@ -1289,8 +1320,11 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
         enable_luna=True,
         luna_patch_layers=args.luna_patch_layers,
         luna_camera_layers=args.luna_camera_layers,
+        aggregator_use_checkpoint=args.aggregator_use_checkpoint,
         sampler=sampler,
         dense_head_frames_chunk_size=normalize_dense_head_frames_chunk_size(args.dense_head_frames_chunk_size),
+        dense_head_use_checkpoint=args.dense_head_use_checkpoint,
+        dense_head_return_confidence=args.dense_head_return_confidence,
         checkpoint_path=None,
     )
 

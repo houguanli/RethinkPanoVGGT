@@ -36,6 +36,7 @@ from typing import Dict, Iterable, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from vggt_omega.models.layers import (
     LunaCameraAdapter,
@@ -77,6 +78,7 @@ class Aggregator(nn.Module):
         luna_sphere_dim: int = 7,
         luna_camera_meta_dim: int = 16,
         luna_hidden_dim: Optional[int] = None,
+        use_checkpoint: bool = False,
     ) -> None:
         super().__init__()
 
@@ -109,6 +111,7 @@ class Aggregator(nn.Module):
         self.cached_layer_indices: Set[int] = set(cached_layer_indices)
         self.enable_pano_global_token = enable_pano_global_token
         self.enable_luna = enable_luna
+        self.use_checkpoint = bool(use_checkpoint)
 
         # Camera + register tokens (b1/omega share this two-slot scheme).
         self.camera_token = nn.Parameter(torch.empty(1, 2, 1, embed_dim))
@@ -232,36 +235,37 @@ class Aggregator(nn.Module):
 
         outputs = []
         for block_idx in range(self.depth):
-            tokens, frame_tokens = self._run_frame_block(
-                tokens,
-                batch_size,
-                num_frames,
-                num_tokens,
-                embed_dim,
-                block_idx,
-                frame_rope,
-            )
-            tokens = self._run_inter_frame_attention_block(
-                tokens,
-                batch_size,
-                num_frames,
-                num_tokens,
-                embed_dim,
-                block_idx,
-                self.inter_frame_attention_types[block_idx],
-            )
+            if self.use_checkpoint and self.training and torch.is_grad_enabled():
+                def layer_forward(layer_tokens, current_block_idx=block_idx):
+                    return self._run_layer(
+                        layer_tokens,
+                        batch_size,
+                        num_frames,
+                        num_tokens,
+                        embed_dim,
+                        current_block_idx,
+                        frame_rope,
+                        pano_token_meta,
+                        pano_camera_meta,
+                    )
 
-            # ---- LUNA residual injection right before the cache decision ----
-            if self.enable_luna:
-                tokens = self._apply_luna_adapters(
+                tokens, frame_tokens = checkpoint(
+                    layer_forward,
+                    tokens,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                tokens, frame_tokens = self._run_layer(
                     tokens,
                     batch_size,
                     num_frames,
                     num_tokens,
                     embed_dim,
                     block_idx,
-                    pano_token_meta=pano_token_meta,
-                    pano_camera_meta=pano_camera_meta,
+                    frame_rope,
+                    pano_token_meta,
+                    pano_camera_meta,
                 )
 
             if block_idx in self.cached_layer_indices:
@@ -276,6 +280,51 @@ class Aggregator(nn.Module):
         return outputs, self.patch_token_start
 
     # ----------------------------------------------------- block-level helpers
+
+    def _run_layer(
+        self,
+        tokens: torch.Tensor,
+        batch_size: int,
+        num_frames: int,
+        num_tokens: int,
+        embed_dim: int,
+        block_idx: int,
+        frame_rope: Tuple[torch.Tensor, torch.Tensor],
+        pano_token_meta: Optional[Dict[str, torch.Tensor]] = None,
+        pano_camera_meta: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        tokens, frame_tokens = self._run_frame_block(
+            tokens,
+            batch_size,
+            num_frames,
+            num_tokens,
+            embed_dim,
+            block_idx,
+            frame_rope,
+        )
+        tokens = self._run_inter_frame_attention_block(
+            tokens,
+            batch_size,
+            num_frames,
+            num_tokens,
+            embed_dim,
+            block_idx,
+            self.inter_frame_attention_types[block_idx],
+        )
+
+        # ---- LUNA residual injection right before the cache decision ----
+        if self.enable_luna:
+            tokens = self._apply_luna_adapters(
+                tokens,
+                batch_size,
+                num_frames,
+                num_tokens,
+                embed_dim,
+                block_idx,
+                pano_token_meta=pano_token_meta,
+                pano_camera_meta=pano_camera_meta,
+            )
+        return tokens, frame_tokens
 
     def _run_frame_block(
         self,
