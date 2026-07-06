@@ -17,6 +17,12 @@ from torch.utils.checkpoint import checkpoint
 from .utils import create_uv_grid, position_grid_to_embed
 
 
+_LOG_DEPTH_CLAMP_MIN = -10.0
+_LOG_DEPTH_CLAMP_MAX = 10.0
+_CONFIDENCE_LOGIT_CLAMP_MIN = -10.0
+_CONFIDENCE_LOGIT_CLAMP_MAX = 10.0
+
+
 class DenseHead(nn.Module):
     """Dense prediction head used by the released VGGT-Omega checkpoints."""
 
@@ -195,6 +201,12 @@ class DenseHead(nn.Module):
         depth_logits = self.proj(fused)
         depth_logits = F.pixel_shuffle(depth_logits, self.final_shuffle_factor)
         depth_logits = depth_logits.permute(0, 2, 3, 1)
+        depth_logits = torch.nan_to_num(
+            depth_logits.float(),
+            nan=0.0,
+            posinf=_LOG_DEPTH_CLAMP_MAX,
+            neginf=_LOG_DEPTH_CLAMP_MIN,
+        ).clamp(min=_LOG_DEPTH_CLAMP_MIN, max=_LOG_DEPTH_CLAMP_MAX)
 
         depth = torch.exp(depth_logits)
         depth = depth.view(batch_size, num_frames, *depth.shape[1:])
@@ -208,6 +220,12 @@ class DenseHead(nn.Module):
         confidence_logits = self.proj_conf(fused)
         confidence_logits = F.pixel_shuffle(confidence_logits, self.final_shuffle_factor)
         confidence_logits = confidence_logits.permute(0, 2, 3, 1).squeeze(-1)
+        confidence_logits = torch.nan_to_num(
+            confidence_logits.float(),
+            nan=0.0,
+            posinf=_CONFIDENCE_LOGIT_CLAMP_MAX,
+            neginf=_CONFIDENCE_LOGIT_CLAMP_MIN,
+        ).clamp(min=_CONFIDENCE_LOGIT_CLAMP_MIN, max=_CONFIDENCE_LOGIT_CLAMP_MAX)
 
         depth_conf = 1.0 + torch.exp(confidence_logits)
         depth_conf = depth_conf.view(batch_size, num_frames, *depth_conf.shape[1:])
