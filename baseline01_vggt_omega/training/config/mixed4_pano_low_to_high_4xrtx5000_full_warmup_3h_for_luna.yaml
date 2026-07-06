@@ -110,6 +110,9 @@ loss:
     weight: 1.0
     mode: log_huber
     pred_depth_scale: 2.7437050342559814
+    depth_scale_alignment: sample_lstsq
+    depth_scale_alignment_min: 0.05
+    depth_scale_alignment_max: 50.0
     log_error_clip: 0.5
     log_huber_delta: 0.2
     sample_weighting: true
