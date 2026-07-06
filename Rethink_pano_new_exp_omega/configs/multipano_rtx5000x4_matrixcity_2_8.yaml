@@ -24,6 +24,7 @@ sampler:
 
 model:
   enable_pano_global_token: false
+  enable_pano_geometry_residual: false
 
 supervision:
   # Match this to preprocessing. The default MatrixCity conversion command uses double_cubemap_z.

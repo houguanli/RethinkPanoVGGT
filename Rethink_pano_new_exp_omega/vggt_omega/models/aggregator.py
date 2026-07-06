@@ -71,6 +71,7 @@ class Aggregator(nn.Module):
         cached_layer_indices: Sequence[int] = (4, 11, 17, 23),
         # ---- pano / LUNA additions (default off → bit-equivalent to base) ----
         enable_pano_global_token: bool = False,
+        enable_pano_geometry_residual: bool = False,
         pano_geom_dim: int = 6,
         enable_luna: bool = False,
         luna_patch_layers: Optional[Iterable[int]] = None,
@@ -110,6 +111,7 @@ class Aggregator(nn.Module):
         self.patch_size = patch_size
         self.cached_layer_indices: Set[int] = set(cached_layer_indices)
         self.enable_pano_global_token = enable_pano_global_token
+        self.enable_pano_geometry_residual = bool(enable_pano_geometry_residual)
         self.enable_luna = enable_luna
         self.use_checkpoint = bool(use_checkpoint)
 
@@ -117,18 +119,25 @@ class Aggregator(nn.Module):
         self.camera_token = nn.Parameter(torch.empty(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.empty(1, 2, num_register_tokens, embed_dim))
 
-        # Optional pano-global token (sits between camera and register).
+        # Optional pano geometry path. The residual mode does not add a token or
+        # change patch_token_start; it gates geometry into the existing camera
+        # token with alpha=0 so loading an old checkpoint starts as a no-op.
+        needs_pano_geometry = self.enable_pano_global_token or self.enable_pano_geometry_residual
         if self.enable_pano_global_token:
             self.pano_global_token = nn.Parameter(torch.empty(1, 1, 1, embed_dim))
+        else:
+            self.pano_global_token = None
+        if needs_pano_geometry:
             self.pano_geometry_embed = nn.Sequential(
                 nn.LayerNorm(pano_geom_dim),
                 nn.Linear(pano_geom_dim, embed_dim),
                 nn.SiLU(),
                 nn.Linear(embed_dim, embed_dim),
             )
+            self.pano_geometry_alpha = nn.Parameter(torch.zeros(1))
         else:
-            self.pano_global_token = None
             self.pano_geometry_embed = None
+            self.pano_geometry_alpha = None
 
         # patch_token_start = camera (1) + optional pano_global (0 or 1) + register (R)
         self.patch_token_start = 1 + int(self.enable_pano_global_token) + num_register_tokens
@@ -179,11 +188,6 @@ class Aggregator(nn.Module):
         nn.init.normal_(self.register_token, std=1e-3)
         if self.pano_global_token is not None:
             nn.init.normal_(self.pano_global_token, std=1e-3)
-        if self.pano_geometry_embed is not None:
-            final = self.pano_geometry_embed[-1]
-            if isinstance(final, nn.Linear):
-                nn.init.zeros_(final.weight)
-                nn.init.zeros_(final.bias)
 
     # ------------------------------------------------------------------ forward
 
@@ -208,22 +212,26 @@ class Aggregator(nn.Module):
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
+        geometry_delta = None
+        if self.pano_geometry_embed is not None and pano_geometry is not None:
+            if pano_geometry.shape[:2] != (batch_size, num_frames):
+                raise ValueError(
+                    f"Expected pano_geometry shape [B, S, D] with B={batch_size}, S={num_frames}, "
+                    f"got {tuple(pano_geometry.shape)}"
+                )
+            geometry_delta = self.pano_geometry_embed(
+                pano_geometry.to(device=images.device, dtype=patch_tokens.dtype)
+            )
+            geometry_delta = geometry_delta.reshape(batch_size * num_frames, 1, -1)
+            geometry_delta = self.pano_geometry_alpha.to(dtype=geometry_delta.dtype) * geometry_delta
+            if self.enable_pano_geometry_residual:
+                camera_token = camera_token + geometry_delta
+
         special_tokens = [camera_token]
         if self.enable_pano_global_token:
             pano_global_token = expand_and_flatten(self.pano_global_token, batch_size, num_frames)
-            if pano_geometry is not None:
-                if pano_geometry.shape[:2] != (batch_size, num_frames):
-                    raise ValueError(
-                        f"Expected pano_geometry shape [B, S, D] with B={batch_size}, S={num_frames}, "
-                        f"got {tuple(pano_geometry.shape)}"
-                    )
-                geometry_delta = self.pano_geometry_embed(
-                    pano_geometry.to(device=images.device, dtype=patch_tokens.dtype)
-                )
-                geometry_delta = geometry_delta.reshape(batch_size * num_frames, 1, -1)
-                camera_token = camera_token + geometry_delta
+            if geometry_delta is not None:
                 pano_global_token = pano_global_token + geometry_delta
-                special_tokens[0] = camera_token
             special_tokens.append(pano_global_token)
         special_tokens.append(register_token)
 

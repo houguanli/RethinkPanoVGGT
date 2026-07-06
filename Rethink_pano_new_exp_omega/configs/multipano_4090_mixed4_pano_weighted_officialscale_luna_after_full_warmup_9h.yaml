@@ -34,6 +34,7 @@ sampler:
 
 model:
   enable_pano_global_token: false
+  enable_pano_geometry_residual: false
 
 supervision:
   gt_depth_semantics: range

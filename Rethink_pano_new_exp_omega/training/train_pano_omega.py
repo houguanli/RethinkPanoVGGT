@@ -151,6 +151,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-pano-global-token", dest="enable_pano_global_token", action="store_true", default=True)
     parser.add_argument("--disable-pano-global-token", dest="enable_pano_global_token", action="store_false")
     parser.add_argument(
+        "--enable-pano-geometry-residual",
+        dest="enable_pano_geometry_residual",
+        action="store_true",
+        default=False,
+        help="Add pano geometry to the existing camera token through an alpha=0 gated residual path.",
+    )
+    parser.add_argument(
+        "--disable-pano-geometry-residual",
+        dest="enable_pano_geometry_residual",
+        action="store_false",
+    )
+    parser.add_argument(
         "--aggregator-checkpoint",
         dest="aggregator_use_checkpoint",
         action="store_true",
@@ -541,6 +553,7 @@ def train(args: argparse.Namespace) -> None:
             dist_state,
         )
         rank0_print(f"[INFO] enable_pano_global_token = {args.enable_pano_global_token}", dist_state)
+        rank0_print(f"[INFO] enable_pano_geometry_residual = {args.enable_pano_geometry_residual}", dist_state)
         rank0_print(f"[INFO] aggregator_checkpoint = {args.aggregator_use_checkpoint}", dist_state)
         rank0_print(
             "[INFO] camera_supervision = "
@@ -1409,6 +1422,7 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
             enable_depth=True,
             enable_alignment=False,
             enable_pano_global_token=args.enable_pano_global_token,
+            enable_pano_geometry_residual=args.enable_pano_geometry_residual,
             enable_luna=True,
             luna_patch_layers=args.luna_patch_layers,
             luna_camera_layers=args.luna_camera_layers,
@@ -1447,6 +1461,7 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
         enable_depth=True,
         enable_alignment=False,
         enable_pano_global_token=args.enable_pano_global_token,
+        enable_pano_geometry_residual=args.enable_pano_geometry_residual,
         enable_luna=True,
         luna_patch_layers=args.luna_patch_layers,
         luna_camera_layers=args.luna_camera_layers,

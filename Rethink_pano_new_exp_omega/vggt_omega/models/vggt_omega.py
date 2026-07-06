@@ -47,6 +47,7 @@ class VGGTOmega(nn.Module):
         enable_alignment: bool = False,
         # ---- pano / LUNA additions (default off) ----
         enable_pano_global_token: bool = False,
+        enable_pano_geometry_residual: bool = False,
         pano_geom_dim: int = 6,
         enable_luna: bool = False,
         luna_patch_layers=None,
@@ -75,6 +76,7 @@ class VGGTOmega(nn.Module):
             patch_size=patch_size,
             embed_dim=embed_dim,
             enable_pano_global_token=enable_pano_global_token,
+            enable_pano_geometry_residual=enable_pano_geometry_residual,
             pano_geom_dim=pano_geom_dim,
             enable_luna=enable_luna,
             luna_patch_layers=luna_patch_layers,

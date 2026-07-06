@@ -34,6 +34,7 @@ sampler:
 
 model:
   enable_pano_global_token: false
+  enable_pano_geometry_residual: false
   aggregator_use_checkpoint: true
   # Keep 2..8 panos x 4 yaw as the model context, but decode dense depth in
   # smaller frame chunks so a full 32-window sample fits on 32GB RTX5000 cards.
