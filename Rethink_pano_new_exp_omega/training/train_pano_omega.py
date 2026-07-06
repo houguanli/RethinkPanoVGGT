@@ -191,6 +191,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-rotation-weight", type=float, default=1.0)
     parser.add_argument("--camera-fov-weight", type=float, default=0.1)
     parser.add_argument(
+        "--camera-translation-normalization",
+        choices=["none", "target_rms", "target_mean_norm", "target_max_norm"],
+        default="none",
+        help="Normalize camera translation loss by the current sample's target relative pose scale.",
+    )
+    parser.add_argument(
+        "--camera-translation-normalization-eps",
+        type=float,
+        default=1.0,
+        help="Minimum translation normalization scale in meters.",
+    )
+    parser.add_argument(
         "--camera-supervision-mode",
         choices=["auto", "none", "window_pose", "pano_relative"],
         default="window_pose",
@@ -427,6 +439,7 @@ def train(args: argparse.Namespace) -> None:
     normalize_camera_supervision_args(args)
     normalize_pred_depth_scale_args(args)
     capture_default_sampler_args(args)
+    capture_default_loss_args(args)
     args.training_stages = normalize_training_stages(args.training_stages)
     if args.pano_sample_mode == "variable_neighborhood" and args.batch_size != 1:
         raise ValueError("variable_neighborhood uses variable-length inputs and currently requires batch_size=1.")
@@ -482,6 +495,7 @@ def train(args: argparse.Namespace) -> None:
             )
             active_stage_name = str(active_stage.get("name", f"stage{active_stage_index + 1}"))
             apply_stage_sampler_overrides(model, args, active_stage)
+            apply_stage_loss_overrides(args, active_stage)
             trainable_count, frozen_count = configure_trainable_for_stage(model, args, active_stage)
         else:
             if isinstance(model, DepthPredictionAdapter):
@@ -531,7 +545,8 @@ def train(args: argparse.Namespace) -> None:
         rank0_print(
             "[INFO] camera_supervision = "
             f"{args.camera_supervision_mode} position={args.camera_position_mode} "
-            f"weight={args.camera_loss_weight}",
+            f"weight={args.camera_loss_weight} "
+            f"translation_norm={args.camera_translation_normalization}",
             dist_state,
         )
         rank0_print(f"[INFO] pred_depth_scale = {args.pred_depth_scale}", dist_state)
@@ -619,6 +634,7 @@ def train(args: argparse.Namespace) -> None:
                         active_stage = next_stage
                         active_stage_name = str(active_stage.get("name", f"stage{active_stage_index + 1}"))
                         apply_stage_sampler_overrides(unwrap_model(model), args, active_stage)
+                        apply_stage_loss_overrides(args, active_stage)
                         trainable_count, frozen_count = configure_trainable_for_stage(
                             unwrap_model(model),
                             args,
@@ -1054,6 +1070,33 @@ def capture_default_sampler_args(args: argparse.Namespace) -> None:
     args.default_dense_head_frames_chunk_size = int(args.dense_head_frames_chunk_size)
 
 
+LOSS_STAGE_OVERRIDE_KEYS = (
+    "camera_loss_weight",
+    "camera_translation_weight",
+    "camera_rotation_weight",
+    "camera_fov_weight",
+    "pano_translation_consistency_weight",
+    "camera_translation_normalization",
+    "camera_translation_normalization_eps",
+)
+
+
+def capture_default_loss_args(args: argparse.Namespace) -> None:
+    args.default_loss_overrides = {key: getattr(args, key) for key in LOSS_STAGE_OVERRIDE_KEYS}
+
+
+def apply_stage_loss_overrides(args: argparse.Namespace, stage: Dict[str, Any] | None) -> None:
+    defaults = getattr(args, "default_loss_overrides", {})
+    for key in LOSS_STAGE_OVERRIDE_KEYS:
+        if key in defaults:
+            setattr(args, key, stage.get(key, defaults[key]) if stage else defaults[key])
+    if args.camera_supervision_mode == "none":
+        args.camera_loss_weight = 0.0
+        args.camera_translation_weight = 0.0
+        args.camera_rotation_weight = 0.0
+        args.camera_fov_weight = 0.0
+
+
 def apply_stage_sampler_overrides(
     model: torch.nn.Module,
     args: argparse.Namespace,
@@ -1276,6 +1319,7 @@ def format_stage_status(
         f"window={stage.get('window_size', 'default')} "
         f"dense_chunk={stage.get('dense_head_frames_chunk_size', 'default')} "
         f"optimizer={stage.get('optimizer_type', 'default')} "
+        f"camera_weight={stage.get('camera_loss_weight', 'default')} "
         f"luna_forward={stage.get('enable_luna_forward', 'default')} "
         f"depth_residual={stage.get('enable_depth_residual', 'default')} "
         f"trainable={trainable_count:,} frozen={frozen_count:,}"
@@ -1473,6 +1517,8 @@ def train_step(
             position_mode=args.camera_position_mode,
             supervision_mode=args.camera_supervision_mode,
             pano_consistency_weight=args.pano_translation_consistency_weight,
+            translation_normalization=args.camera_translation_normalization,
+            translation_normalization_eps=args.camera_translation_normalization_eps,
         )
         loss_camera = loss_camera_dict["loss_camera"]
         loss = loss_depth + float(args.overlap_consistency_weight) * loss_overlap + args.camera_loss_weight * loss_camera
@@ -2043,6 +2089,8 @@ def camera_alignment_loss(
     position_mode: str,
     supervision_mode: str = "window_pose",
     pano_consistency_weight: float = 0.1,
+    translation_normalization: str = "none",
+    translation_normalization_eps: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
     pred_pose = predictions.get("pose_enc")
     camera_meta = predictions.get("pano_camera_meta")
@@ -2068,10 +2116,14 @@ def camera_alignment_loss(
             batch=batch,
             position_mode=position_mode,
             consistency_weight=pano_consistency_weight,
+            translation_normalization=translation_normalization,
+            translation_normalization_eps=translation_normalization_eps,
         )
         zero = pred_translation.new_zeros(())
         return {
-            "loss_camera": translation_weight * loss_t + rotation_weight * loss_r,
+            "loss_camera": translation_weight * loss_t
+            + rotation_weight * loss_r
+            + translation_weight * pano_consistency_weight * loss_consistency,
             "loss_camera_t": loss_t,
             "loss_camera_r": loss_r,
             "loss_camera_fov": zero,
@@ -2100,7 +2152,12 @@ def camera_alignment_loss(
     if position_mode == "none" or translation_weight == 0:
         loss_t = pred_translation.new_zeros(())
     else:
-        loss_t = (pred_translation - target_translation).abs().mean()
+        scale = camera_translation_normalization_scale(
+            target_translation,
+            mode=translation_normalization,
+            eps=translation_normalization_eps,
+        )
+        loss_t = ((pred_translation - target_translation).abs() / scale[:, None, None]).mean()
     loss_r = torch.minimum(
         (pred_quat - target_quat).abs().sum(dim=-1),
         (pred_quat + target_quat).abs().sum(dim=-1),
@@ -2122,6 +2179,8 @@ def pano_relative_pose_loss(
     batch: Dict,
     position_mode: str,
     consistency_weight: float,
+    translation_normalization: str,
+    translation_normalization_eps: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # A multi-pano sample is flattened as [pano0 windows, pano1 windows, ...].
     # In pano_relative mode the camera head output is treated as a pano-level
@@ -2141,7 +2200,8 @@ def pano_relative_pose_loss(
     loss_t, loss_consistency = repeated_pano_translation_loss(
         pred_translation=pred_translation,
         target_translation=target_translation,
-        consistency_weight=consistency_weight,
+        translation_normalization=translation_normalization,
+        translation_normalization_eps=translation_normalization_eps,
     )
     loss_r = repeated_pano_rotation_loss(
         pred_quat=pred_quat,
@@ -2154,7 +2214,8 @@ def pano_relative_pose_loss(
 def repeated_pano_translation_loss(
     pred_translation: torch.Tensor,
     target_translation: torch.Tensor,
-    consistency_weight: float,
+    translation_normalization: str,
+    translation_normalization_eps: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if target_translation.ndim != 3 or target_translation.shape[1] < 2:
         zero = pred_translation.new_zeros(())
@@ -2173,10 +2234,35 @@ def repeated_pano_translation_loss(
         3,
     )
     target = target_translation[:, :, None, :]
-    loss_pose = (pred_per_pano - target).abs().mean()
+    scale = camera_translation_normalization_scale(
+        target_translation,
+        mode=translation_normalization,
+        eps=translation_normalization_eps,
+    )
+    loss_pose = ((pred_per_pano - target).abs() / scale[:, None, None, None]).mean()
     pred_mean = pred_per_pano.mean(dim=2)
-    loss_consistency = (pred_per_pano - pred_mean[:, :, None, :]).abs().mean()
-    return loss_pose + consistency_weight * loss_consistency, loss_consistency
+    loss_consistency = ((pred_per_pano - pred_mean[:, :, None, :]).abs() / scale[:, None, None, None]).mean()
+    return loss_pose, loss_consistency
+
+
+def camera_translation_normalization_scale(
+    target_translation: torch.Tensor,
+    mode: str,
+    eps: float,
+) -> torch.Tensor:
+    batch_shape = target_translation.shape[0]
+    if mode == "none":
+        return target_translation.new_ones(batch_shape)
+    norms = torch.linalg.vector_norm(target_translation.float(), dim=-1)
+    if mode == "target_rms":
+        scale = norms.square().mean(dim=-1).sqrt()
+    elif mode == "target_mean_norm":
+        scale = norms.mean(dim=-1)
+    elif mode == "target_max_norm":
+        scale = norms.max(dim=-1).values
+    else:
+        raise ValueError(f"Unknown camera translation normalization: {mode}")
+    return scale.to(device=target_translation.device, dtype=target_translation.dtype).clamp_min(float(eps))
 
 
 def repeated_pano_rotation_loss(

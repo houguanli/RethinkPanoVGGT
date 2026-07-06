@@ -45,11 +45,13 @@ supervision:
   depth_residual_max_log: 0.5
   enable_camera_head: true
   camera_supervision_mode: pano_relative
-  camera_loss_weight: 1.0
+  camera_loss_weight: 0.5
   camera_translation_weight: 1.0
   camera_rotation_weight: 0.0
   camera_fov_weight: 0.0
   pano_translation_consistency_weight: 0.1
+  camera_translation_normalization: target_rms
+  camera_translation_normalization_eps: 1.0
   camera_position_mode: relative_anchor
 
 optimization:
@@ -66,6 +68,7 @@ optimization:
       pred_depth_scale_lr: 5.0e-5
       weight_decay: 0.05
       optimizer_type: adamw
+      camera_loss_weight: 0.5
       enable_luna_forward: true
       enable_depth_residual: true
       train_depth_residual: true
