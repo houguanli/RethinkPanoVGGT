@@ -340,6 +340,31 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="Maximum per-pixel absolute log-depth error for --depth-loss-mode=clipped_log_l1.",
     )
+    parser.add_argument(
+        "--depth-scale-alignment",
+        choices=["none", "sample_lstsq", "sample_log_median"],
+        default="none",
+        help=(
+            "Per-sample scale alignment for depth supervision. sample_lstsq follows the "
+            "PanoVGGT/VGGT scale-normalized geometry protocol by fitting one optimal "
+            "stop-gradient scale per training sample before computing depth loss."
+        ),
+    )
+    parser.add_argument("--depth-scale-alignment-min", type=float, default=0.05)
+    parser.add_argument("--depth-scale-alignment-max", type=float, default=50.0)
+    parser.add_argument("--depth-scale-alignment-eps", type=float, default=1e-6)
+    parser.add_argument(
+        "--no-camera-depth-scale-alignment",
+        dest="camera_depth_scale_alignment",
+        action="store_false",
+        default=True,
+        help="Do not apply the same per-sample depth scale to camera translation predictions.",
+    )
+    parser.add_argument(
+        "--camera-depth-scale-alignment",
+        dest="camera_depth_scale_alignment",
+        action="store_true",
+    )
     parser.add_argument("--loss-sample-weighting", dest="loss_sample_weighting", action="store_true", default=True)
     parser.add_argument("--no-loss-sample-weighting", dest="loss_sample_weighting", action="store_false")
     parser.add_argument("--min-window-valid-ratio", type=float, default=0.05)
@@ -565,6 +590,13 @@ def train(args: argparse.Namespace) -> None:
         rank0_print(f"[INFO] pred_depth_scale = {args.pred_depth_scale}", dist_state)
         rank0_print(f"[INFO] learn_pred_depth_scale = {args.learn_pred_depth_scale}", dist_state)
         rank0_print(
+            "[INFO] depth_scale_alignment = "
+            f"{args.depth_scale_alignment} "
+            f"range=[{args.depth_scale_alignment_min}, {args.depth_scale_alignment_max}] "
+            f"camera={args.camera_depth_scale_alignment}",
+            dist_state,
+        )
+        rank0_print(
             "[INFO] depth_residual = "
             f"{args.depth_residual_mode} hidden={args.depth_residual_hidden} "
             f"max_log={args.depth_residual_max_log} "
@@ -693,6 +725,11 @@ def train(args: argparse.Namespace) -> None:
                     ),
                     "pred_depth_finite_ratio": float(loss_dict.get("pred_depth_finite_ratio", torch.tensor(0.0)).item()),
                     "loss_depth_unfiltered": float(loss_dict.get("loss_depth_unfiltered", torch.tensor(0.0)).item()),
+                    "depth_sample_scale_median": float(
+                        loss_dict.get("depth_sample_scale_median", torch.tensor(1.0)).item()
+                    ),
+                    "depth_sample_scale_min": float(loss_dict.get("depth_sample_scale_min", torch.tensor(1.0)).item()),
+                    "depth_sample_scale_max": float(loss_dict.get("depth_sample_scale_max", torch.tensor(1.0)).item()),
                     "pred_depth_scale": float(loss_dict["pred_depth_scale"].item()),
                     "stage": active_stage_name,
                     "stage_index": int(active_stage_index + 1) if active_stage_index is not None else 0,
@@ -713,6 +750,7 @@ def train(args: argparse.Namespace) -> None:
                         f"depth_loss_valid={metrics['depth_loss_valid_ratio']:.4f} "
                         f"depth_keep={metrics['depth_loss_window_keep_ratio']:.4f} "
                         f"pred_finite={metrics['pred_depth_finite_ratio']:.4f} "
+                        f"sample_scale={metrics['depth_sample_scale_median']:.4f} "
                         f"scale={metrics['pred_depth_scale']:.6f}"
                     )
                     if progress is not None:
@@ -734,6 +772,7 @@ def train(args: argparse.Namespace) -> None:
                             lvalid=f"{metrics['depth_loss_valid_ratio']:.3f}",
                             keep=f"{metrics['depth_loss_window_keep_ratio']:.3f}",
                             pfinite=f"{metrics['pred_depth_finite_ratio']:.3f}",
+                            sscale=f"{metrics['depth_sample_scale_median']:.3f}",
                             scale=f"{metrics['pred_depth_scale']:.3f}",
                         )
                         if args.progress_log_every > 0 and global_step % args.progress_log_every == 0:
@@ -1519,7 +1558,18 @@ def train_step(
             "_pred_depth_scale",
             predictions["depth"].new_tensor(float(args.pred_depth_scale)),
         )
-        pred_depth = predictions["depth"] * pred_depth_scale
+        base_depth_scale = pred_depth_scale.detach() if args.depth_scale_alignment != "none" else pred_depth_scale
+        pred_depth_base = predictions["depth"] * base_depth_scale
+        sample_depth_scale = estimate_sample_depth_alignment_scale(
+            pred_depth_base,
+            target_depth,
+            target_valid,
+            mode=args.depth_scale_alignment,
+            min_scale=args.depth_scale_alignment_min,
+            max_scale=args.depth_scale_alignment_max,
+            eps=args.depth_scale_alignment_eps,
+        )
+        pred_depth = pred_depth_base * expand_sample_scale_like(sample_depth_scale, pred_depth_base)
         depth_loss_valid, depth_loss_window_keep_ratio, pred_depth_finite_ratio = depth_loss_validity_stats(
             pred_depth,
             target_depth,
@@ -1578,6 +1628,11 @@ def train_step(
             pano_consistency_weight=args.pano_translation_consistency_weight,
             translation_normalization=args.camera_translation_normalization,
             translation_normalization_eps=args.camera_translation_normalization_eps,
+            pred_translation_scale=(
+                (base_depth_scale.detach() * sample_depth_scale)
+                if args.camera_depth_scale_alignment and args.depth_scale_alignment != "none"
+                else None
+            ),
         )
         loss_camera = loss_camera_dict["loss_camera"]
         loss = loss_depth + float(args.overlap_consistency_weight) * loss_overlap + args.camera_loss_weight * loss_camera
@@ -1606,6 +1661,9 @@ def train_step(
         "depth_loss_window_keep_ratio": depth_loss_window_keep_ratio.detach(),
         "pred_depth_finite_ratio": pred_depth_finite_ratio.detach(),
         "loss_depth_unfiltered": loss_depth_unfiltered.detach(),
+        "depth_sample_scale_median": sample_depth_scale.detach().float().median(),
+        "depth_sample_scale_min": sample_depth_scale.detach().float().min(),
+        "depth_sample_scale_max": sample_depth_scale.detach().float().max(),
         "pred_depth_scale": logged_pred_depth_scale,
         **{key: value.detach() for key, value in loss_camera_dict.items() if key != "loss_camera"},
     }
@@ -1888,6 +1946,9 @@ def write_tensorboard_metrics(writer, metrics: Dict[str, Any]) -> None:
         "data/depth_loss_valid_ratio": "depth_loss_valid_ratio",
         "data/depth_loss_window_keep_ratio": "depth_loss_window_keep_ratio",
         "data/pred_depth_finite_ratio": "pred_depth_finite_ratio",
+        "data/depth_sample_scale_median": "depth_sample_scale_median",
+        "data/depth_sample_scale_min": "depth_sample_scale_min",
+        "data/depth_sample_scale_max": "depth_sample_scale_max",
         "train/lr": "lr",
         "train/pred_depth_scale": "pred_depth_scale",
         "train/elapsed_seconds": "elapsed_seconds",
@@ -2007,6 +2068,62 @@ def masked_log_l1_depth(
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return masked_depth_loss(pred_depth, target_depth, valid_mask, mode="log_l1")
+
+
+def estimate_sample_depth_alignment_scale(
+    pred_depth: torch.Tensor,
+    target_depth: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    mode: str = "none",
+    min_scale: float = 0.05,
+    max_scale: float = 50.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    batch_size = pred_depth.shape[0]
+    if mode == "none":
+        return pred_depth.new_ones(batch_size)
+    if mode not in {"sample_lstsq", "sample_log_median"}:
+        raise ValueError(f"Unknown depth-scale-alignment mode: {mode}")
+
+    pred = pred_depth.detach().float()
+    target = target_depth.detach().to(device=pred.device, dtype=torch.float32)
+    valid = torch.isfinite(pred) & torch.isfinite(target) & (pred > 0) & (target > 0)
+    if valid_mask is not None:
+        valid = valid & valid_mask.to(device=pred.device, dtype=torch.bool)
+
+    pred_flat = pred.reshape(batch_size, -1)
+    target_flat = target.reshape(batch_size, -1)
+    valid_flat = valid.reshape(batch_size, -1)
+    min_scale = float(min_scale)
+    max_scale = float(max_scale)
+    eps = max(float(eps), 1e-12)
+
+    if mode == "sample_lstsq":
+        weights = valid_flat.to(dtype=torch.float32)
+        numerator = (pred_flat * target_flat * weights).sum(dim=1)
+        denominator = (pred_flat.square() * weights).sum(dim=1).clamp_min(eps)
+        scale = numerator / denominator
+        has_valid = valid_flat.any(dim=1)
+        scale = torch.where(has_valid, scale, torch.ones_like(scale))
+    else:
+        scales = []
+        for item_pred, item_target, item_valid in zip(pred_flat, target_flat, valid_flat):
+            if bool(item_valid.any()):
+                ratio = (item_target[item_valid] / item_pred[item_valid]).clamp_min(eps)
+                scales.append(torch.exp(torch.log(ratio).median()))
+            else:
+                scales.append(item_pred.new_tensor(1.0))
+        scale = torch.stack(scales, dim=0)
+
+    scale = torch.nan_to_num(scale, nan=1.0, posinf=max_scale, neginf=min_scale)
+    return scale.clamp(min=min_scale, max=max_scale).to(device=pred_depth.device, dtype=pred_depth.dtype)
+
+
+def expand_sample_scale_like(scale: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    scale = scale.to(device=target.device, dtype=target.dtype)
+    while scale.ndim < target.ndim:
+        scale = scale.unsqueeze(-1)
+    return scale
 
 
 def depth_loss_validity_stats(
@@ -2186,6 +2303,7 @@ def camera_alignment_loss(
     pano_consistency_weight: float = 0.1,
     translation_normalization: str = "none",
     translation_normalization_eps: float = 1.0,
+    pred_translation_scale: torch.Tensor | None = None,
 ) -> Dict[str, torch.Tensor]:
     pred_pose = predictions.get("pose_enc")
     camera_meta = predictions.get("pano_camera_meta")
@@ -2203,6 +2321,8 @@ def camera_alignment_loss(
     rotations_c2w = camera_meta["rotations"].to(device=pred_pose.device, dtype=pred_pose.dtype)
     rotations_w2c = rotations_c2w.transpose(-1, -2).contiguous()
     pred_translation = pred_pose[..., :3]
+    if pred_translation_scale is not None:
+        pred_translation = pred_translation * expand_sample_scale_like(pred_translation_scale, pred_translation)
     if supervision_mode == "pano_relative":
         pred_quat = F.normalize(pred_pose[..., 3:7], dim=-1)
         loss_t, loss_r, loss_consistency = pano_relative_pose_loss(

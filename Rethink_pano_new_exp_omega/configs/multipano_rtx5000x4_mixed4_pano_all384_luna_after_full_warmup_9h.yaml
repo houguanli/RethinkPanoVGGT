@@ -48,6 +48,9 @@ supervision:
   depth_loss_mode: log_huber
   depth_log_error_clip: 0.5
   depth_log_huber_delta: 0.2
+  depth_scale_alignment: sample_lstsq
+  depth_scale_alignment_min: 0.05
+  depth_scale_alignment_max: 50.0
   loss_sample_weighting: true
   min_window_valid_ratio: 0.05
   valid_ratio_loss_power: 0.5
@@ -56,7 +59,7 @@ supervision:
   overlap_consistency_weight: 0.02
   overlap_band_fraction: 0.20
   pred_depth_scale: 2.7437050342559814
-  learn_pred_depth_scale: true
+  learn_pred_depth_scale: false
   pred_depth_scale_lr: 5.0e-5
   depth_residual_mode: log_conv
   depth_residual_hidden: 32
@@ -96,7 +99,7 @@ optimization:
       enable_luna_forward: true
       enable_depth_residual: true
       train_depth_residual: true
-      learn_pred_depth_scale: true
+      learn_pred_depth_scale: false
     - name: multipano_residual_low_lr_all384
       window_size: 384
       dense_head_frames_chunk_size: 1
@@ -109,7 +112,7 @@ optimization:
       enable_luna_forward: true
       enable_depth_residual: true
       train_depth_residual: true
-      learn_pred_depth_scale: true
+      learn_pred_depth_scale: false
 
 runtime:
   device: cuda

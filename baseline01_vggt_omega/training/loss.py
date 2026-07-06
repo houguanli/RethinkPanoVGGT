@@ -284,6 +284,10 @@ def compute_depth_loss(
     sample_weight_max=1.25,
     overlap_consistency_weight=0.0,
     overlap_band_fraction=0.20,
+    depth_scale_alignment="none",
+    depth_scale_alignment_min=0.05,
+    depth_scale_alignment_max=50.0,
+    depth_scale_alignment_eps=1e-6,
     **kwargs,
 ):
     """
@@ -304,6 +308,16 @@ def compute_depth_loss(
     gt_depth = gt_depth[..., None]              # (B, H, W, 1)
     gt_depth_mask = batch['point_masks'].clone()   # 3D points derived from depth map, so we use the same mask
     gt_depth_mask = gt_depth_mask & torch.isfinite(gt_depth[..., 0]) & (gt_depth[..., 0] > 0)
+    sample_scale = estimate_sample_depth_alignment_scale(
+        pred_depth,
+        gt_depth,
+        gt_depth_mask,
+        mode=depth_scale_alignment,
+        min_scale=depth_scale_alignment_min,
+        max_scale=depth_scale_alignment_max,
+        eps=depth_scale_alignment_eps,
+    )
+    pred_depth = pred_depth * expand_sample_scale_like(sample_scale, pred_depth)
 
     if gt_depth_mask.sum() < 100:
         # If there are less than 100 valid points, skip this batch
@@ -359,6 +373,58 @@ def compute_depth_loss(
 
 def masked_log_l1_depth(pred_depth, target_depth, valid_mask=None):
     return masked_log_depth_loss(pred_depth, target_depth, valid_mask, mode="log_l1")
+
+
+def estimate_sample_depth_alignment_scale(
+    pred_depth,
+    target_depth,
+    valid_mask=None,
+    mode="none",
+    min_scale=0.05,
+    max_scale=50.0,
+    eps=1e-6,
+):
+    batch_size = pred_depth.shape[0]
+    if mode == "none":
+        return pred_depth.new_ones(batch_size)
+    if mode not in {"sample_lstsq", "sample_log_median"}:
+        raise ValueError(f"Unknown depth_scale_alignment mode: {mode}")
+    pred = pred_depth.detach().float()
+    target = target_depth.detach().to(device=pred.device, dtype=torch.float32)
+    valid = torch.isfinite(pred) & torch.isfinite(target) & (pred > 0) & (target > 0)
+    if valid_mask is not None:
+        valid = valid & valid_mask.to(device=pred.device, dtype=torch.bool)[..., None]
+
+    pred_flat = pred.reshape(batch_size, -1)
+    target_flat = target.reshape(batch_size, -1)
+    valid_flat = valid.reshape(batch_size, -1)
+    min_scale = float(min_scale)
+    max_scale = float(max_scale)
+    eps = max(float(eps), 1e-12)
+    if mode == "sample_lstsq":
+        weights = valid_flat.to(dtype=torch.float32)
+        numerator = (pred_flat * target_flat * weights).sum(dim=1)
+        denominator = (pred_flat.square() * weights).sum(dim=1).clamp_min(eps)
+        scale = numerator / denominator
+        scale = torch.where(valid_flat.any(dim=1), scale, torch.ones_like(scale))
+    else:
+        scales = []
+        for item_pred, item_target, item_valid in zip(pred_flat, target_flat, valid_flat):
+            if bool(item_valid.any()):
+                ratio = (item_target[item_valid] / item_pred[item_valid]).clamp_min(eps)
+                scales.append(torch.exp(torch.log(ratio).median()))
+            else:
+                scales.append(item_pred.new_tensor(1.0))
+        scale = torch.stack(scales, dim=0)
+    scale = torch.nan_to_num(scale, nan=1.0, posinf=max_scale, neginf=min_scale)
+    return scale.clamp(min=min_scale, max=max_scale).to(device=pred_depth.device, dtype=pred_depth.dtype)
+
+
+def expand_sample_scale_like(scale, target):
+    scale = scale.to(device=target.device, dtype=target.dtype)
+    while scale.ndim < target.ndim:
+        scale = scale.unsqueeze(-1)
+    return scale
 
 
 def masked_log_depth_loss(

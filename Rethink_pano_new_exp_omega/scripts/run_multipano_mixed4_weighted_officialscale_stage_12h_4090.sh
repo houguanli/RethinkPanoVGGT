@@ -107,6 +107,9 @@ LOCAL_RANK=0 RANK=0 WORLD_SIZE=1 MASTER_ADDR="$MASTER_ADDR" MASTER_PORT="$BASE_P
   PYTHONPATH="$BASELINE${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" training/launch.py --config "$BASE_CONFIG" \
     loss.depth.pred_depth_scale="$PRED_DEPTH_SCALE" \
     loss.depth.mode=log_huber \
+    loss.depth.depth_scale_alignment=sample_lstsq \
+    loss.depth.depth_scale_alignment_min=0.05 \
+    loss.depth.depth_scale_alignment_max=50.0 \
   2>&1 | tee -a "$BASE_OUT/train_3h_console.log"
 echo "[sequence] stage1 baseline full warmup weighted official-scale low384 finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 
@@ -121,6 +124,9 @@ LOCAL_RANK=0 RANK=0 WORLD_SIZE=1 MASTER_ADDR="$MASTER_ADDR" MASTER_PORT="$LUNA_P
   PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" training/train_pano_omega.py --config "$LUNA_CONFIG" \
     --pred-depth-scale "$PRED_DEPTH_SCALE" \
     --depth-loss-mode log_huber \
+    --depth-scale-alignment sample_lstsq \
+    --depth-scale-alignment-min 0.05 \
+    --depth-scale-alignment-max 50.0 \
   2>&1 | tee -a "$LUNA_OUT/train_9h.log"
 echo "[sequence] stage2/3 multi-pano LUNA weighted official-scale low384 finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 
