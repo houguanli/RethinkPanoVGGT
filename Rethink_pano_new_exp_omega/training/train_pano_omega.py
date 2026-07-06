@@ -654,6 +654,10 @@ def train(args: argparse.Namespace) -> None:
                     "loss_camera_consistency": float(
                         loss_dict.get("loss_camera_consistency", torch.tensor(0.0)).item()
                     ),
+                    "depth_valid_ratio": float(loss_dict.get("depth_valid_ratio", torch.tensor(0.0)).item()),
+                    "depth_window_keep_ratio": float(
+                        loss_dict.get("depth_window_keep_ratio", torch.tensor(0.0)).item()
+                    ),
                     "pred_depth_scale": float(loss_dict["pred_depth_scale"].item()),
                     "stage": active_stage_name,
                     "stage_index": int(active_stage_index + 1) if active_stage_index is not None else 0,
@@ -670,6 +674,7 @@ def train(args: argparse.Namespace) -> None:
                         f"stage={active_stage_name} elapsed={elapsed_seconds / 60.0:.2f}m "
                         f"loss={metrics['loss']:.6f} depth={metrics['loss_depth']:.6f} "
                         f"overlap={metrics['loss_overlap']:.6f} camera={metrics['loss_camera']:.6f} "
+                        f"depth_valid={metrics['depth_valid_ratio']:.4f} "
                         f"scale={metrics['pred_depth_scale']:.6f}"
                     )
                     if progress is not None:
@@ -685,6 +690,9 @@ def train(args: argparse.Namespace) -> None:
                             stage=active_stage_name,
                             window=metrics["window_size"],
                             loss=f"{metrics['loss']:.4f}",
+                            depth=f"{metrics['loss_depth']:.4f}",
+                            camera=f"{metrics['loss_camera']:.4f}",
+                            valid=f"{metrics['depth_valid_ratio']:.3f}",
                             scale=f"{metrics['pred_depth_scale']:.3f}",
                         )
                         if args.progress_log_every > 0 and global_step % args.progress_log_every == 0:
@@ -1413,6 +1421,12 @@ def train_step(
         source_depth_semantics=args.gt_depth_semantics,
         max_range_depth=args.depth_max_m,
     )
+    target_valid_float = target_valid.to(dtype=torch.float32)
+    depth_valid_ratio = target_valid_float.mean()
+    depth_window_keep_ratio = (
+        target_valid_float.mean(dim=tuple(range(2, target_valid_float.ndim)))
+        >= max(float(args.min_window_valid_ratio), 0.0)
+    ).to(dtype=torch.float32).mean()
     amp_enabled = pano_images.device.type == "cuda" and args.amp_dtype != "none"
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float32
     with torch.autocast(device_type=pano_images.device.type, dtype=amp_dtype, enabled=amp_enabled):
@@ -1481,6 +1495,8 @@ def train_step(
         "loss_depth": loss_depth.detach(),
         "loss_overlap": loss_overlap.detach(),
         "loss_camera": loss_camera.detach(),
+        "depth_valid_ratio": depth_valid_ratio.detach(),
+        "depth_window_keep_ratio": depth_window_keep_ratio.detach(),
         "pred_depth_scale": logged_pred_depth_scale,
         **{key: value.detach() for key, value in loss_camera_dict.items() if key != "loss_camera"},
     }
@@ -1757,6 +1773,8 @@ def write_tensorboard_metrics(writer, metrics: Dict[str, Any]) -> None:
         "loss/camera_r": "loss_camera_r",
         "loss/camera_fov": "loss_camera_fov",
         "loss/camera_consistency": "loss_camera_consistency",
+        "data/depth_valid_ratio": "depth_valid_ratio",
+        "data/depth_window_keep_ratio": "depth_window_keep_ratio",
         "train/lr": "lr",
         "train/pred_depth_scale": "pred_depth_scale",
         "train/elapsed_seconds": "elapsed_seconds",
