@@ -915,15 +915,15 @@ class DepthPredictionAdapter(torch.nn.Module):
     def forward(self, *args, **kwargs) -> Dict:
         predictions = dict(self.model(*args, **kwargs))
         predictions["_pred_depth_scale"] = self.pred_depth_scale()
-        if self.depth_residual_head is None:
-            return predictions
-
         raw_depth = torch.nan_to_num(
             predictions["depth"].float(),
             nan=1e-4,
             posinf=1e4,
             neginf=1e-4,
         ).clamp_min(1e-4)
+        predictions["depth"] = raw_depth
+        if self.depth_residual_head is None:
+            return predictions
         if not self.depth_residual_enabled:
             return predictions
         windows = predictions.get("pano_windows")
@@ -950,10 +950,23 @@ class DepthPredictionAdapter(torch.nn.Module):
             delta_chunks.append(delta_chunk)
         delta = torch.cat(delta_chunks, dim=0)
         delta = delta.reshape(batch_size, num_views, 1, height, width).permute(0, 1, 3, 4, 2)
+        delta_limit = float(self.residual_max_log) if self.residual_max_log > 0 else 10.0
+        delta = torch.nan_to_num(
+            delta.float(),
+            nan=0.0,
+            posinf=delta_limit,
+            neginf=-delta_limit,
+        ).clamp(min=-delta_limit, max=delta_limit)
         if self.store_residual_debug:
-            predictions["raw_depth"] = predictions["depth"]
+            predictions["raw_depth"] = raw_depth
             predictions["depth_log_residual"] = delta
-        predictions["depth"] = raw_depth * torch.exp(delta.float())
+        final_depth = raw_depth * torch.exp(delta)
+        predictions["depth"] = torch.nan_to_num(
+            final_depth,
+            nan=1e-4,
+            posinf=1e4,
+            neginf=1e-4,
+        ).clamp_min(1e-4)
         return predictions
 
     def _run_depth_residual_head(self, rgb: torch.Tensor, log_depth: torch.Tensor) -> torch.Tensor:
