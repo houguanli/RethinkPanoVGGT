@@ -178,4 +178,31 @@ if [[ -s "$BASE_OUT/loss.csv" && -s "$LUNA_OUT/loss.csv" ]]; then
     2>&1 | tee -a "$SEQ_LOG"
 fi
 
+if [[ "${RUN_VALIDATION:-1}" == "1" ]]; then
+  if [[ ! -s "$LUNA_OUT/last.pt" ]]; then
+    echo "[sequence] missing LUNA checkpoint for validation: $LUNA_OUT/last.pt" | tee -a "$SEQ_LOG"
+    exit 1
+  fi
+  VALIDATION_GPUS="${VALIDATION_GPUS:-0,1,2,3}"
+  VALIDATION_OUT="${VALIDATION_OUT:-$LUNA_OUT/eval_full_4gpu}"
+  VALIDATION_LIMIT_PER_DATASET="${VALIDATION_LIMIT_PER_DATASET:-0}"
+  VALIDATION_DATASETS="${VALIDATION_DATASETS:-all}"
+  echo "[sequence] mixed4 4GPU validation started $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
+  env \
+    PYTHON="$PYTHON" \
+    GPUS="$VALIDATION_GPUS" \
+    CONFIG="$LUNA_CONFIG" \
+    LUNA_OUT="$LUNA_OUT" \
+    CHECKPOINT="$LUNA_OUT/last.pt" \
+    TRAIN_LOSS_CSV="$LUNA_OUT/loss.csv" \
+    EVAL_OUT="$VALIDATION_OUT" \
+    LIMIT_PER_DATASET="$VALIDATION_LIMIT_PER_DATASET" \
+    EVAL_DATASETS="$VALIDATION_DATASETS" \
+    bash "$LUNA/scripts/run_multipano_mixed4_eval_4gpu.sh" \
+    2>&1 | tee -a "$SEQ_LOG"
+  echo "[sequence] mixed4 4GPU validation finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
+else
+  echo "[sequence] validation skipped because RUN_VALIDATION=0" | tee -a "$SEQ_LOG"
+fi
+
 echo "[sequence] finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
