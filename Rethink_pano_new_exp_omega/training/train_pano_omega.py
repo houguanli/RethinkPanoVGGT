@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
@@ -176,6 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
             "luna_residual",
             "luna_residual_dense",
             "luna_residual_dense_tail",
+            "luna_residual_tail_heads",
             "luna_residual_heads",
             "all",
         ],
@@ -242,6 +244,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.5,
         help="Clamp residual log-depth correction to +/- this value.",
+    )
+    parser.add_argument(
+        "--depth-residual-frames-chunk-size",
+        type=int,
+        default=8,
+        help="Number of sampled windows processed by the depth residual head at once; set <=0 to disable chunking.",
+    )
+    parser.add_argument(
+        "--depth-residual-checkpoint",
+        dest="depth_residual_use_checkpoint",
+        action="store_true",
+        default=False,
+        help="Checkpoint depth residual chunks to reduce activation memory.",
+    )
+    parser.add_argument("--no-depth-residual-checkpoint", dest="depth_residual_use_checkpoint", action="store_false")
+    parser.add_argument(
+        "--store-depth-residual-debug",
+        action="store_true",
+        default=False,
+        help="Store raw_depth and depth_log_residual tensors in predictions for debugging.",
     )
     parser.add_argument(
         "--dense-head-frames-chunk-size",
@@ -441,6 +463,11 @@ def train(args: argparse.Namespace) -> None:
                 residual_mode=args.depth_residual_mode,
                 residual_hidden=args.depth_residual_hidden,
                 residual_max_log=args.depth_residual_max_log,
+                residual_frames_chunk_size=normalize_dense_head_frames_chunk_size(
+                    args.depth_residual_frames_chunk_size
+                ),
+                residual_use_checkpoint=args.depth_residual_use_checkpoint,
+                store_residual_debug=args.store_depth_residual_debug,
             ).to(device)
             load_adapter_state_if_present(model, checkpoint_payload, args.checkpoint)
 
@@ -512,7 +539,10 @@ def train(args: argparse.Namespace) -> None:
         rank0_print(
             "[INFO] depth_residual = "
             f"{args.depth_residual_mode} hidden={args.depth_residual_hidden} "
-            f"max_log={args.depth_residual_max_log}",
+            f"max_log={args.depth_residual_max_log} "
+            f"frames_chunk_size={args.depth_residual_frames_chunk_size} "
+            f"checkpoint={args.depth_residual_use_checkpoint} "
+            f"store_debug={args.store_depth_residual_debug}",
             dist_state,
         )
         rank0_print(
@@ -602,7 +632,11 @@ def train(args: argparse.Namespace) -> None:
 
                 global_step += 1
                 batch = move_batch_to_device(batch, device)
-                loss_dict = train_step(model, batch, optimizer, args, global_step=global_step)
+                try:
+                    loss_dict = train_step(model, batch, optimizer, args, global_step=global_step)
+                except torch.cuda.OutOfMemoryError:
+                    print_cuda_memory(f"[OOM] rank={dist_state['rank']} step={global_step}", device)
+                    raise
                 loss_dict = reduce_loss_dict(loss_dict, dist_state)
                 elapsed_seconds = time.time() - started_at
                 sampler_status = current_sampler_status(unwrap_model(model), args)
@@ -787,6 +821,9 @@ class DepthPredictionAdapter(torch.nn.Module):
         residual_mode: str = "none",
         residual_hidden: int = 32,
         residual_max_log: float = 0.5,
+        residual_frames_chunk_size: int | None = 8,
+        residual_use_checkpoint: bool = False,
+        store_residual_debug: bool = False,
     ) -> None:
         super().__init__()
         if initial_scale <= 0:
@@ -796,6 +833,12 @@ class DepthPredictionAdapter(torch.nn.Module):
         self.residual_mode = residual_mode
         self.residual_max_log = float(residual_max_log)
         self.depth_residual_enabled = residual_mode != "none"
+        self.residual_frames_chunk_size = (
+            None if residual_frames_chunk_size is None or int(residual_frames_chunk_size) <= 0
+            else int(residual_frames_chunk_size)
+        )
+        self.residual_use_checkpoint = bool(residual_use_checkpoint)
+        self.store_residual_debug = bool(store_residual_debug)
         log_scale = torch.tensor(math.log(float(initial_scale)), dtype=torch.float32)
         self.register_buffer("initial_pred_depth_log_scale", log_scale.clone())
         if self.learn_scale:
@@ -838,17 +881,40 @@ class DepthPredictionAdapter(torch.nn.Module):
         if windows is None:
             return predictions
         batch_size, num_views, _, height, width = windows.shape
-        rgb = windows.reshape(batch_size * num_views, 3, height, width).float()
-        log_depth = torch.log(raw_depth).permute(0, 1, 4, 2, 3).reshape(batch_size * num_views, 1, height, width)
+        chunk_size = self.residual_frames_chunk_size or num_views
+        delta_chunks = []
+        for start_idx in range(0, num_views, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_views)
+            rgb = windows[:, start_idx:end_idx].reshape(-1, 3, height, width).float()
+            log_depth = torch.log(raw_depth[:, start_idx:end_idx]).permute(0, 1, 4, 2, 3)
+            log_depth = log_depth.reshape(-1, 1, height, width)
+            if self.residual_use_checkpoint and self.training and torch.is_grad_enabled():
+                delta_chunk = checkpoint(
+                    self._run_depth_residual_head,
+                    rgb,
+                    log_depth,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                delta_chunk = self._run_depth_residual_head(rgb, log_depth)
+            delta_chunks.append(delta_chunk)
+        delta = torch.cat(delta_chunks, dim=0)
+        delta = delta.reshape(batch_size, num_views, 1, height, width).permute(0, 1, 3, 4, 2)
+        if self.store_residual_debug:
+            predictions["raw_depth"] = predictions["depth"]
+            predictions["depth_log_residual"] = delta
+        predictions["depth"] = raw_depth * torch.exp(delta.float())
+        return predictions
+
+    def _run_depth_residual_head(self, rgb: torch.Tensor, log_depth: torch.Tensor) -> torch.Tensor:
+        if self.depth_residual_head is None:
+            raise RuntimeError("Depth residual head is not initialized.")
         residual_input = torch.cat([rgb, log_depth], dim=1)
         delta = self.depth_residual_head(residual_input)
         if self.residual_max_log > 0:
             delta = torch.tanh(delta) * self.residual_max_log
-        delta = delta.reshape(batch_size, num_views, 1, height, width).permute(0, 1, 3, 4, 2)
-        predictions["raw_depth"] = predictions["depth"]
-        predictions["depth_log_residual"] = delta
-        predictions["depth"] = raw_depth * torch.exp(delta.float())
-        return predictions
+        return delta
 
     def pred_depth_scale(self) -> torch.Tensor:
         log_scale = torch.nan_to_num(
@@ -1422,6 +1488,21 @@ def train_step(
 
 def _is_rank0_process() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
+
+
+def print_cuda_memory(prefix: str, device: torch.device) -> None:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize(device)
+    allocated = torch.cuda.memory_allocated(device) / (1024**3)
+    reserved = torch.cuda.memory_reserved(device) / (1024**3)
+    peak_allocated = torch.cuda.max_memory_allocated(device) / (1024**3)
+    peak_reserved = torch.cuda.max_memory_reserved(device) / (1024**3)
+    print(
+        f"{prefix} cuda_memory allocated={allocated:.2f}GB reserved={reserved:.2f}GB "
+        f"peak_allocated={peak_allocated:.2f}GB peak_reserved={peak_reserved:.2f}GB",
+        flush=True,
+    )
 
 
 @torch.no_grad()
@@ -2300,11 +2381,12 @@ def configure_trainable(model: torch.nn.Module, mode: str) -> Tuple[int, int]:
             "luna_residual",
             "luna_residual_dense",
             "luna_residual_dense_tail",
+            "luna_residual_tail_heads",
             "luna_residual_heads",
         }
         train_dense = mode in {"dense", "heads", "luna_dense", "luna_heads", "luna_residual_dense", "luna_residual_heads"}
-        train_dense_tail = mode in {"luna_dense_tail", "luna_residual_dense_tail"}
-        train_camera = mode in {"camera", "heads", "luna_heads", "luna_residual_heads"}
+        train_dense_tail = mode in {"luna_dense_tail", "luna_residual_dense_tail", "luna_residual_tail_heads"}
+        train_camera = mode in {"camera", "heads", "luna_heads", "luna_residual_heads", "luna_residual_tail_heads"}
         for name, param in model.named_parameters():
             if train_luna and (
                 "luna_" in name or "pano_global" in name or "pano_geometry" in name
