@@ -1948,10 +1948,34 @@ def _expand_sample_weight(
     sample_weight_max: float = 10.0,
 ) -> torch.Tensor:
     weight = sample_weight.to(device=target.device, dtype=torch.float32)
+
+    if weight.ndim == 0:
+        weight = weight.reshape(*([1] * target.ndim))
+    elif weight.ndim == 1 and target.ndim >= 2 and weight.shape[0] == target.shape[0]:
+        weight = weight.reshape(target.shape[0], *([1] * (target.ndim - 1)))
+
     while weight.ndim > target.ndim:
         weight = weight.squeeze(-1)
     while weight.ndim < target.ndim:
         weight = weight.unsqueeze(-1)
+
+    # Multi-pano samples carry one dataset/sample weight per pano [B, N],
+    # while depth/camera windows are flattened as [B, N * views_per_pano].
+    # Repeat each pano weight across its yaw/pitch windows before broadcasting.
+    if (
+        weight.ndim >= 2
+        and target.ndim >= 2
+        and weight.shape[0] in (1, target.shape[0])
+        and weight.shape[1] not in (1, target.shape[1])
+    ):
+        if target.shape[1] % weight.shape[1] != 0:
+            raise ValueError(
+                f"Cannot expand sample_weight shape {tuple(sample_weight.shape)} "
+                f"to target shape {tuple(target.shape)}."
+            )
+        repeat = target.shape[1] // weight.shape[1]
+        weight = weight.repeat_interleave(repeat, dim=1)
+
     return weight.expand_as(target).clamp(min=float(sample_weight_min), max=float(sample_weight_max))
 
 
