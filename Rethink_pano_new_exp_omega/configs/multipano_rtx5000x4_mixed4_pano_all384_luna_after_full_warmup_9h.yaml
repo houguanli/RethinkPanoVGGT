@@ -33,7 +33,7 @@ sampler:
   luna_camera_layers: "23"
 
 model:
-  enable_pano_global_token: true
+  enable_pano_global_token: false
   aggregator_use_checkpoint: true
   # Keep 2..8 panos x 4 yaw as the model context, but decode dense depth in
   # smaller frame chunks so a full 32-window sample fits on 32GB RTX5000 cards.

@@ -179,6 +179,11 @@ class Aggregator(nn.Module):
         nn.init.normal_(self.register_token, std=1e-3)
         if self.pano_global_token is not None:
             nn.init.normal_(self.pano_global_token, std=1e-3)
+        if self.pano_geometry_embed is not None:
+            final = self.pano_geometry_embed[-1]
+            if isinstance(final, nn.Linear):
+                nn.init.zeros_(final.weight)
+                nn.init.zeros_(final.bias)
 
     # ------------------------------------------------------------------ forward
 

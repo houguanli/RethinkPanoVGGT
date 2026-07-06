@@ -26,7 +26,7 @@ sampler:
   luna_camera_layers: "23"
 
 model:
-  enable_pano_global_token: true
+  enable_pano_global_token: false
 
 supervision:
   gt_depth_semantics: range

@@ -720,6 +720,7 @@ def train(args: argparse.Namespace) -> None:
                             valid=f"{metrics['depth_valid_ratio']:.3f}",
                             lvalid=f"{metrics['depth_loss_valid_ratio']:.3f}",
                             keep=f"{metrics['depth_loss_window_keep_ratio']:.3f}",
+                            pfinite=f"{metrics['pred_depth_finite_ratio']:.3f}",
                             scale=f"{metrics['pred_depth_scale']:.3f}",
                         )
                         if args.progress_log_every > 0 and global_step % args.progress_log_every == 0:
