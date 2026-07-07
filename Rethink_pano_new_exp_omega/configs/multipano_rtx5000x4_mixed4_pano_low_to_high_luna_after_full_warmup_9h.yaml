@@ -11,7 +11,7 @@ data:
   bad_sample_list: configs/structured3d_bad_scenes.txt
   curriculum_bins: null
   use_metadata_weights: false
-  checkpoint: ../baseline01_vggt_omega/logs/mixed4_pano_low_to_high_4xrtx5000_full_warmup_3h_for_luna/ckpts/checkpoint.pt
+  checkpoint: logs/mixed4_pano_omega_multipano_warmup_3h_for_luna/last.pt
   pano_sample_mode: variable_neighborhood
   pano_min_count: 2
   pano_max_count: 8

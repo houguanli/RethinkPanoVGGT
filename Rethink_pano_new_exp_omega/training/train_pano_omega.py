@@ -196,6 +196,22 @@ def build_parser() -> argparse.ArgumentParser:
         default="luna_heads",
     )
     parser.add_argument("--strict-checkpoint", action="store_true")
+    parser.add_argument(
+        "--inherit-checkpoint-training-defaults",
+        dest="inherit_checkpoint_training_defaults",
+        action="store_true",
+        default=False,
+        help=(
+            "Adopt training defaults stored in a checkpoint payload. Disabled by default so "
+            "stage handoff checkpoints do not override the next config's depth residual or "
+            "scale-alignment policy."
+        ),
+    )
+    parser.add_argument(
+        "--no-inherit-checkpoint-training-defaults",
+        dest="inherit_checkpoint_training_defaults",
+        action="store_false",
+    )
     parser.add_argument("--enable-camera-head", dest="enable_camera_head", action="store_true", default=True)
     parser.add_argument("--disable-camera-head", dest="enable_camera_head", action="store_false")
     parser.add_argument("--camera-loss-weight", type=float, default=1.0)
@@ -501,7 +517,8 @@ def train(args: argparse.Namespace) -> None:
 
         model = build_model(args).to(device)
         checkpoint_payload = load_checkpoint_payload(args.checkpoint) if args.checkpoint is not None else {}
-        apply_checkpoint_training_defaults(args, checkpoint_payload)
+        if args.inherit_checkpoint_training_defaults:
+            apply_checkpoint_training_defaults(args, checkpoint_payload)
         if args.checkpoint is not None:
             load_checkpoint(model, args.checkpoint, strict=args.strict_checkpoint)
 
