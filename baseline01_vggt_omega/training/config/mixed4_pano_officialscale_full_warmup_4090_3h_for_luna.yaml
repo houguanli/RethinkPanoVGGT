@@ -100,6 +100,7 @@ logging:
 checkpoint:
   save_dir: logs/${exp_name}/ckpts
   save_freq: 0
+  save_step_freq: 10000
   resume_checkpoint_path: null
   strict: false
 

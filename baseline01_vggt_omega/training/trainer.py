@@ -713,6 +713,7 @@ class Trainer:
             for optim in self.optims:   
                 self.scaler.step(optim.optimizer)
             self.scaler.update()
+            self._maybe_save_step_checkpoint(phase)
 
             # Measure elapsed time
             batch_time.update(time.time() - end)
@@ -907,6 +908,22 @@ class Trainer:
     def _distributed_barrier(self) -> None:
         if is_dist_avail_and_initialized():
             dist.barrier()
+
+    def _maybe_save_step_checkpoint(self, phase: str) -> None:
+        if phase != "train" or not self.save_checkpoint_on_exit:
+            return
+        save_step_freq = int(self.checkpoint_conf.get("save_step_freq", 0) or 0)
+        if save_step_freq <= 0:
+            return
+        step = int(self.steps.get(phase, 0))
+        if step <= 0 or step % save_step_freq != 0:
+            return
+        self._distributed_barrier()
+        self.save_checkpoint(
+            self.epoch,
+            checkpoint_names=["checkpoint", f"checkpoint_step_{step}"],
+        )
+        self._distributed_barrier()
 
     def _append_metrics_csv(self, batch: Mapping, loss_dict: Mapping) -> None:
         def scalar(name: str) -> float:
