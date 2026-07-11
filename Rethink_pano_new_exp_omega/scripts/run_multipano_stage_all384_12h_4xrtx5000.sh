@@ -30,7 +30,7 @@ NUM_YAW="${NUM_YAW:-4}"
 
 LUNA_CONFIG="${LUNA_CONFIG:-configs/multipano_rtx5000x4_mixed4_pano_all384_luna_after_full_warmup_9h.yaml}"
 LUNA_OUT="${LUNA_OUT:-$LUNA/logs/mixed4_pano_all384_4xrtx5000_multipano_after_full_warmup_9h}"
-SEQ_LOG="$LUNA/logs/mixed4_pano_all384_4xrtx5000_multipano_stage_12h_sequence.log"
+SEQ_LOG="${SEQ_LOG:-$LUNA/logs/mixed4_pano_all384_4xrtx5000_multipano_stage_12h_sequence.log}"
 
 mkdir -p "$(dirname "$SEQ_LOG")"
 if [[ "${CLEAN_OUTPUT:-0}" == "1" ]]; then
@@ -121,6 +121,9 @@ else
     --nproc_per_node="$NPROC_PER_NODE" \
     training/train_pano_omega.py --config "$WARMUP_CONFIG" \
     "${WARMUP_DURATION_ARGS[@]}" \
+    --output-dir "$WARMUP_OUT" \
+    --tensorboard-dir "$WARMUP_OUT/tensorboard" \
+    --debug-dir "$WARMUP_OUT/debug" \
     --dataset-root "$PANOVGGT_ROOT" \
     --checkpoint "$BASE_CHECKPOINT" \
     --pred-depth-scale "$PRED_DEPTH_SCALE" \
@@ -160,6 +163,9 @@ PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   --nproc_per_node="$NPROC_PER_NODE" \
   training/train_pano_omega.py --config "$LUNA_CONFIG" \
   "${LUNA_DURATION_ARGS[@]}" \
+  --output-dir "$LUNA_OUT" \
+  --tensorboard-dir "$LUNA_OUT/tensorboard" \
+  --debug-dir "$LUNA_OUT/debug" \
   --dataset-root "$PANOVGGT_ROOT" \
   --checkpoint "$WARMUP_CKPT" \
   --pred-depth-scale "$PRED_DEPTH_SCALE" \
