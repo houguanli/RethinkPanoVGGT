@@ -28,6 +28,7 @@ from training.train_pano_omega import (  # noqa: E402
     adjacent_edge_overlap_loss,
     build_dataset,
     build_model,
+    camera_alignment_loss,
     load_checkpoint,
     masked_depth_loss,
     move_batch_to_device,
@@ -312,7 +313,11 @@ def evaluate_run(
                 max_range_depth=eval_args.depth_max_m,
             )
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                predictions = model(pano_images=moved["pano_image"], return_sampler_output=True)
+                predictions = model(
+                    pano_images=moved["pano_image"],
+                    return_sampler_output=True,
+                    return_window_pose=eval_args.camera_supervision_mode != "pano_relative",
+                )
                 pred_depth_scale = predictions.get(
                     "_pred_depth_scale",
                     predictions["depth"].new_tensor(float(eval_args.pred_depth_scale)),
@@ -337,9 +342,29 @@ def evaluate_run(
                     sample_weight=moved.get("sample_weight") if eval_args.loss_sample_weighting else None,
                     band_fraction=eval_args.overlap_band_fraction,
                 )
-                loss = loss_depth + float(eval_args.overlap_consistency_weight) * loss_overlap
+                depth_metrics = compute_depth_metrics(pred_depth, target_depth, target_valid)
+                camera_scale = pred_depth_scale.detach() * float(depth_metrics["depth_irls_scale"])
+                camera_losses = camera_alignment_loss(
+                    predictions=predictions,
+                    batch=moved,
+                    translation_weight=eval_args.camera_translation_weight,
+                    rotation_weight=eval_args.camera_rotation_weight,
+                    fov_weight=eval_args.camera_fov_weight,
+                    position_mode=eval_args.camera_position_mode,
+                    supervision_mode=eval_args.camera_supervision_mode,
+                    pano_consistency_weight=eval_args.pano_translation_consistency_weight,
+                    translation_normalization=eval_args.camera_translation_normalization,
+                    translation_normalization_eps=eval_args.camera_translation_normalization_eps,
+                    pred_translation_scale=(
+                        camera_scale if eval_args.camera_depth_scale_alignment else None
+                    ),
+                )
+                loss = (
+                    loss_depth
+                    + float(eval_args.overlap_consistency_weight) * loss_overlap
+                    + float(eval_args.camera_loss_weight) * camera_losses["loss_camera"]
+                )
 
-            depth_metrics = compute_depth_metrics(pred_depth, target_depth, target_valid)
             row = {
                 "run": name,
                 "dataset_index": int(selected_indices[local_index]),
@@ -350,6 +375,16 @@ def evaluate_run(
                 "loss": float(loss.detach().cpu()),
                 "loss_depth": float(loss_depth.detach().cpu()),
                 "loss_overlap": float(loss_overlap.detach().cpu()),
+                "loss_camera": float(camera_losses["loss_camera"].detach().cpu()),
+                "loss_camera_t": float(camera_losses["loss_camera_t"].detach().cpu()),
+                "loss_camera_r": float(camera_losses["loss_camera_r"].detach().cpu()),
+                "camera_rotation_deg": float(camera_losses["camera_rotation_deg"].detach().cpu()),
+                "camera_translation_valid_count": float(
+                    camera_losses["camera_translation_valid_count"].detach().cpu()
+                ),
+                "camera_rotation_valid_count": float(
+                    camera_losses["camera_rotation_valid_count"].detach().cpu()
+                ),
                 "valid_fraction": float(target_valid.float().mean().detach().cpu()),
                 "pred_depth_scale": float(pred_depth_scale.detach().float().cpu()),
                 "metadata_valid_ratio": scalar_float(batch.get("metadata_valid_ratio")),
@@ -394,6 +429,12 @@ def evaluate_run(
         "summary": summarize_values([row["loss"] for row in rows]),
         "depth_summary": summarize_values([row["loss_depth"] for row in rows]),
         "overlap_summary": summarize_values([row["loss_overlap"] for row in rows]),
+        "camera_summary": summarize_values([row["loss_camera"] for row in rows]),
+        "camera_translation_summary": summarize_values([row["loss_camera_t"] for row in rows]),
+        "camera_rotation_rad_summary": summarize_values([row["loss_camera_r"] for row in rows]),
+        "camera_rotation_deg_summary": summarize_values(
+            [row["camera_rotation_deg"] for row in rows if row["camera_rotation_valid_count"] > 0]
+        ),
         "valid_fraction_summary": summarize_values([row["valid_fraction"] for row in rows]),
         "depth_metric_summary": summarize_metric_rows(rows, DEPTH_METRIC_KEYS),
         "panovggt_metric_summary": summarize_panovggt_rows(rows),

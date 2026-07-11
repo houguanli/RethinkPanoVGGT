@@ -19,6 +19,7 @@ import torch
 
 from vggt_omega.checkpoint import DEFAULT_CHECKPOINT_PATH
 from vggt_omega.data.pano_sampler import PanoWindowSampler
+from vggt_omega.models.heads import PanoCameraHead
 from vggt_omega.models.vggt_omega import VGGTOmega
 
 
@@ -47,6 +48,7 @@ class VGGTOmega_LUNA(VGGTOmega):
         dense_head_frames_chunk_size: Optional[int] = 8,
         dense_head_use_checkpoint: bool = False,
         dense_head_return_confidence: bool = True,
+        enable_pano_camera_head: bool = True,
         checkpoint_path: Optional[str] = str(DEFAULT_CHECKPOINT_PATH),
         checkpoint_strict: bool = False,
     ) -> None:
@@ -79,6 +81,18 @@ class VGGTOmega_LUNA(VGGTOmega):
         sampler_config = {"window_size": 512, "patch_size": patch_size}
         sampler_config.update(sampler or {})
         self.pano_sampler = PanoWindowSampler(**sampler_config)
+        pano_camera_dim = min(512, 2 * embed_dim)
+        self.pano_camera_head = (
+            PanoCameraHead(
+                dim_in=2 * embed_dim,
+                hidden_dim=pano_camera_dim,
+                camera_meta_dim=luna_camera_meta_dim,
+                num_heads=8,
+                num_cross_pano_layers=2,
+            )
+            if enable_camera and enable_pano_camera_head
+            else None
+        )
 
     def forward(
         self,
@@ -100,6 +114,7 @@ class VGGTOmega_LUNA(VGGTOmega):
         if pano_images is None:
             return super().forward(images, **kwargs)
 
+        num_panos = int(pano_images.shape[1]) if pano_images.ndim == 5 else 1
         sampler_output = self.sample_pano_windows(pano_images, yaw=yaw, pitch=pitch, fov=fov)
         predictions = super().forward(
             sampler_output.windows,
@@ -108,6 +123,21 @@ class VGGTOmega_LUNA(VGGTOmega):
             pano_camera_meta=sampler_output.camera_meta["camera_encoding"],
             **kwargs,
         )
+        if self.pano_camera_head is not None:
+            camera_tokens = predictions["camera_and_register_tokens"][:, :, 0]
+            pano_camera = self.pano_camera_head(
+                camera_tokens,
+                sampler_output.camera_meta["camera_encoding"],
+                num_panos=num_panos,
+            )
+            predictions.update(pano_camera)
+            predictions["pano_pose_enc"] = torch.cat(
+                [
+                    predictions["pano_camera_center"],
+                    predictions["pano_rotation_quat_w2c"],
+                ],
+                dim=-1,
+            )
         if return_sampler_output:
             predictions["pano_windows"] = sampler_output.windows
             predictions["pano_camera_meta"] = sampler_output.camera_meta

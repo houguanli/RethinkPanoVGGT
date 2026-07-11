@@ -6,6 +6,7 @@
 
 from .camera_head import CameraHead
 from .dense_head import DenseHead
+from .pano_camera_head import PanoCameraHead
 from .text_alignment_head import TextAlignmentHead
 
-__all__ = ["CameraHead", "DenseHead", "TextAlignmentHead"]
+__all__ = ["CameraHead", "DenseHead", "PanoCameraHead", "TextAlignmentHead"]

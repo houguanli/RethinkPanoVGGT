@@ -39,6 +39,12 @@ NUMERIC_FIELDS = {
     "loss",
     "loss_depth",
     "loss_overlap",
+    "loss_camera",
+    "loss_camera_t",
+    "loss_camera_r",
+    "camera_rotation_deg",
+    "camera_translation_valid_count",
+    "camera_rotation_valid_count",
     "valid_fraction",
     "pred_depth_scale",
     "metadata_valid_ratio",
@@ -90,6 +96,20 @@ def main() -> None:
                 "summary": summarize_values([float(row["loss"]) for row in run_rows]),
                 "depth_summary": summarize_values([float(row["loss_depth"]) for row in run_rows]),
                 "overlap_summary": summarize_values([float(row["loss_overlap"]) for row in run_rows]),
+                "camera_summary": summarize_values([float(row["loss_camera"]) for row in run_rows]),
+                "camera_translation_summary": summarize_values(
+                    [float(row["loss_camera_t"]) for row in run_rows]
+                ),
+                "camera_rotation_rad_summary": summarize_values(
+                    [float(row["loss_camera_r"]) for row in run_rows]
+                ),
+                "camera_rotation_deg_summary": summarize_values(
+                    [
+                        float(row["camera_rotation_deg"])
+                        for row in run_rows
+                        if float(row.get("camera_rotation_valid_count", 0.0)) > 0
+                    ]
+                ),
                 "valid_fraction_summary": summarize_values([float(row["valid_fraction"]) for row in run_rows]),
                 "depth_metric_summary": summarize_metric_rows(run_rows, DEPTH_METRIC_KEYS),
                 "panovggt_metric_summary": summarize_panovggt_rows(run_rows),

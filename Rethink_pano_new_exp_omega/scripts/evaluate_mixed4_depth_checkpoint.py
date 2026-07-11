@@ -257,6 +257,9 @@ def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
     weighted_loss = 0.0
     weighted_depth_loss = 0.0
     weighted_overlap_loss = 0.0
+    weighted_camera_loss = 0.0
+    weighted_camera_rotation_deg = 0.0
+    camera_rotation_samples = 0
     total_samples = 0
     for run in runs:
         n = int(run.get("evaluated_samples", 0))
@@ -266,12 +269,24 @@ def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
         weighted_loss += float(run.get("summary", {}).get("mean", 0.0)) * n
         weighted_depth_loss += float(run.get("depth_summary", {}).get("mean", 0.0)) * n
         weighted_overlap_loss += float(run.get("overlap_summary", {}).get("mean", 0.0)) * n
+        weighted_camera_loss += float(run.get("camera_summary", {}).get("mean", 0.0)) * n
+        rotation_n = int(run.get("camera_rotation_deg_summary", {}).get("n", 0))
+        if rotation_n > 0:
+            weighted_camera_rotation_deg += (
+                float(run["camera_rotation_deg_summary"]["mean"]) * rotation_n
+            )
+            camera_rotation_samples += rotation_n
     denom = float(total_samples) if total_samples > 0 else 1.0
     return {
         "evaluated_samples": total_samples,
         "weighted_loss_mean": weighted_loss / denom if total_samples else None,
         "weighted_depth_loss_mean": weighted_depth_loss / denom if total_samples else None,
         "weighted_overlap_loss_mean": weighted_overlap_loss / denom if total_samples else None,
+        "weighted_camera_loss_mean": weighted_camera_loss / denom if total_samples else None,
+        "weighted_camera_rotation_deg_mean": (
+            weighted_camera_rotation_deg / camera_rotation_samples if camera_rotation_samples else None
+        ),
+        "camera_rotation_samples": camera_rotation_samples,
     }
 
 

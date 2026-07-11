@@ -215,6 +215,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-camera-head", dest="enable_camera_head", action="store_true", default=True)
     parser.add_argument("--disable-camera-head", dest="enable_camera_head", action="store_false")
     parser.add_argument("--camera-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--camera-comparable-weight",
+        type=float,
+        default=0.25,
+        help="Fixed camera weight used only for a cross-stage comparable loss metric.",
+    )
     parser.add_argument("--camera-translation-weight", type=float, default=1.0)
     parser.add_argument("--camera-rotation-weight", type=float, default=1.0)
     parser.add_argument("--camera-fov-weight", type=float, default=0.1)
@@ -702,13 +708,23 @@ def train(args: argparse.Namespace) -> None:
                             args,
                             active_stage,
                         )
-                        optimizer = build_optimizer_for_stage(model, args, active_stage)
+                        optimizer, optimizer_preserved = transition_optimizer_for_stage(
+                            optimizer,
+                            model,
+                            args,
+                            active_stage,
+                        )
                         rank0_print(
                             f"[INFO] active_stage = {format_stage_status(active_stage_index, active_stage, trainable_count, frozen_count)}",
                             dist_state,
                         )
+                        rank0_print(
+                            f"[INFO] optimizer_state_preserved = {optimizer_preserved}",
+                            dist_state,
+                        )
 
                 global_step += 1
+                batch = limit_batch_panos(batch, active_stage)
                 batch = move_batch_to_device(batch, device)
                 try:
                     loss_dict = train_step(model, batch, optimizer, args, global_step=global_step)
@@ -723,15 +739,32 @@ def train(args: argparse.Namespace) -> None:
                     "epoch": epoch + 1,
                     "elapsed_seconds": elapsed_seconds,
                     "loss": float(loss_dict["loss"].item()),
+                    "loss_comparable": float(loss_dict.get("loss_comparable", loss_dict["loss"]).item()),
                     "loss_depth": float(loss_dict["loss_depth"].item()),
                     "loss_overlap": float(loss_dict.get("loss_overlap", torch.tensor(0.0)).item()),
+                    "loss_overlap_weighted": float(
+                        loss_dict.get("loss_overlap_weighted", torch.tensor(0.0)).item()
+                    ),
                     "loss_camera": float(loss_dict["loss_camera"].item()),
+                    "loss_camera_weighted": float(
+                        loss_dict.get("loss_camera_weighted", torch.tensor(0.0)).item()
+                    ),
                     "loss_camera_t": float(loss_dict.get("loss_camera_t", torch.tensor(0.0)).item()),
                     "loss_camera_r": float(loss_dict.get("loss_camera_r", torch.tensor(0.0)).item()),
                     "loss_camera_fov": float(loss_dict.get("loss_camera_fov", torch.tensor(0.0)).item()),
                     "loss_camera_consistency": float(
                         loss_dict.get("loss_camera_consistency", torch.tensor(0.0)).item()
                     ),
+                    "camera_rotation_deg": float(
+                        loss_dict.get("camera_rotation_deg", torch.tensor(0.0)).item()
+                    ),
+                    "camera_translation_valid_count": float(
+                        loss_dict.get("camera_translation_valid_count", torch.tensor(0.0)).item()
+                    ),
+                    "camera_rotation_valid_count": float(
+                        loss_dict.get("camera_rotation_valid_count", torch.tensor(0.0)).item()
+                    ),
+                    "pano_count": float(loss_dict.get("pano_count", torch.tensor(1.0)).item()),
                     "depth_valid_ratio": float(loss_dict.get("depth_valid_ratio", torch.tensor(0.0)).item()),
                     "depth_window_keep_ratio": float(
                         loss_dict.get("depth_window_keep_ratio", torch.tensor(0.0)).item()
@@ -763,6 +796,11 @@ def train(args: argparse.Namespace) -> None:
                         f"stage={active_stage_name} elapsed={elapsed_seconds / 60.0:.2f}m "
                         f"loss={metrics['loss']:.6f} depth={metrics['loss_depth']:.6f} "
                         f"overlap={metrics['loss_overlap']:.6f} camera={metrics['loss_camera']:.6f} "
+                        f"camera_t={metrics['loss_camera_t']:.6f} "
+                        f"camera_r_deg={metrics['camera_rotation_deg']:.3f} "
+                        f"camera_valid=t{metrics['camera_translation_valid_count']:.1f}/"
+                        f"r{metrics['camera_rotation_valid_count']:.1f} "
+                        f"panos={metrics['pano_count']:.1f} "
                         f"depth_valid={metrics['depth_valid_ratio']:.4f} "
                         f"depth_loss_valid={metrics['depth_loss_valid_ratio']:.4f} "
                         f"depth_keep={metrics['depth_loss_window_keep_ratio']:.4f} "
@@ -783,8 +821,10 @@ def train(args: argparse.Namespace) -> None:
                             stage=active_stage_name,
                             window=metrics["window_size"],
                             loss=f"{metrics['loss']:.4f}",
+                            comp=f"{metrics['loss_comparable']:.4f}",
                             depth=f"{metrics['loss_depth']:.4f}",
                             camera=f"{metrics['loss_camera']:.4f}",
+                            rdeg=f"{metrics['camera_rotation_deg']:.1f}",
                             valid=f"{metrics['depth_valid_ratio']:.3f}",
                             lvalid=f"{metrics['depth_loss_valid_ratio']:.3f}",
                             keep=f"{metrics['depth_loss_window_keep_ratio']:.3f}",
@@ -1120,6 +1160,34 @@ def build_optimizer_for_stage(
     )
 
 
+def transition_optimizer_for_stage(
+    optimizer: torch.optim.Optimizer,
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+    stage: Dict[str, Any],
+) -> Tuple[torch.optim.Optimizer, bool]:
+    """Keep optimizer moments when a stage only changes scalar hyperparameters."""
+    requested_type = str(stage.get("optimizer_type", args.optimizer_type))
+    current_type = "adafactor" if isinstance(optimizer, torch.optim.Adafactor) else "adamw"
+    current_params = {id(param) for group in optimizer.param_groups for param in group["params"]}
+    requested_params = {id(param) for param in model.parameters() if param.requires_grad}
+    if requested_type != current_type or current_params != requested_params:
+        return build_optimizer_for_stage(model, args, stage), False
+
+    regular_lr = float(stage.get("lr", args.lr))
+    scale_lr_value = stage.get("pred_depth_scale_lr", regular_lr)
+    scale_lr = regular_lr if scale_lr_value is None else float(scale_lr_value)
+    weight_decay = float(stage.get("weight_decay", args.weight_decay))
+    for group in optimizer.param_groups:
+        if group.get("group_name") == "scale":
+            group["lr"] = scale_lr
+            group["weight_decay"] = 0.0
+        else:
+            group["lr"] = regular_lr
+            group["weight_decay"] = weight_decay
+    return optimizer, True
+
+
 def build_optimizer(
     model: torch.nn.Module,
     args: argparse.Namespace,
@@ -1142,10 +1210,14 @@ def build_optimizer(
             regular_params.append(param)
     param_groups = []
     if regular_params:
-        param_groups.append({"params": regular_params, "lr": lr, "weight_decay": weight_decay})
+        param_groups.append(
+            {"params": regular_params, "lr": lr, "weight_decay": weight_decay, "group_name": "regular"}
+        )
     if scale_params:
         scale_lr = pred_depth_scale_lr if pred_depth_scale_lr is not None else lr
-        param_groups.append({"params": scale_params, "lr": scale_lr, "weight_decay": 0.0})
+        param_groups.append(
+            {"params": scale_params, "lr": scale_lr, "weight_decay": 0.0, "group_name": "scale"}
+        )
     if not param_groups:
         raise ValueError("No trainable parameters for optimizer.")
     if optimizer_type == "adamw":
@@ -1394,6 +1466,8 @@ def format_training_stages(stages: Sequence[Dict[str, Any]]) -> str:
             boundary.append(f"window={int(stage['window_size'])}")
         if stage.get("dense_head_frames_chunk_size") is not None:
             boundary.append(f"dense_chunk={int(stage['dense_head_frames_chunk_size'])}")
+        if stage.get("pano_max_count") is not None:
+            boundary.append(f"pano_max={int(stage['pano_max_count'])}")
         parts.append(f"{idx + 1}:{stage.get('name', f'stage{idx + 1}')}({','.join(boundary) or 'final'})")
     return "; ".join(parts)
 
@@ -1412,12 +1486,33 @@ def format_stage_status(
         f"lr={stage.get('lr', 'default')} "
         f"window={stage.get('window_size', 'default')} "
         f"dense_chunk={stage.get('dense_head_frames_chunk_size', 'default')} "
+        f"pano_max={stage.get('pano_max_count', 'default')} "
         f"optimizer={stage.get('optimizer_type', 'default')} "
         f"camera_weight={stage.get('camera_loss_weight', 'default')} "
         f"luna_forward={stage.get('enable_luna_forward', 'default')} "
         f"depth_residual={stage.get('enable_depth_residual', 'default')} "
         f"trainable={trainable_count:,} frozen={frozen_count:,}"
     )
+
+
+def limit_batch_panos(batch: Dict[str, Any], stage: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Apply a stage pano curriculum after collation so worker copies cannot go stale."""
+    if stage is None or stage.get("pano_max_count") is None:
+        return batch
+    pano_image = batch.get("pano_image")
+    if not torch.is_tensor(pano_image) or pano_image.ndim != 5:
+        return batch
+    current_count = int(pano_image.shape[1])
+    max_count = max(1, int(stage["pano_max_count"]))
+    if current_count <= max_count:
+        return batch
+    limited: Dict[str, Any] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.ndim >= 2 and int(value.shape[1]) == current_count:
+            limited[key] = value[:, :max_count]
+        else:
+            limited[key] = value
+    return limited
 
 
 def configure_trainable_for_stage(
@@ -1431,6 +1526,11 @@ def configure_trainable_for_stage(
 
     trainable_mode = str(stage.get("trainable", args.trainable))
     configure_trainable(base_model, trainable_mode)
+    if args.camera_supervision_mode == "pano_relative":
+        window_camera_head = getattr(base_model, "camera_head", None)
+        if window_camera_head is not None:
+            for param in window_camera_head.parameters():
+                param.requires_grad_(False)
 
     enable_luna_forward = bool(stage.get("enable_luna_forward", True))
     set_luna_forward_enabled(base_model, enable_luna_forward)
@@ -1570,7 +1670,11 @@ def train_step(
     amp_enabled = pano_images.device.type == "cuda" and args.amp_dtype != "none"
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float32
     with torch.autocast(device_type=pano_images.device.type, dtype=amp_dtype, enabled=amp_enabled):
-        predictions = model(pano_images=pano_images, return_sampler_output=True)
+        predictions = model(
+            pano_images=pano_images,
+            return_sampler_output=True,
+            return_window_pose=args.camera_supervision_mode != "pano_relative",
+        )
         pred_depth_scale = predictions.get(
             "_pred_depth_scale",
             predictions["depth"].new_tensor(float(args.pred_depth_scale)),
@@ -1653,6 +1757,11 @@ def train_step(
         )
         loss_camera = loss_camera_dict["loss_camera"]
         loss = loss_depth + float(args.overlap_consistency_weight) * loss_overlap + args.camera_loss_weight * loss_camera
+        loss_comparable = (
+            loss_depth
+            + float(args.overlap_consistency_weight) * loss_overlap
+            + float(args.camera_comparable_weight) * loss_camera
+        )
     loss.backward()
 
     if args.grad_clip > 0:
@@ -1669,9 +1778,13 @@ def train_step(
         logged_pred_depth_scale = pred_depth_scale.detach()
     return {
         "loss": loss.detach(),
+        "loss_comparable": loss_comparable.detach(),
         "loss_depth": loss_depth.detach(),
         "loss_overlap": loss_overlap.detach(),
         "loss_camera": loss_camera.detach(),
+        "loss_overlap_weighted": (float(args.overlap_consistency_weight) * loss_overlap).detach(),
+        "loss_camera_weighted": (float(args.camera_loss_weight) * loss_camera).detach(),
+        "pano_count": loss_depth.new_tensor(float(pano_images.shape[1] if pano_images.ndim == 5 else 1)),
         "depth_valid_ratio": depth_valid_ratio.detach(),
         "depth_window_keep_ratio": depth_window_keep_ratio.detach(),
         "depth_loss_valid_ratio": depth_loss_valid.detach(),
@@ -1950,9 +2063,12 @@ def write_tensorboard_metrics(writer, metrics: Dict[str, Any]) -> None:
     step = int(metrics["step"])
     scalar_map = {
         "loss/total": "loss",
+        "loss/comparable": "loss_comparable",
         "loss/depth": "loss_depth",
         "loss/overlap": "loss_overlap",
+        "loss/overlap_weighted": "loss_overlap_weighted",
         "loss/camera": "loss_camera",
+        "loss/camera_weighted": "loss_camera_weighted",
         "loss/camera_t": "loss_camera_t",
         "loss/camera_r": "loss_camera_r",
         "loss/camera_fov": "loss_camera_fov",
@@ -1966,6 +2082,10 @@ def write_tensorboard_metrics(writer, metrics: Dict[str, Any]) -> None:
         "data/depth_sample_scale_median": "depth_sample_scale_median",
         "data/depth_sample_scale_min": "depth_sample_scale_min",
         "data/depth_sample_scale_max": "depth_sample_scale_max",
+        "camera/rotation_deg": "camera_rotation_deg",
+        "camera/translation_valid_count": "camera_translation_valid_count",
+        "camera/rotation_valid_count": "camera_rotation_valid_count",
+        "data/pano_count": "pano_count",
         "train/lr": "lr",
         "train/pred_depth_scale": "pred_depth_scale",
         "train/elapsed_seconds": "elapsed_seconds",
@@ -2324,7 +2444,7 @@ def camera_alignment_loss(
 ) -> Dict[str, torch.Tensor]:
     pred_pose = predictions.get("pose_enc")
     camera_meta = predictions.get("pano_camera_meta")
-    if supervision_mode == "none" or pred_pose is None or camera_meta is None:
+    if supervision_mode == "none":
         zero = predictions["depth"].new_zeros(())
         return {
             "loss_camera": zero,
@@ -2332,6 +2452,57 @@ def camera_alignment_loss(
             "loss_camera_r": zero,
             "loss_camera_fov": zero,
             "loss_camera_consistency": zero,
+            "camera_rotation_deg": zero,
+            "camera_translation_valid_count": zero,
+            "camera_rotation_valid_count": zero,
+        }
+
+    if supervision_mode == "pano_relative":
+        pred_center = predictions.get("pano_camera_center")
+        pred_quat = predictions.get("pano_rotation_quat_w2c")
+        if pred_center is None or pred_quat is None:
+            raise ValueError(
+                "pano_relative supervision requires pano_camera_center and "
+                "pano_rotation_quat_w2c from PanoCameraHead"
+            )
+        pred_center = torch.nan_to_num(pred_center.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        pred_quat = F.normalize(
+            torch.nan_to_num(pred_quat.float(), nan=0.0, posinf=0.0, neginf=0.0),
+            dim=-1,
+        )
+        if pred_translation_scale is not None:
+            pred_center = pred_center * expand_sample_scale_like(pred_translation_scale, pred_center)
+        pano_losses = pano_relative_pose_loss(
+            pred_center=pred_center,
+            pred_quat=pred_quat,
+            batch=batch,
+            position_mode=position_mode,
+            translation_normalization=translation_normalization,
+            translation_normalization_eps=translation_normalization_eps,
+        )
+        zero = pred_center.new_zeros(())
+        return {
+            "loss_camera": (
+                translation_weight * pano_losses["loss_camera_t"]
+                + rotation_weight * pano_losses["loss_camera_r"]
+            ),
+            "loss_camera_fov": zero,
+            "loss_camera_consistency": zero,
+            **pano_losses,
+        }
+    if supervision_mode != "window_pose":
+        raise ValueError(f"Unknown camera-supervision-mode: {supervision_mode}")
+    if pred_pose is None or camera_meta is None:
+        zero = predictions["depth"].new_zeros(())
+        return {
+            "loss_camera": zero,
+            "loss_camera_t": zero,
+            "loss_camera_r": zero,
+            "loss_camera_fov": zero,
+            "loss_camera_consistency": zero,
+            "camera_rotation_deg": zero,
+            "camera_translation_valid_count": zero,
+            "camera_rotation_valid_count": zero,
         }
 
     pred_pose = torch.nan_to_num(pred_pose.float(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -2340,29 +2511,6 @@ def camera_alignment_loss(
     pred_translation = pred_pose[..., :3]
     if pred_translation_scale is not None:
         pred_translation = pred_translation * expand_sample_scale_like(pred_translation_scale, pred_translation)
-    if supervision_mode == "pano_relative":
-        pred_quat = F.normalize(pred_pose[..., 3:7], dim=-1)
-        loss_t, loss_r, loss_consistency = pano_relative_pose_loss(
-            pred_translation=pred_translation,
-            pred_quat=pred_quat,
-            batch=batch,
-            position_mode=position_mode,
-            consistency_weight=pano_consistency_weight,
-            translation_normalization=translation_normalization,
-            translation_normalization_eps=translation_normalization_eps,
-        )
-        zero = pred_translation.new_zeros(())
-        return {
-            "loss_camera": translation_weight * loss_t
-            + rotation_weight * loss_r
-            + translation_weight * pano_consistency_weight * loss_consistency,
-            "loss_camera_t": loss_t,
-            "loss_camera_r": loss_r,
-            "loss_camera_fov": zero,
-            "loss_camera_consistency": loss_consistency,
-        }
-    if supervision_mode != "window_pose":
-        raise ValueError(f"Unknown camera-supervision-mode: {supervision_mode}")
 
     target_quat = F.normalize(mat_to_quat(rotations_w2c), dim=-1)
     target_translation = build_target_translation(
@@ -2402,133 +2550,161 @@ def camera_alignment_loss(
         "loss_camera_r": loss_r,
         "loss_camera_fov": loss_fov,
         "loss_camera_consistency": pred_translation.new_zeros(()),
+        "camera_rotation_deg": pred_translation.new_zeros(()),
+        "camera_translation_valid_count": pred_translation.new_tensor(float(pred_translation.shape[1])),
+        "camera_rotation_valid_count": pred_translation.new_tensor(float(pred_translation.shape[1])),
     }
 
 
 def pano_relative_pose_loss(
-    pred_translation: torch.Tensor,
+    pred_center: torch.Tensor,
     pred_quat: torch.Tensor,
     batch: Dict,
     position_mode: str,
-    consistency_weight: float,
     translation_normalization: str,
     translation_normalization_eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # A multi-pano sample is flattened as [pano0 windows, pano1 windows, ...].
-    # In pano_relative mode the camera head output is treated as a pano-level
-    # pose estimate. The repeated yaw/pitch windows for one pano are supervised
-    # against the same ERP camera target; window yaw/pitch only affects image
-    # sampling and LUNA metadata, not the camera target.
+) -> Dict[str, torch.Tensor]:
+    """Supervise one predicted camera center and rotation per panorama."""
     targets = build_relative_pano_pose_targets(
         batch=batch,
         position_mode=position_mode,
-        device=pred_translation.device,
-        dtype=pred_translation.dtype,
+        device=pred_center.device,
+        dtype=pred_center.dtype,
     )
     if targets is None:
-        zero = pred_translation.new_zeros(())
-        return zero, zero, zero
-    target_translation, target_quat, rotation_valid = targets
-    loss_t, loss_consistency = repeated_pano_translation_loss(
-        pred_translation=pred_translation,
-        target_translation=target_translation,
+        valid = torch.zeros(pred_center.shape[:2], device=pred_center.device, dtype=torch.bool)
+        loss_t = distributed_masked_mean(pred_center[..., 0] * 0.0, valid)
+        loss_r = distributed_masked_mean(pred_quat[..., 0] * 0.0, valid)
+        rotation_deg = distributed_masked_mean(pred_quat[..., 0].detach() * 0.0, valid)
+        return {
+            "loss_camera_t": loss_t,
+            "loss_camera_r": loss_r,
+            "camera_rotation_deg": rotation_deg,
+            "camera_translation_valid_count": pred_center.new_zeros(()),
+            "camera_rotation_valid_count": pred_center.new_zeros(()),
+        }
+    target_center, target_quat, position_valid, rotation_valid = targets
+    if pred_center.shape != target_center.shape or pred_quat.shape != target_quat.shape:
+        raise ValueError(
+            "Pano camera prediction/target shapes disagree: "
+            f"center {tuple(pred_center.shape)} vs {tuple(target_center.shape)}, "
+            f"rotation {tuple(pred_quat.shape)} vs {tuple(target_quat.shape)}"
+        )
+    loss_t = pano_center_loss(
+        pred_center=pred_center,
+        target_center=target_center,
+        position_valid=position_valid,
         translation_normalization=translation_normalization,
         translation_normalization_eps=translation_normalization_eps,
     )
-    loss_r = repeated_pano_rotation_loss(
+    loss_r, rotation_deg = pano_rotation_geodesic_loss(
         pred_quat=pred_quat,
         target_quat=target_quat,
         rotation_valid=rotation_valid,
     )
-    return loss_t, loss_r, loss_consistency
+    return {
+        "loss_camera_t": loss_t,
+        "loss_camera_r": loss_r,
+        "camera_rotation_deg": rotation_deg.detach(),
+        "camera_translation_valid_count": position_valid[:, 1:].sum().to(dtype=pred_center.dtype),
+        "camera_rotation_valid_count": rotation_valid[:, 1:].sum().to(dtype=pred_center.dtype),
+    }
 
 
-def repeated_pano_translation_loss(
-    pred_translation: torch.Tensor,
-    target_translation: torch.Tensor,
+def pano_center_loss(
+    pred_center: torch.Tensor,
+    target_center: torch.Tensor,
+    position_valid: torch.Tensor,
     translation_normalization: str,
     translation_normalization_eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if target_translation.ndim != 3 or target_translation.shape[1] < 2:
-        zero = pred_translation.new_zeros(())
-        return zero, zero
-
-    batch_size, total_views = pred_translation.shape[:2]
-    num_panos = target_translation.shape[1]
-    if total_views % num_panos != 0:
-        raise ValueError(f"Cannot map {total_views} views to {num_panos} panos.")
-
-    views_per_pano = total_views // num_panos
-    pred_per_pano = pred_translation.reshape(
-        batch_size,
-        num_panos,
-        views_per_pano,
-        3,
-    )
-    target = target_translation[:, :, None, :]
+) -> torch.Tensor:
+    if target_center.ndim != 3 or target_center.shape[1] < 2:
+        return pred_center.new_zeros(())
+    valid = position_valid.to(device=pred_center.device).bool().clone()
+    valid[:, 0] = False
     scale = camera_translation_normalization_scale(
-        target_translation,
+        target_center,
         mode=translation_normalization,
         eps=translation_normalization_eps,
+        valid_mask=valid,
     )
-    loss_pose = ((pred_per_pano - target).abs() / scale[:, None, None, None]).mean()
-    pred_mean = pred_per_pano.mean(dim=2)
-    loss_consistency = ((pred_per_pano - pred_mean[:, :, None, :]).abs() / scale[:, None, None, None]).mean()
-    return loss_pose, loss_consistency
+    normalized_error = (pred_center - target_center) / scale[:, None, None]
+    per_pano = F.smooth_l1_loss(
+        normalized_error,
+        torch.zeros_like(normalized_error),
+        beta=0.1,
+        reduction="none",
+    ).mean(dim=-1)
+    return distributed_masked_mean(per_pano, valid)
 
 
 def camera_translation_normalization_scale(
     target_translation: torch.Tensor,
     mode: str,
     eps: float,
+    valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_shape = target_translation.shape[0]
     if mode == "none":
         return target_translation.new_ones(batch_shape)
     norms = torch.linalg.vector_norm(target_translation.float(), dim=-1)
+    if valid_mask is None:
+        valid = torch.ones_like(norms, dtype=torch.bool)
+    else:
+        valid = valid_mask.to(device=norms.device).bool()
+        if valid.shape != norms.shape:
+            raise ValueError(f"Translation validity shape {tuple(valid.shape)} != {tuple(norms.shape)}")
+    valid_float = valid.to(dtype=norms.dtype)
+    count = valid_float.sum(dim=-1).clamp_min(1.0)
     if mode == "target_rms":
-        scale = norms.square().mean(dim=-1).sqrt()
+        scale = ((norms.square() * valid_float).sum(dim=-1) / count).sqrt()
     elif mode == "target_mean_norm":
-        scale = norms.mean(dim=-1)
+        scale = (norms * valid_float).sum(dim=-1) / count
     elif mode == "target_max_norm":
-        scale = norms.max(dim=-1).values
+        scale = norms.masked_fill(~valid, float("-inf")).max(dim=-1).values
+        scale = torch.where(torch.isfinite(scale), scale, torch.zeros_like(scale))
     else:
         raise ValueError(f"Unknown camera translation normalization: {mode}")
     return scale.to(device=target_translation.device, dtype=target_translation.dtype).clamp_min(float(eps))
 
 
-def repeated_pano_rotation_loss(
+def pano_rotation_geodesic_loss(
     pred_quat: torch.Tensor,
     target_quat: torch.Tensor,
     rotation_valid: torch.Tensor,
-) -> torch.Tensor:
-    if target_quat.ndim != 3 or rotation_valid.ndim != 2:
-        return pred_quat.new_zeros(())
-    batch_size, total_views = pred_quat.shape[:2]
-    num_panos = target_quat.shape[1]
-    if num_panos < 2 or total_views % num_panos != 0:
-        return pred_quat.new_zeros(())
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if target_quat.ndim != 3 or rotation_valid.ndim != 2 or target_quat.shape[1] < 2:
+        zero = pred_quat.new_zeros(())
+        return zero, zero
     valid = rotation_valid.to(device=pred_quat.device).bool()
-    if valid.shape != (batch_size, num_panos):
-        return pred_quat.new_zeros(())
     valid = valid & valid[:, :1]
-    if not bool(valid.any()):
-        return pred_quat.new_zeros(())
+    valid[:, 0] = False
 
-    views_per_pano = total_views // num_panos
-    pred = F.normalize(pred_quat, dim=-1).reshape(
-        batch_size,
-        num_panos,
-        views_per_pano,
-        4,
-    )
-    target = F.normalize(target_quat, dim=-1)[:, :, None, :]
-    per_view_loss = torch.minimum(
-        (pred - target).abs().sum(dim=-1),
-        (pred + target).abs().sum(dim=-1),
-    )
-    mask = valid[:, :, None].expand_as(per_view_loss)
-    return per_view_loss[mask].mean()
+    pred = F.normalize(pred_quat, dim=-1)
+    target = F.normalize(target_quat, dim=-1)
+    cosine = (pred * target).sum(dim=-1).abs().clamp(0.0, 1.0)
+    eps = 1e-7
+    floor = 2.0 * torch.acos(cosine.new_tensor(1.0 - eps))
+    angle = (2.0 * torch.acos(cosine.clamp_max(1.0 - eps)) - floor).clamp_min(0.0)
+    loss = distributed_masked_mean(angle, valid)
+    degrees = distributed_masked_mean(angle.detach(), valid) * (180.0 / math.pi)
+    return loss, degrees
+
+
+def distributed_masked_mean(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Mean over valid labels with correct normalization under variable-label DDP."""
+    valid_float = valid.to(device=values.device, dtype=values.dtype)
+    numerator = (values * valid_float).sum()
+    count = valid_float.sum()
+    if not (dist.is_available() and dist.is_initialized()):
+        return numerator / count.clamp_min(1.0)
+    global_count = count.detach().clone()
+    dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+    if not bool(global_count > 0):
+        return numerator * 0.0
+    # DDP averages gradients over ranks. Multiplying the local numerator by
+    # world_size/global_count yields a true global valid-label mean.
+    return numerator * (float(dist.get_world_size()) / global_count)
 
 
 def build_relative_pano_pose_targets(
@@ -2536,7 +2712,7 @@ def build_relative_pano_pose_targets(
     position_mode: str,
     device: torch.device,
     dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
     pano_position = batch.get("pano_position_m", None)
     if pano_position is None:
         return None
@@ -2547,6 +2723,15 @@ def build_relative_pano_pose_targets(
         centers = centers[:, None, :]
     if centers.ndim != 3 or centers.shape[1] < 2:
         return None
+    position_valid_raw = batch.get("pano_position_valid", None)
+    if position_valid_raw is None:
+        position_valid = torch.ones(centers.shape[:2], device=device, dtype=torch.bool)
+    else:
+        position_valid = position_valid_raw.to(device=device).bool()
+        if position_valid.ndim == 1:
+            position_valid = position_valid[None, :]
+        if position_valid.shape != centers.shape[:2]:
+            return None
 
     pano_rotation = batch.get("pano_rotation_c2w", None)
     if pano_rotation is None:
@@ -2579,11 +2764,13 @@ def build_relative_pano_pose_targets(
 
     if position_mode in {"none", "local_zero"}:
         target_centers = torch.zeros_like(centers)
+        position_valid = torch.zeros_like(position_valid)
         target_rotations_c2w = torch.eye(3, device=device, dtype=dtype).reshape(1, 1, 3, 3).expand_as(rotations_c2w)
         rotation_valid = torch.zeros_like(rotation_valid)
     elif position_mode == "relative_anchor":
         anchor_w2c = rotations_c2w[:, :1].transpose(-1, -2)
         target_centers = (anchor_w2c @ (centers - centers[:, :1])[..., None])[..., 0]
+        position_valid = position_valid & position_valid[:, :1]
         target_rotations_c2w = anchor_w2c @ rotations_c2w
         rotation_valid = rotation_valid & rotation_valid[:, :1]
     elif position_mode == "relative_mean":
@@ -2596,9 +2783,8 @@ def build_relative_pano_pose_targets(
         raise ValueError(f"Unknown camera-position-mode: {position_mode}")
 
     target_rotations_w2c = target_rotations_c2w.transpose(-1, -2).contiguous()
-    target_translation = (-(target_rotations_w2c @ target_centers[..., None])[..., 0]).contiguous()
     target_quat = F.normalize(mat_to_quat(target_rotations_w2c), dim=-1)
-    return target_translation, target_quat, rotation_valid
+    return target_centers.contiguous(), target_quat, position_valid, rotation_valid
 
 
 def build_relative_pano_centers(
