@@ -53,13 +53,17 @@ mkdir -p "$WARMUP_OUT" "$LUNA_OUT"
   echo "[sequence] num_yaw=$NUM_YAW"
 } | tee -a "$SEQ_LOG"
 
-echo "[sequence] building mixed4 official indexes under $PANOVGGT_ROOT $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
-PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
-  "$PYTHON" "$LUNA/scripts/build_mixed4_official_indexes.py" \
-  --root "$PANOVGGT_ROOT" \
-  --train-fraction 0.95 \
-  --seed 42 \
-  2>&1 | tee -a "$SEQ_LOG"
+if [[ "${SKIP_INDEX_BUILD:-0}" != "1" ]]; then
+  echo "[sequence] building mixed4 official indexes under $PANOVGGT_ROOT $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
+  PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" "$LUNA/scripts/build_mixed4_official_indexes.py" \
+    --root "$PANOVGGT_ROOT" \
+    --train-fraction 0.95 \
+    --seed 42 \
+    2>&1 | tee -a "$SEQ_LOG"
+else
+  echo "[sequence] mixed4 index rebuild skipped because SKIP_INDEX_BUILD=1" | tee -a "$SEQ_LOG"
+fi
 
 PRED_DEPTH_SCALE="${PRED_DEPTH_SCALE:-}"
 if [[ "${SKIP_CALIBRATION:-0}" != "1" ]]; then
