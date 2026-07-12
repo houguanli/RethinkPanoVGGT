@@ -5,26 +5,22 @@ import numpy as np
 from scripts.calibrate_camera_conventions import (
     PairRecord,
     PanoRecord,
+    DOCUMENTED_PANOVGGT_CAMERA_BASIS_CANONICAL_TO_NATIVE,
+    WORLD_NATIVE_TO_CANONICAL,
+    canonicalize_camera_pose,
     erp_rays,
     prepare_pair_samples,
     rotation_about_y,
     score_candidate,
     search_coarse,
 )
-from training.data.pano_minimal import (
-    _CAMERA_CANONICAL_TO_NATIVE,
-    _WORLD_NATIVE_TO_CANONICAL,
-    _canonicalize_camera_item,
-)
-
-
 class CameraConventionCalibrationTest(unittest.TestCase):
     def test_official_dataset_pose_conversions_are_proper_and_round_trip(self):
         expected_rotations = {
             "panocity": np.eye(3),
             "matterport3d": (
-                _WORLD_NATIVE_TO_CANONICAL["matterport3d"]
-                @ _CAMERA_CANONICAL_TO_NATIVE["matterport3d"]
+                WORLD_NATIVE_TO_CANONICAL["matterport3d"]
+                @ DOCUMENTED_PANOVGGT_CAMERA_BASIS_CANONICAL_TO_NATIVE["matterport3d"]
             ),
             "stanford2d3ds": np.asarray(
                 [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
@@ -33,18 +29,13 @@ class CameraConventionCalibrationTest(unittest.TestCase):
         }
         for dataset, expected_rotation in expected_rotations.items():
             with self.subTest(dataset=dataset):
-                item = {
-                    "dataset": dataset,
-                    "pano_position_m": [1.0, 2.0, 3.0],
-                    "pano_rotation_c2w": np.eye(3).tolist(),
-                    "pano_position_valid": True,
-                    "pano_rotation_valid": True,
-                }
-                canonical = _canonicalize_camera_item(item)
-                world_basis = _WORLD_NATIVE_TO_CANONICAL[dataset]
-                camera_basis = _CAMERA_CANONICAL_TO_NATIVE[dataset]
-                center = np.asarray(canonical["pano_position_m"])
-                rotation = np.asarray(canonical["pano_rotation_c2w"])
+                world_basis = WORLD_NATIVE_TO_CANONICAL[dataset]
+                camera_basis = DOCUMENTED_PANOVGGT_CAMERA_BASIS_CANONICAL_TO_NATIVE[dataset]
+                center, rotation = canonicalize_camera_pose(
+                    dataset,
+                    np.asarray([1.0, 2.0, 3.0]),
+                    np.eye(3),
+                )
 
                 np.testing.assert_allclose(center, world_basis @ np.asarray([1.0, 2.0, 3.0]))
                 np.testing.assert_allclose(rotation, expected_rotation, atol=1e-6)

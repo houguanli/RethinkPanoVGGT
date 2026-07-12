@@ -22,7 +22,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from training.data.pano_minimal import (  # noqa: E402
     PanoMinimalDataset,
-    _CAMERA_CANONICAL_TO_NATIVE,
     _read_depth_tensor,
     _scene_group_key,
 )
@@ -30,11 +29,21 @@ from training.train_pano_omega import erp_depth_to_range_depth  # noqa: E402
 
 
 DATASET_NAMES = ("panocity", "matterport3d", "stanford2d3ds", "structured3d")
+Y_FORWARD_Z_UP_WORLD_TO_OPENCV = np.asarray(
+    [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+    dtype=np.float64,
+)
+WORLD_NATIVE_TO_CANONICAL = {
+    "panocity": np.eye(3, dtype=np.float64),
+    "matterport3d": Y_FORWARD_Z_UP_WORLD_TO_OPENCV,
+    "stanford2d3ds": Y_FORWARD_Z_UP_WORLD_TO_OPENCV,
+    "structured3d": Y_FORWARD_Z_UP_WORLD_TO_OPENCV,
+}
 DOCUMENTED_PANOVGGT_CAMERA_BASIS_CANONICAL_TO_NATIVE = {
     "panocity": np.eye(3, dtype=np.float64),
     "matterport3d": np.diag([1.0, -1.0, -1.0]),
     "stanford2d3ds": np.eye(3, dtype=np.float64),
-    "structured3d": _CAMERA_CANONICAL_TO_NATIVE["structured3d"].copy(),
+    "structured3d": Y_FORWARD_Z_UP_WORLD_TO_OPENCV.T,
 }
 
 
@@ -107,7 +116,6 @@ def main() -> None:
             split=args.split,
             split_seed=args.seed,
             datasets=dataset_name,
-            canonicalize_camera=False,
             strict=True,
         )
         pairs = load_pairs(
@@ -150,9 +158,6 @@ def main() -> None:
         documented_matrix = DOCUMENTED_PANOVGGT_CAMERA_BASIS_CANONICAL_TO_NATIVE[dataset_name]
         documented_cal = score_candidate(sampled_calibration, documented_matrix, 1.0)
         documented_val = score_candidate(sampled_validation, documented_matrix, 1.0)
-        configured_matrix = _CAMERA_CANONICAL_TO_NATIVE[dataset_name]
-        configured_cal = score_candidate(sampled_calibration, configured_matrix, 1.0)
-        configured_val = score_candidate(sampled_validation, configured_matrix, 1.0)
         coarse = search_coarse(sampled_calibration, scales)
         refined = search_refined(
             sampled_calibration,
@@ -197,12 +202,6 @@ def main() -> None:
                 "calibration": documented_cal,
                 "validation": documented_val,
             },
-            "configured_loader": {
-                "camera_basis_canonical_to_native": configured_matrix.tolist(),
-                "position_scale_to_m": 1.0,
-                "calibration": configured_cal,
-                "validation": configured_val,
-            },
             "best": {
                 **{key: value for key, value in best.items() if key != "metrics"},
                 "diagnostic_only": True,
@@ -229,7 +228,6 @@ def main() -> None:
             f"dataset={dataset_name} accepted={accepted} "
             f"identity_val={identity_val['score']:.6f} "
             f"official_val={documented_val['score']:.6f} "
-            f"configured_val={configured_val['score']:.6f} "
             f"fixed_val={fixed_validation['score']:.6f} "
             f"best_val={best_validation['score']:.6f} "
             f"scale={best_scale:.6g} axes={best['axis_map']} yaw={best['yaw_offset_deg']:.1f}"
@@ -255,6 +253,16 @@ def parse_positive_floats(raw: str) -> list[float]:
     if not values or any(value <= 0 or not math.isfinite(value) for value in values):
         raise ValueError("position-scales must contain finite positive values.")
     return values
+
+
+def canonicalize_camera_pose(
+    dataset_name: str,
+    center_native: np.ndarray,
+    rotation_native: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    world_basis = WORLD_NATIVE_TO_CANONICAL[dataset_name]
+    camera_basis = DOCUMENTED_PANOVGGT_CAMERA_BASIS_CANONICAL_TO_NATIVE[dataset_name]
+    return world_basis @ center_native, world_basis @ rotation_native @ camera_basis
 
 
 def load_pairs(

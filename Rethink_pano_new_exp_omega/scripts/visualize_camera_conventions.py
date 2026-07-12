@@ -18,6 +18,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.calibrate_camera_conventions import (  # noqa: E402
     DATASET_NAMES,
+    DOCUMENTED_PANOVGGT_CAMERA_BASIS_CANONICAL_TO_NATIVE,
+    WORLD_NATIVE_TO_CANONICAL,
     erp_rays,
     load_pairs,
     prepare_pair_samples,
@@ -26,8 +28,6 @@ from scripts.calibrate_camera_conventions import (  # noqa: E402
 )
 from training.data.pano_minimal import (  # noqa: E402
     PanoMinimalDataset,
-    _CAMERA_CANONICAL_TO_NATIVE,
-    _WORLD_NATIVE_TO_CANONICAL,
 )
 
 
@@ -58,7 +58,6 @@ def main() -> None:
             split=args.split,
             split_seed=args.seed,
             datasets=dataset_name,
-            canonicalize_camera=False,
             strict=True,
         )
         pairs = load_pairs(
@@ -72,7 +71,10 @@ def main() -> None:
         )
         if not pairs:
             raise RuntimeError(f"No camera pair available for {dataset_name}")
-        configured_basis = basis_overrides.get(dataset_name, _CAMERA_CANONICAL_TO_NATIVE[dataset_name])
+        configured_basis = basis_overrides.get(
+            dataset_name,
+            DOCUMENTED_PANOVGGT_CAMERA_BASIS_CANONICAL_TO_NATIVE[dataset_name],
+        )
         pair = select_highest_overlap_pair(
             pairs,
             height=args.height,
@@ -106,7 +108,7 @@ def main() -> None:
         cv2.imwrite(str(output_path), panel)
         panels.append(panel)
 
-        world_basis = _WORLD_NATIVE_TO_CANONICAL[dataset_name]
+        world_basis = WORLD_NATIVE_TO_CANONICAL[dataset_name]
         pair_summary = []
         for record in (pair.first, pair.second):
             center_canonical = world_basis @ record.center
