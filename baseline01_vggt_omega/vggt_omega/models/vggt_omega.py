@@ -30,8 +30,11 @@ class VGGTOmega(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.activation_checkpointing = bool(activation_checkpointing)
-        self.aggregator = Aggregator(patch_size=patch_size, embed_dim=embed_dim)
+        self.aggregator = Aggregator(
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            activation_checkpointing=activation_checkpointing,
+        )
         _warn_if_rope_not_max(self.aggregator)
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.dense_head = DenseHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_depth else None
