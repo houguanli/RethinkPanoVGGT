@@ -47,6 +47,18 @@ _MATTERPORT3D_DEPTH_SCALE = 4000.0
 _STANFORD2D3DS_DEPTH_SCALE = 512.0
 _STRUCTURED3D_DEPTH_SCALE = 1000.0
 
+_MP3D_CAMERA_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
+_MP3D_WORLD_TO_OPENCV = np.asarray(
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float32,
+)
+_S3D_WORLD_TO_OPENCV = _MP3D_WORLD_TO_OPENCV
+
 
 class MixedPanoDataset(Dataset):
     """Concatenate multiple pano datasets while preserving the training batch schema."""
@@ -131,6 +143,7 @@ class PanoMinimalDataset(Dataset):
             self.dataset_sampling_weights if self.split == "train" else None,
             seed=self.split_seed,
         )
+        self.indices_by_scene = self._build_indices_by_scene()
         self.groups = self._build_groups()
         if strict and not self.items:
             raise FileNotFoundError(f"No minimal PanoVGGT samples found under {self.root}.")
@@ -150,7 +163,7 @@ class PanoMinimalDataset(Dataset):
             max_count = min(self.pano_max_count, len(group))
             min_count = min(self.pano_min_count, max_count)
             group = group[: random.randint(min_count, max_count)]
-        samples = [self._read_item_with_fallback(item_index) for item_index in group]
+        samples = self._read_group_with_scene_fallback(group)
         return {
             "pano_image": torch.stack([sample["pano_image"] for sample in samples], dim=0),
             "pano_depth": torch.stack([sample["pano_depth"] for sample in samples], dim=0),
@@ -169,16 +182,75 @@ class PanoMinimalDataset(Dataset):
         }
 
     def _read_item_with_fallback(self, item_index: int) -> Dict:
-        start = int(item_index) % len(self.items)
-        last_error: Exception | None = None
-        for offset in range(len(self.items)):
-            candidate_index = (start + offset) % len(self.items)
+        sample, _chosen_index = self._read_item_with_fallback_from_candidates(item_index)
+        return sample
+
+    def _read_group_with_scene_fallback(self, group: Sequence[int]) -> List[Dict]:
+        if not group:
+            raise IndexError("Cannot read an empty multi-pano group.")
+        scene_key = _scene_group_key(self.items[group[0]])
+        group_scene_keys = {_scene_group_key(self.items[item_index]) for item_index in group}
+        if group_scene_keys != {scene_key}:
+            raise RuntimeError(f"Multi-pano group crosses scenes: {sorted(group_scene_keys)}")
+        scene_indices = self.indices_by_scene.get(scene_key, list(group))
+        samples: List[Dict] = []
+        used_indices: set[int] = set()
+        for item_index in group:
             try:
-                return self._read_item(self.items[candidate_index])
+                sample, chosen_index = self._read_item_with_fallback_from_candidates(
+                    item_index,
+                    fallback_indices=scene_indices,
+                    used_indices=used_indices,
+                )
+            except RuntimeError:
+                # Keep the replacement in-scene even if the scene has too few
+                # readable alternatives to avoid a duplicate panorama.
+                sample, chosen_index = self._read_item_with_fallback_from_candidates(
+                    item_index,
+                    fallback_indices=scene_indices,
+                    used_indices=None,
+                )
+            samples.append(sample)
+            used_indices.add(chosen_index)
+        return samples
+
+    def _read_item_with_fallback_from_candidates(
+        self,
+        item_index: int,
+        fallback_indices: Optional[Sequence[int]] = None,
+        used_indices: Optional[set[int]] = None,
+    ) -> Tuple[Dict, int]:
+        start = int(item_index) % len(self.items)
+        candidates = self._fallback_candidates(start, fallback_indices)
+        last_error: Exception | None = None
+        for candidate_index in candidates:
+            if used_indices is not None and candidate_index in used_indices:
+                continue
+            try:
+                return self._read_item(self.items[candidate_index]), candidate_index
             except (FileNotFoundError, OSError, ValueError, SyntaxError) as exc:
                 last_error = exc
                 print(f"[WARN] skipping unreadable minimal pano sample {self.items[candidate_index].get('scene_name')}: {exc}")
         raise RuntimeError("All minimal pano samples failed to load.") from last_error
+
+    def _fallback_candidates(
+        self,
+        item_index: int,
+        fallback_indices: Optional[Sequence[int]],
+    ) -> List[int]:
+        if fallback_indices is None:
+            return [(item_index + offset) % len(self.items) for offset in range(len(self.items))]
+        anchor = self.items[item_index]
+        unique_indices = sorted(set(int(index) for index in fallback_indices))
+        return sorted(
+            unique_indices,
+            key=lambda candidate: (
+                candidate != item_index,
+                _position_distance_sq(anchor, self.items[candidate]),
+                abs(candidate - item_index),
+                candidate,
+            ),
+        )
 
     def _read_item(self, item: Dict) -> Dict:
         image = _read_rgb_tensor(item["rgb_path"])
@@ -213,18 +285,15 @@ class PanoMinimalDataset(Dataset):
         if self.pano_sample_mode == "single":
             return [[idx] for idx in sample_indices]
 
-        indices_by_scene: Dict[str, List[int]] = {}
-        for item_index, item in enumerate(self.items):
-            indices_by_scene.setdefault(_scene_group_key(item), []).append(item_index)
         offset_by_index: Dict[int, int] = {}
-        for scene_indices in indices_by_scene.values():
+        for scene_indices in self.indices_by_scene.values():
             for offset, item_index in enumerate(scene_indices):
                 offset_by_index[item_index] = offset
 
         groups = []
         for idx in sample_indices:
             item = self.items[idx]
-            scene_indices = indices_by_scene.get(_scene_group_key(item), [idx])
+            scene_indices = self.indices_by_scene.get(_scene_group_key(item), [idx])
             if len(scene_indices) < self.pano_min_count:
                 continue
             anchor_offset = offset_by_index.get(idx, 0)
@@ -246,6 +315,12 @@ class PanoMinimalDataset(Dataset):
             group = candidates[: self.pano_max_count]
             groups.append(group)
         return groups
+
+    def _build_indices_by_scene(self) -> Dict[str, List[int]]:
+        indices_by_scene: Dict[str, List[int]] = {}
+        for item_index, item in enumerate(self.items):
+            indices_by_scene.setdefault(_scene_group_key(item), []).append(item_index)
+        return indices_by_scene
 
     def _build_index(self, max_samples: Optional[int]) -> List[Dict]:
         items: List[Dict] = []
@@ -317,10 +392,19 @@ def _is_bad_sample(rgb_path: str, depth_path: str, scene_name: str, bad_samples:
 
 
 def _scene_group_key(item: Dict) -> str:
+    explicit = item.get("scene_group_key")
+    if explicit not in (None, ""):
+        return str(explicit)
     dataset = str(item.get("dataset") or item.get("sequence_name") or "unknown")
     scene_name = str(item.get("scene_name") or "")
     scene_prefix = scene_name.rsplit("_", 1)[0] if "_" in scene_name else scene_name
     return f"{dataset}:{scene_prefix}"
+
+
+def _join_scene_key(dataset: object, *parts: object) -> str:
+    values = [str(dataset)]
+    values.extend(str(part) for part in parts if part not in (None, ""))
+    return ":".join(values)
 
 
 def _position_distance_sq(anchor: Dict, candidate: Dict) -> float:
@@ -479,6 +563,7 @@ def _index_matterport3d(root: Path, split: str, scale: float) -> List[Dict]:
                     position_valid=position_valid,
                     rotation_c2w=rotation,
                     rotation_valid=rotation_valid,
+                    scene_group_key=_join_scene_key("Matterport3D", scan, room_id),
                 )
             )
     return items
@@ -489,7 +574,7 @@ def _index_stanford2d3ds(root: Path, split: str, scale: float) -> List[Dict]:
     rows = _read_json_list(index_path)
     items: List[Dict] = []
     for row in rows:
-        area, _room_id, room_name, pano_ids, _size = row
+        area, room_id, room_name, pano_ids, _size = row
         for pano_id in pano_ids:
             rgb_path = _first_match(root / str(area) / "pano" / "rgb", f"camera_{pano_id}_*_rgb.png")
             depth_path = _first_match(root / str(area) / "pano" / "depth", f"camera_{pano_id}_*_depth.png")
@@ -508,6 +593,7 @@ def _index_stanford2d3ds(root: Path, split: str, scale: float) -> List[Dict]:
                     position_valid=position_valid,
                     rotation_c2w=rotation,
                     rotation_valid=rotation_valid,
+                    scene_group_key=_join_scene_key("Stanford2D3DS", area, room_id),
                 )
             )
     return items
@@ -545,6 +631,7 @@ def _index_structured3d(root: Path, split: str, scale: float) -> List[Dict]:
                     position_valid=position_valid,
                     rotation_c2w=_identity_rotation(),
                     rotation_valid=False,
+                    scene_group_key=_join_scene_key("Structured3D", scene),
                 )
             )
     return items
@@ -579,6 +666,8 @@ def _index_panocity_official(root: Path, split: str, scale: float) -> List[Dict]
             pose_cache,
             pose_path_cache,
         )
+        city = str(row.get("city") or row.get("scene") or "")
+        block = str(row.get("block") or "")
         items.append(
             _item(
                 "Panocity",
@@ -590,6 +679,7 @@ def _index_panocity_official(root: Path, split: str, scale: float) -> List[Dict]
                 position_valid=position_valid,
                 rotation_c2w=rotation,
                 rotation_valid=rotation_valid,
+                scene_group_key=str(row.get("scene_group_key") or _join_scene_key("Panocity", city, block)),
             )
         )
     return items
@@ -629,6 +719,7 @@ def build_panocity_official_rows(root: Path) -> List[Dict]:
                     "city": city,
                     "block": block,
                     "scene_name": f"{city}_{block}_{Path(str(rgb_name)).stem}",
+                    "scene_group_key": _join_scene_key("Panocity", city, block),
                     "rgb_path": str(rgb_path.relative_to(root)),
                     "depth_path": str(depth_path.relative_to(root)),
                     "pano_position_m": position,
@@ -650,11 +741,13 @@ def _item(
     position_valid: bool = True,
     rotation_c2w: Optional[List[List[float]]] = None,
     rotation_valid: bool = False,
+    scene_group_key: Optional[str] = None,
 ) -> Dict:
     return {
         "dataset": sequence_name,
         "sequence_name": sequence_name,
         "scene_name": scene_name,
+        "scene_group_key": scene_group_key,
         "rgb_path": rgb_path,
         "depth_path": depth_path,
         "pano_position_m": position,
@@ -719,6 +812,7 @@ def _read_pose_position_rotation(path: Path) -> Tuple[List[float], bool, List[Li
         return [0.0, 0.0, 0.0], False, _identity_rotation(), False
     matrix = np.loadtxt(path, dtype=np.float32)
     if matrix.shape == (4, 4):
+        matrix = _MP3D_WORLD_TO_OPENCV @ matrix @ np.linalg.inv(_MP3D_CAMERA_TO_OPENCV)
         rotation = _rotation_from_matrix_c2w(matrix)
         return (
             [float(value) for value in matrix[:3, 3]],
@@ -906,7 +1000,9 @@ def _read_structured3d_position(path: Path) -> Tuple[List[float], bool]:
         return [0.0, 0.0, 0.0], False
     if len(values) != 3:
         return [0.0, 0.0, 0.0], False
-    return [value / 1000.0 for value in values], True
+    position = np.asarray([value / 1000.0 for value in values], dtype=np.float32)
+    position = (_S3D_WORLD_TO_OPENCV[:3, :3] @ position[:, None])[:, 0]
+    return [float(value) for value in position], True
 
 
 def _read_rgb_tensor(path: Path) -> torch.Tensor:

@@ -35,15 +35,18 @@ Y_FORWARD_Z_UP_WORLD_TO_OPENCV = np.asarray(
 )
 WORLD_NATIVE_TO_CANONICAL = {
     "panocity": np.eye(3, dtype=np.float64),
-    "matterport3d": Y_FORWARD_Z_UP_WORLD_TO_OPENCV,
-    "stanford2d3ds": Y_FORWARD_Z_UP_WORLD_TO_OPENCV,
-    "structured3d": Y_FORWARD_Z_UP_WORLD_TO_OPENCV,
+    "matterport3d": np.eye(3, dtype=np.float64),
+    "stanford2d3ds": np.eye(3, dtype=np.float64),
+    "structured3d": np.eye(3, dtype=np.float64),
 }
+# PanoMinimalDataset now returns loader-canonical camera poses. Raw dataset
+# basis conversions live in training.data.pano_minimal, so this diagnostic must
+# not apply another dataset-specific transform on top of the loader output.
 DOCUMENTED_PANOVGGT_CAMERA_BASIS_CANONICAL_TO_NATIVE = {
     "panocity": np.eye(3, dtype=np.float64),
-    "matterport3d": np.diag([1.0, -1.0, -1.0]),
+    "matterport3d": np.eye(3, dtype=np.float64),
     "stanford2d3ds": np.eye(3, dtype=np.float64),
-    "structured3d": Y_FORWARD_Z_UP_WORLD_TO_OPENCV.T,
+    "structured3d": np.eye(3, dtype=np.float64),
 }
 
 

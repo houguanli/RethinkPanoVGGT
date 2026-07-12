@@ -1,6 +1,12 @@
 import unittest
+import sys
+from pathlib import Path
 
 import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.calibrate_camera_conventions import (
     PairRecord,
@@ -18,13 +24,8 @@ class CameraConventionCalibrationTest(unittest.TestCase):
     def test_official_dataset_pose_conversions_are_proper_and_round_trip(self):
         expected_rotations = {
             "panocity": np.eye(3),
-            "matterport3d": (
-                WORLD_NATIVE_TO_CANONICAL["matterport3d"]
-                @ DOCUMENTED_PANOVGGT_CAMERA_BASIS_CANONICAL_TO_NATIVE["matterport3d"]
-            ),
-            "stanford2d3ds": np.asarray(
-                [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
-            ),
+            "matterport3d": np.eye(3),
+            "stanford2d3ds": np.eye(3),
             "structured3d": np.eye(3),
         }
         for dataset, expected_rotation in expected_rotations.items():

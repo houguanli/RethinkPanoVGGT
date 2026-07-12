@@ -1,14 +1,19 @@
 """Tests for single and variable-neighborhood pano sampling."""
 
+import json
 import os
 import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(THIS_DIR))
 
-from training.data import PanoVKittiOmegaDataset  # noqa: E402
+from training.data import PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E402
+from training.data.pano_minimal import _read_pose_position_rotation, _read_structured3d_position  # noqa: E402
 from training.train_pano_omega import write_smoke_dataset  # noqa: E402
 
 
@@ -44,7 +49,103 @@ def test_variable_neighborhood_sampling_returns_anchor_first_sequence():
         assert lengths
 
 
+def test_minimal_multipano_groups_stay_inside_scene():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "minimal"
+        _write_matterport_minimal_bundle(root)
+        dataset = PanoMinimalDataset(
+            root=root,
+            datasets="matterport3d",
+            pano_size=(16, 32),
+            pano_sample_mode="fixed_neighborhood",
+            pano_min_count=2,
+            pano_max_count=2,
+            grouping="nearest",
+        )
+        assert dataset.groups
+        for group in dataset.groups:
+            scene_keys = {_scene_key(dataset, item_index) for item_index in group}
+            assert len(scene_keys) == 1
+        sample = dataset[0]
+        assert all(name.startswith("scan_a_all_") for name in sample["scene_name"].split("|"))
+
+
+def test_minimal_multipano_fallback_stays_inside_scene():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "minimal"
+        _write_matterport_minimal_bundle(root)
+        (root / "Matterport3D" / "scan_a" / "pano_depth" / "pano_1.png").unlink()
+        dataset = PanoMinimalDataset(
+            root=root,
+            datasets="matterport3d",
+            pano_size=(16, 32),
+            pano_sample_mode="fixed_neighborhood",
+            pano_min_count=2,
+            pano_max_count=2,
+            grouping="nearest",
+        )
+        sample = dataset[0]
+        assert all(name.startswith("scan_a_all_") for name in sample["scene_name"].split("|"))
+
+
+def test_minimal_matterport_pose_is_converted_to_opencv():
+    with tempfile.TemporaryDirectory() as tmp:
+        pose_path = Path(tmp) / "pose.txt"
+        pose = np.eye(4, dtype=np.float32)
+        pose[:3, 3] = np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+        np.savetxt(pose_path, pose)
+        position, position_valid, rotation, rotation_valid = _read_pose_position_rotation(pose_path)
+        assert position_valid
+        assert rotation_valid
+        np.testing.assert_allclose(position, [1.0, -3.0, 2.0], atol=1e-6)
+        np.testing.assert_allclose(
+            np.asarray(rotation),
+            np.asarray([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]], dtype=np.float32),
+            atol=1e-6,
+        )
+
+
+def test_minimal_structured3d_position_is_converted_to_opencv():
+    with tempfile.TemporaryDirectory() as tmp:
+        position_path = Path(tmp) / "camera_xyz.txt"
+        position_path.write_text("1000 2000 3000\n", encoding="utf-8")
+        position, position_valid = _read_structured3d_position(position_path)
+        assert position_valid
+        np.testing.assert_allclose(position, [1.0, -3.0, 2.0], atol=1e-6)
+
+
+def _scene_key(dataset: PanoMinimalDataset, item_index: int) -> str:
+    return str(dataset.items[item_index].get("scene_group_key"))
+
+
+def _write_matterport_minimal_bundle(root: Path) -> None:
+    cache_dir = root / "Matterport3D" / "cache"
+    cache_dir.mkdir(parents=True)
+    rows = [
+        ["scan_a", "all", "all", ["pano_0", "pano_1"], [32, 64]],
+        ["scan_b", "all", "all", ["pano_0", "pano_1"], [32, 64]],
+    ]
+    (cache_dir / "matterport3d_train_index.json").write_text(json.dumps(rows), encoding="utf-8")
+    for scan_index, scan in enumerate(("scan_a", "scan_b")):
+        for subdir in ("pano_skybox_color", "pano_depth", "pano_poses"):
+            (root / "Matterport3D" / scan / subdir).mkdir(parents=True, exist_ok=True)
+        for pano_index, pano_id in enumerate(("pano_0", "pano_1")):
+            color = (80 + scan_index * 50, 100 + pano_index * 40, 160)
+            Image.new("RGB", (64, 32), color).save(
+                root / "Matterport3D" / scan / "pano_skybox_color" / f"{pano_id}.jpg"
+            )
+            depth = np.full((32, 64), 4000 + pano_index * 100, dtype=np.uint16)
+            Image.fromarray(depth).save(root / "Matterport3D" / scan / "pano_depth" / f"{pano_id}.png")
+            pose = np.eye(4, dtype=np.float32)
+            pose[0, 3] = float(scan_index * 100 + pano_index)
+            np.savetxt(root / "Matterport3D" / scan / "pano_poses" / f"{pano_id}.txt", pose)
+
+
 if __name__ == "__main__":
     test_single_pano_sampling_returns_one_erp()
     test_variable_neighborhood_sampling_returns_anchor_first_sequence()
+    test_minimal_multipano_groups_stay_inside_scene()
+    test_minimal_multipano_fallback_stays_inside_scene()
+    test_minimal_matterport_pose_is_converted_to_opencv()
+    test_minimal_structured3d_position_is_converted_to_opencv()
     print("pano dataset sampling (omega) ok")
