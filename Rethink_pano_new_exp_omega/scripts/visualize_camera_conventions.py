@@ -36,6 +36,7 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--datasets", default="all")
+    parser.add_argument("--camera-basis-json", type=Path, default=None)
     parser.add_argument("--split", default="train")
     parser.add_argument("--height", type=int, default=128)
     parser.add_argument("--width", type=int, default=256)
@@ -43,6 +44,7 @@ def main() -> None:
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    basis_overrides = load_camera_basis_overrides(args.camera_basis_json)
     summaries: dict[str, Any] = {}
     panels: list[np.ndarray] = []
     selected_datasets = parse_datasets(args.datasets)
@@ -70,11 +72,12 @@ def main() -> None:
         )
         if not pairs:
             raise RuntimeError(f"No camera pair available for {dataset_name}")
+        configured_basis = basis_overrides.get(dataset_name, _CAMERA_CANONICAL_TO_NATIVE[dataset_name])
         pair = select_highest_overlap_pair(
             pairs,
             height=args.height,
             width=args.width,
-            camera_basis=_CAMERA_CANONICAL_TO_NATIVE[dataset_name],
+            camera_basis=configured_basis,
             seed=args.seed + offset * 2003,
         )
         samples = prepare_pair_samples(
@@ -86,7 +89,7 @@ def main() -> None:
         )
         sample = samples[0]
         identity = np.eye(3, dtype=np.float64)
-        configured = _CAMERA_CANONICAL_TO_NATIVE[dataset_name]
+        configured = configured_basis
         native_view = reproject_sample_depth(sample, identity, 1.0)
         canonical_view = reproject_sample_depth(sample, configured, 1.0)
         native_metrics = score_candidate(samples, identity, 1.0)
@@ -104,13 +107,12 @@ def main() -> None:
         panels.append(panel)
 
         world_basis = _WORLD_NATIVE_TO_CANONICAL[dataset_name]
-        camera_basis = _CAMERA_CANONICAL_TO_NATIVE[dataset_name]
         pair_summary = []
         for record in (pair.first, pair.second):
             center_canonical = world_basis @ record.center
-            rotation_canonical = world_basis @ record.rotation_c2w @ camera_basis
+            rotation_canonical = world_basis @ record.rotation_c2w @ configured_basis
             center_roundtrip = world_basis.T @ center_canonical
-            rotation_roundtrip = world_basis.T @ rotation_canonical @ camera_basis.T
+            rotation_roundtrip = world_basis.T @ rotation_canonical @ configured_basis.T
             pair_summary.append(
                 {
                     "name": record.name,
@@ -129,7 +131,7 @@ def main() -> None:
             "first": pair.first.name,
             "second": pair.second.name,
             "world_native_to_canonical": world_basis.tolist(),
-            "camera_canonical_to_native": camera_basis.tolist(),
+            "camera_canonical_to_native": configured_basis.tolist(),
             "native_identity_metrics": native_metrics,
             "configured_canonical_metrics": canonical_metrics,
             "cameras": pair_summary,
@@ -155,6 +157,22 @@ def parse_datasets(raw: str) -> list[str]:
     if unknown:
         raise ValueError(f"Unknown datasets: {unknown}")
     return selected
+
+
+def load_camera_basis_overrides(path: Path | None) -> dict[str, np.ndarray]:
+    if path is None:
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    overrides: dict[str, np.ndarray] = {}
+    for dataset_name, result in payload.get("datasets", {}).items():
+        candidate = result.get("best_fixed_official_scale")
+        if not isinstance(candidate, dict):
+            continue
+        matrix = np.asarray(candidate.get("camera_basis_canonical_to_native"), dtype=np.float64)
+        if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+            raise ValueError(f"Invalid camera basis override for {dataset_name}")
+        overrides[dataset_name] = matrix
+    return overrides
 
 
 def select_highest_overlap_pair(pairs, height, width, camera_basis, seed):
