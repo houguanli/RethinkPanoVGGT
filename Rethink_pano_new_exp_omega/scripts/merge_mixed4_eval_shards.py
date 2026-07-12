@@ -96,19 +96,19 @@ def main() -> None:
                 "summary": summarize_values([float(row["loss"]) for row in run_rows]),
                 "depth_summary": summarize_values([float(row["loss_depth"]) for row in run_rows]),
                 "overlap_summary": summarize_values([float(row["loss_overlap"]) for row in run_rows]),
-                "camera_summary": summarize_values([float(row["loss_camera"]) for row in run_rows]),
+                "camera_summary": summarize_values(optional_numeric_values(run_rows, "loss_camera")),
                 "camera_translation_summary": summarize_values(
-                    [float(row["loss_camera_t"]) for row in run_rows]
+                    optional_numeric_values(run_rows, "loss_camera_t")
                 ),
                 "camera_rotation_rad_summary": summarize_values(
-                    [float(row["loss_camera_r"]) for row in run_rows]
+                    optional_numeric_values(run_rows, "loss_camera_r")
                 ),
                 "camera_rotation_deg_summary": summarize_values(
-                    [
-                        float(row["camera_rotation_deg"])
-                        for row in run_rows
-                        if float(row.get("camera_rotation_valid_count", 0.0)) > 0
-                    ]
+                    optional_numeric_values(
+                        run_rows,
+                        "camera_rotation_deg",
+                        valid_count_key="camera_rotation_valid_count",
+                    )
                 ),
                 "valid_fraction_summary": summarize_values([float(row["valid_fraction"]) for row in run_rows]),
                 "depth_metric_summary": summarize_metric_rows(run_rows, DEPTH_METRIC_KEYS),
@@ -194,6 +194,31 @@ def coerce_row(row: dict[str, str]) -> dict[str, Any]:
             continue
         out[key] = int(number) if key in {"dataset_index", "depth_valid_pixels"} else number
     return out
+
+
+def optional_numeric_values(
+    rows: list[dict[str, Any]],
+    key: str,
+    valid_count_key: str | None = None,
+) -> list[float]:
+    values: list[float] = []
+    for row in rows:
+        if valid_count_key is not None:
+            try:
+                if float(row.get(valid_count_key, 0.0)) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            values.append(number)
+    return values
 
 
 def collect_run_meta(payloads: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

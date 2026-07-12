@@ -29,6 +29,8 @@ from training.train_pano_omega import (  # noqa: E402
     build_dataset,
     build_model,
     camera_alignment_loss,
+    estimate_sample_depth_alignment_scale,
+    expand_sample_scale_like,
     load_checkpoint,
     masked_depth_loss,
     move_batch_to_device,
@@ -322,7 +324,25 @@ def evaluate_run(
                     "_pred_depth_scale",
                     predictions["depth"].new_tensor(float(eval_args.pred_depth_scale)),
                 )
-                pred_depth = predictions["depth"] * pred_depth_scale
+                base_depth_scale = (
+                    pred_depth_scale.detach()
+                    if eval_args.depth_scale_alignment != "none"
+                    else pred_depth_scale
+                )
+                pred_depth_base = predictions["depth"] * base_depth_scale
+                sample_depth_scale = estimate_sample_depth_alignment_scale(
+                    pred_depth_base,
+                    target_depth,
+                    target_valid,
+                    mode=eval_args.depth_scale_alignment,
+                    min_scale=eval_args.depth_scale_alignment_min,
+                    max_scale=eval_args.depth_scale_alignment_max,
+                    eps=eval_args.depth_scale_alignment_eps,
+                )
+                pred_depth = pred_depth_base * expand_sample_scale_like(
+                    sample_depth_scale,
+                    pred_depth_base,
+                )
                 loss_depth = masked_depth_loss(
                     pred_depth,
                     target_depth,
@@ -342,8 +362,8 @@ def evaluate_run(
                     sample_weight=moved.get("sample_weight") if eval_args.loss_sample_weighting else None,
                     band_fraction=eval_args.overlap_band_fraction,
                 )
-                depth_metrics = compute_depth_metrics(pred_depth, target_depth, target_valid)
-                camera_scale = pred_depth_scale.detach() * float(depth_metrics["depth_irls_scale"])
+                depth_metrics = compute_depth_metrics(pred_depth_base, target_depth, target_valid)
+                camera_scale = base_depth_scale.detach() * sample_depth_scale
                 camera_losses = camera_alignment_loss(
                     predictions=predictions,
                     batch=moved,
@@ -356,7 +376,12 @@ def evaluate_run(
                     translation_normalization=eval_args.camera_translation_normalization,
                     translation_normalization_eps=eval_args.camera_translation_normalization_eps,
                     pred_translation_scale=(
-                        camera_scale if eval_args.camera_depth_scale_alignment else None
+                        (
+                            camera_scale
+                            if eval_args.camera_depth_scale_alignment
+                            and eval_args.depth_scale_alignment != "none"
+                            else None
+                        )
                     ),
                 )
                 loss = (
