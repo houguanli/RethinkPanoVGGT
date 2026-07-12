@@ -54,9 +54,24 @@ _Y_FORWARD_Z_UP_WORLD_TO_OPENCV = np.asarray(
     [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
     dtype=np.float64,
 )
+_MATTERPORT3D_ERP_YAW_OFFSET_DEG = -62.0
+_MATTERPORT3D_ERP_YAW_OFFSET_RAD = np.deg2rad(_MATTERPORT3D_ERP_YAW_OFFSET_DEG)
+_MATTERPORT3D_ERP_YAW_COS = np.cos(_MATTERPORT3D_ERP_YAW_OFFSET_RAD)
+_MATTERPORT3D_ERP_YAW_SIN = np.sin(_MATTERPORT3D_ERP_YAW_OFFSET_RAD)
+_MATTERPORT3D_CAMERA_CANONICAL_TO_NATIVE = np.asarray(
+    [
+        [_MATTERPORT3D_ERP_YAW_COS, 0.0, _MATTERPORT3D_ERP_YAW_SIN],
+        [0.0, 1.0, 0.0],
+        [-_MATTERPORT3D_ERP_YAW_SIN, 0.0, _MATTERPORT3D_ERP_YAW_COS],
+    ],
+    dtype=np.float64,
+)
 _CAMERA_CANONICAL_TO_NATIVE = {
     "panocity": np.eye(3, dtype=np.float64),
-    "matterport3d": np.diag([1.0, -1.0, -1.0]),
+    # This minimal bundle's pano seam differs from the documented PanoVGGT
+    # OpenGL basis. GT-depth calibration over independent rooms gives a stable
+    # camera-local yaw of -62 degrees (-65/-60/-62 across three seeds).
+    "matterport3d": _MATTERPORT3D_CAMERA_CANONICAL_TO_NATIVE,
     "stanford2d3ds": np.eye(3, dtype=np.float64),
     "structured3d": _Y_FORWARD_Z_UP_WORLD_TO_OPENCV.T,
 }

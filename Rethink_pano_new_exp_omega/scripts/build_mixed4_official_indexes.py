@@ -401,21 +401,46 @@ def build_matterport3d(root: Path) -> dict[str, Any]:
 
     val_scans = read_name_set(root / "val.txt")
     test_scans = read_name_set(root / "test.txt")
-    for scan_dir in sorted(path for path in root.iterdir() if path.is_dir() and path.name != "cache"):
+    ignored_dirs = {"cache", "parsed_json"}
+    for scan_dir in sorted(
+        path for path in root.iterdir() if path.is_dir() and path.name not in ignored_dirs
+    ):
         scan = scan_dir.name
         depth_dir = scan_dir / "pano_depth"
         rgb_dir = scan_dir / "pano_skybox_color"
-        if not depth_dir.exists() or not rgb_dir.exists():
+        pose_dir = scan_dir / "pano_poses"
+        if not depth_dir.exists() or not rgb_dir.exists() or not pose_dir.exists():
             continue
-        pano_ids = [
+        available_pano_ids = {
             depth_path.stem
             for depth_path in sorted(depth_dir.glob("*.png"))
-            if (rgb_dir / f"{depth_path.stem}.jpg").exists()
-        ]
-        if not pano_ids:
+            if (
+                (
+                    (rgb_dir / f"{depth_path.stem}.jpg").exists()
+                    or (rgb_dir / f"{depth_path.stem}.png").exists()
+                )
+                and (pose_dir / f"{depth_path.stem}.txt").exists()
+            )
+        }
+        if not available_pano_ids:
             continue
         split = "val" if scan in val_scans else "test" if scan in test_scans else "train"
-        rows_by_split[split].append([scan, "all", "all", pano_ids, [1024, 2048]])
+        parsed_path = root / "parsed_json" / f"{scan}.json"
+        room_rows = 0
+        if parsed_path.is_file():
+            room_info = json.loads(parsed_path.read_text(encoding="utf-8"))
+            for room_id, room_data in sorted(room_info.items(), key=lambda item: str(item[0])):
+                pano_ids = sorted(set(room_data.get("panoramas", [])) & available_pano_ids)
+                if len(pano_ids) < 2:
+                    continue
+                room_name = str(room_data.get("room_name") or f"room_{room_id}")
+                rows_by_split[split].append([scan, str(room_id), room_name, pano_ids, [1024, 2048]])
+                room_rows += 1
+        if room_rows == 0:
+            print(f"[WARN] Matterport3D room metadata unavailable for {scan}; using one scan-level group")
+            rows_by_split[split].append(
+                [scan, "all", "all", sorted(available_pano_ids), [1024, 2048]]
+            )
 
     cache = root / "cache"
     for split, rows in rows_by_split.items():

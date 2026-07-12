@@ -30,8 +30,11 @@ from training.train_pano_omega import erp_depth_to_range_depth  # noqa: E402
 
 
 DATASET_NAMES = ("panocity", "matterport3d", "stanford2d3ds", "structured3d")
-OFFICIAL_CAMERA_BASIS_CANONICAL_TO_NATIVE = {
-    name: matrix.copy() for name, matrix in _CAMERA_CANONICAL_TO_NATIVE.items()
+DOCUMENTED_PANOVGGT_CAMERA_BASIS_CANONICAL_TO_NATIVE = {
+    "panocity": np.eye(3, dtype=np.float64),
+    "matterport3d": np.diag([1.0, -1.0, -1.0]),
+    "stanford2d3ds": np.eye(3, dtype=np.float64),
+    "structured3d": _CAMERA_CANONICAL_TO_NATIVE["structured3d"].copy(),
 }
 
 
@@ -144,9 +147,12 @@ def main() -> None:
         identity = np.eye(3, dtype=np.float64)
         identity_cal = score_candidate(sampled_calibration, identity, 1.0)
         identity_val = score_candidate(sampled_validation, identity, 1.0)
-        official_matrix = OFFICIAL_CAMERA_BASIS_CANONICAL_TO_NATIVE[dataset_name]
-        official_cal = score_candidate(sampled_calibration, official_matrix, 1.0)
-        official_val = score_candidate(sampled_validation, official_matrix, 1.0)
+        documented_matrix = DOCUMENTED_PANOVGGT_CAMERA_BASIS_CANONICAL_TO_NATIVE[dataset_name]
+        documented_cal = score_candidate(sampled_calibration, documented_matrix, 1.0)
+        documented_val = score_candidate(sampled_validation, documented_matrix, 1.0)
+        configured_matrix = _CAMERA_CANONICAL_TO_NATIVE[dataset_name]
+        configured_cal = score_candidate(sampled_calibration, configured_matrix, 1.0)
+        configured_val = score_candidate(sampled_validation, configured_matrix, 1.0)
         coarse = search_coarse(sampled_calibration, scales)
         refined = search_refined(
             sampled_calibration,
@@ -186,10 +192,16 @@ def main() -> None:
                 "validation": identity_val,
             },
             "official_panovggt": {
-                "camera_basis_canonical_to_native": official_matrix.tolist(),
+                "camera_basis_canonical_to_native": documented_matrix.tolist(),
                 "position_scale_to_m": 1.0,
-                "calibration": official_cal,
-                "validation": official_val,
+                "calibration": documented_cal,
+                "validation": documented_val,
+            },
+            "configured_loader": {
+                "camera_basis_canonical_to_native": configured_matrix.tolist(),
+                "position_scale_to_m": 1.0,
+                "calibration": configured_cal,
+                "validation": configured_val,
             },
             "best": {
                 **{key: value for key, value in best.items() if key != "metrics"},
@@ -216,7 +228,8 @@ def main() -> None:
             "[calibrate-camera] "
             f"dataset={dataset_name} accepted={accepted} "
             f"identity_val={identity_val['score']:.6f} "
-            f"official_val={official_val['score']:.6f} "
+            f"official_val={documented_val['score']:.6f} "
+            f"configured_val={configured_val['score']:.6f} "
             f"fixed_val={fixed_validation['score']:.6f} "
             f"best_val={best_validation['score']:.6f} "
             f"scale={best_scale:.6g} axes={best['axis_map']} yaw={best['yaw_offset_deg']:.1f}"
@@ -470,20 +483,18 @@ def score_candidate(
 ) -> dict[str, Any]:
     all_errors: list[np.ndarray] = []
     total_requested = 0
+    total_projected = 0
     pair_scores: list[float] = []
     for sample in samples:
         reprojection = reproject_sample_depth(sample, camera_basis, position_scale)
-        z_buffer = reprojection["reprojected_depth"].reshape(-1)
-        target_depth = reprojection["target_depth"].reshape(-1)
-        projected = reprojection["projected_mask"].reshape(-1)
-        total_requested += int(projected.sum())
-        valid = reprojection["visible_mask"].reshape(-1)
+        comparable = reprojection["comparable_mask"].reshape(-1)
+        overlap = reprojection["overlap_mask"].reshape(-1)
+        total_requested += int(comparable.sum())
+        total_projected += int(reprojection["projected_mask"].sum())
+        valid = overlap
         if not np.any(valid):
             continue
-        errors = np.abs(
-            np.log(np.maximum(z_buffer[valid], 1e-6))
-            - np.log(np.maximum(target_depth[valid], 1e-6))
-        )
+        errors = reprojection["abs_log_error"].reshape(-1)[valid]
         all_errors.append(errors)
         pair_scores.append(float(np.mean(np.minimum(errors, 0.5))))
 
@@ -492,6 +503,9 @@ def score_candidate(
             "score": float("inf"),
             "valid_points": 0,
             "coverage": 0.0,
+            "overlap_ratio": 0.0,
+            "projected_valid_points": int(total_requested),
+            "projected_points": int(total_projected),
             "median_abs_log_error": float("inf"),
             "p90_abs_log_error": float("inf"),
             "inlier_5pct": 0.0,
@@ -502,11 +516,16 @@ def score_candidate(
     errors = np.concatenate(all_errors)
     coverage = float(len(errors) / max(total_requested, 1))
     clipped_mean = float(np.mean(np.minimum(errors, 0.5)))
-    score = clipped_mean + 0.1 * (1.0 - coverage)
+    # Keep ranking quality separate from the overlap-only error. A candidate
+    # cannot win by producing a tiny number of accidental depth matches.
+    score = clipped_mean + 0.5 * (1.0 - coverage)
     return {
         "score": score,
         "valid_points": int(len(errors)),
         "coverage": coverage,
+        "overlap_ratio": coverage,
+        "projected_valid_points": int(total_requested),
+        "projected_points": int(total_projected),
         "median_abs_log_error": float(np.median(errors)),
         "p90_abs_log_error": float(np.quantile(errors, 0.9)),
         "inlier_5pct": float(np.mean(errors < math.log(1.05))),
@@ -553,19 +572,22 @@ def reproject_sample_depth(
     target_depth = sample["target_depth"].astype(np.float64)
     projected = np.isfinite(z_buffer)
     target_valid = np.isfinite(target_depth) & (target_depth > 0)
-    # A source surface behind the target's first hit is occluded in the target
-    # panorama and must not be scored as a pose error.
-    visible = projected & target_valid & (z_buffer <= target_depth * 1.05)
+    comparable = projected & target_valid
     error = np.full((height, width), np.nan, dtype=np.float64)
-    error[visible] = np.abs(
-        np.log(np.maximum(z_buffer[visible], 1e-6))
-        - np.log(np.maximum(target_depth[visible], 1e-6))
+    error[comparable] = np.abs(
+        np.log(np.maximum(z_buffer[comparable], 1e-6))
+        - np.log(np.maximum(target_depth[comparable], 1e-6))
     )
+    # A projected point belongs to the same visible surface only when both
+    # views agree in depth. Twenty percent is used to identify overlap; the
+    # reported 5/10-percent inlier metrics remain stricter diagnostics.
+    overlap = comparable & (error <= math.log(1.20))
     return {
         "target_depth": target_depth,
         "reprojected_depth": z_buffer,
         "projected_mask": projected,
-        "visible_mask": visible,
+        "comparable_mask": comparable,
+        "overlap_mask": overlap,
         "abs_log_error": error,
     }
 

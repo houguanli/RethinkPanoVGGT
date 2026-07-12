@@ -35,6 +35,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--datasets", default="all")
     parser.add_argument("--split", default="train")
     parser.add_argument("--height", type=int, default=128)
     parser.add_argument("--width", type=int, default=256)
@@ -44,7 +45,8 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summaries: dict[str, Any] = {}
     panels: list[np.ndarray] = []
-    for offset, dataset_name in enumerate(DATASET_NAMES):
+    selected_datasets = parse_datasets(args.datasets)
+    for offset, dataset_name in enumerate(selected_datasets):
         dataset = PanoMinimalDataset(
             root=args.root,
             pano_sample_mode="fixed_neighborhood",
@@ -59,7 +61,7 @@ def main() -> None:
         )
         pairs = load_pairs(
             dataset,
-            count=1,
+            count=16,
             pairs_per_scene=1,
             height=args.height,
             width=args.width,
@@ -68,9 +70,15 @@ def main() -> None:
         )
         if not pairs:
             raise RuntimeError(f"No camera pair available for {dataset_name}")
-        pair = pairs[0]
-        samples = prepare_pair_samples(
+        pair = select_highest_overlap_pair(
             pairs,
+            height=args.height,
+            width=args.width,
+            camera_basis=_CAMERA_CANONICAL_TO_NATIVE[dataset_name],
+            seed=args.seed + offset * 2003,
+        )
+        samples = prepare_pair_samples(
+            [pair],
             erp_rays(args.height, args.width),
             points_per_direction=args.height * args.width,
             max_depth_m=80.0,
@@ -78,12 +86,19 @@ def main() -> None:
         )
         sample = samples[0]
         identity = np.eye(3, dtype=np.float64)
-        official = _CAMERA_CANONICAL_TO_NATIVE[dataset_name]
+        configured = _CAMERA_CANONICAL_TO_NATIVE[dataset_name]
         native_view = reproject_sample_depth(sample, identity, 1.0)
-        canonical_view = reproject_sample_depth(sample, official, 1.0)
+        canonical_view = reproject_sample_depth(sample, configured, 1.0)
         native_metrics = score_candidate(samples, identity, 1.0)
-        canonical_metrics = score_candidate(samples, official, 1.0)
-        panel = make_panel(dataset_name, pair, native_view, canonical_view)
+        canonical_metrics = score_candidate(samples, configured, 1.0)
+        panel = make_panel(
+            dataset_name,
+            pair,
+            native_view,
+            canonical_view,
+            native_metrics,
+            canonical_metrics,
+        )
         output_path = args.output_dir / f"{dataset_name}_gt_depth_reprojection.png"
         cv2.imwrite(str(output_path), panel)
         panels.append(panel)
@@ -116,7 +131,7 @@ def main() -> None:
             "world_native_to_canonical": world_basis.tolist(),
             "camera_canonical_to_native": camera_basis.tolist(),
             "native_identity_metrics": native_metrics,
-            "official_canonical_metrics": canonical_metrics,
+            "configured_canonical_metrics": canonical_metrics,
             "cameras": pair_summary,
             "visualization": str(output_path.resolve()),
         }
@@ -132,7 +147,33 @@ def main() -> None:
     print(f"[camera-vis] wrote {summary_path.resolve()}")
 
 
-def make_panel(dataset_name, pair, native_view, canonical_view) -> np.ndarray:
+def parse_datasets(raw: str) -> list[str]:
+    if raw.strip().lower() == "all":
+        return list(DATASET_NAMES)
+    selected = [value.strip().lower() for value in raw.split(",") if value.strip()]
+    unknown = sorted(set(selected) - set(DATASET_NAMES))
+    if unknown:
+        raise ValueError(f"Unknown datasets: {unknown}")
+    return selected
+
+
+def select_highest_overlap_pair(pairs, height, width, camera_basis, seed):
+    rays = erp_rays(height, width)
+    ranked = []
+    for index, pair in enumerate(pairs):
+        samples = prepare_pair_samples(
+            [pair],
+            rays,
+            points_per_direction=min(height * width, 4096),
+            max_depth_m=80.0,
+            seed=seed + index,
+        )
+        metrics = score_candidate(samples, camera_basis, 1.0)
+        ranked.append((float(metrics["overlap_ratio"]), -float(metrics["median_abs_log_error"]), pair))
+    return max(ranked, key=lambda item: (item[0], item[1]))[2]
+
+
+def make_panel(dataset_name, pair, native_view, canonical_view, native_metrics, canonical_metrics) -> np.ndarray:
     target_depth = native_view["target_depth"]
     source_depth = pair.first.depth
     finite_depth = np.concatenate(
@@ -143,16 +184,21 @@ def make_panel(dataset_name, pair, native_view, canonical_view) -> np.ndarray:
         depth_tile(source_depth, depth_max, "Source GT depth"),
         depth_tile(target_depth, depth_max, "Target GT depth"),
         depth_tile(native_view["reprojected_depth"], depth_max, "Native identity reprojection"),
-        depth_tile(canonical_view["reprojected_depth"], depth_max, "Official canonical reprojection"),
-        error_tile(native_view["abs_log_error"], "Native abs-log error"),
-        error_tile(canonical_view["abs_log_error"], "Canonical abs-log error"),
-        mask_tile(native_view["visible_mask"], "Native visible surface"),
-        mask_tile(canonical_view["visible_mask"], "Canonical visible surface"),
+        depth_tile(canonical_view["reprojected_depth"], depth_max, "Configured canonical reprojection"),
+        error_tile(native_view["abs_log_error"], native_view["overlap_mask"], "Native overlap error"),
+        error_tile(canonical_view["abs_log_error"], canonical_view["overlap_mask"], "Canonical overlap error"),
+        mask_tile(native_view["overlap_mask"], "Native depth-consistent overlap"),
+        mask_tile(canonical_view["overlap_mask"], "Canonical depth-consistent overlap"),
     ]
     top = np.concatenate(tiles[:4], axis=1)
     bottom = np.concatenate(tiles[4:], axis=1)
     panel = np.concatenate([top, bottom], axis=0)
-    title = f"{dataset_name} | {pair.first.name} -> {pair.second.name}"
+    title = (
+        f"{dataset_name} | overlap native={native_metrics['overlap_ratio']:.3f} "
+        f"canonical={canonical_metrics['overlap_ratio']:.3f} | "
+        f"median error native={native_metrics['median_abs_log_error']:.3f} "
+        f"canonical={canonical_metrics['median_abs_log_error']:.3f}"
+    )
     return add_header(panel, title)
 
 
@@ -167,8 +213,8 @@ def depth_tile(depth: np.ndarray, maximum: float, label: str) -> np.ndarray:
     return add_label(colored, label)
 
 
-def error_tile(error: np.ndarray, label: str) -> np.ndarray:
-    valid = np.isfinite(error)
+def error_tile(error: np.ndarray, overlap: np.ndarray, label: str) -> np.ndarray:
+    valid = np.isfinite(error) & overlap
     normalized = np.zeros(error.shape, dtype=np.uint8)
     normalized[valid] = np.clip(error[valid] / 0.5 * 255.0, 0, 255).astype(np.uint8)
     colored = cv2.applyColorMap(normalized, cv2.COLORMAP_INFERNO)

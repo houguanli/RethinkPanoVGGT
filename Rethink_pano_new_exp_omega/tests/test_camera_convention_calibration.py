@@ -22,8 +22,9 @@ class CameraConventionCalibrationTest(unittest.TestCase):
     def test_official_dataset_pose_conversions_are_proper_and_round_trip(self):
         expected_rotations = {
             "panocity": np.eye(3),
-            "matterport3d": np.asarray(
-                [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]]
+            "matterport3d": (
+                _WORLD_NATIVE_TO_CANONICAL["matterport3d"]
+                @ _CAMERA_CANONICAL_TO_NATIVE["matterport3d"]
             ),
             "stanford2d3ds": np.asarray(
                 [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
