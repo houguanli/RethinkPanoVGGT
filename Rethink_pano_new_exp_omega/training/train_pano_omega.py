@@ -409,6 +409,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-progress-bar", dest="progress_bar", action="store_false")
     parser.add_argument("--progress-log-every", type=int, default=50)
     parser.add_argument("--log-csv", type=Path, default=None)
+    parser.add_argument("--camera-stats-json", type=Path, default=None)
+    parser.add_argument("--camera-stats-every", type=int, default=50)
+    parser.add_argument("--camera-error-thresholds-deg", type=str, default="5,10,15,30,45,60,90")
+    parser.add_argument("--camera-error-example-limit", type=int, default=64)
     parser.add_argument("--loss-plot", type=Path, default=None)
     parser.add_argument("--tensorboard-dir", type=Path, default=None)
     parser.add_argument("--tensorboard", dest="tensorboard", action="store_true", default=True)
@@ -659,9 +663,15 @@ def train(args: argparse.Namespace) -> None:
             args.output_dir.mkdir(parents=True, exist_ok=True)
         barrier(dist_state)
         log_csv = args.log_csv or (args.output_dir / "loss.csv")
+        camera_stats_json = args.camera_stats_json or (args.output_dir / "camera_error_stats.json")
+        camera_stats = CameraErrorStats(
+            thresholds_deg=parse_float_list(args.camera_error_thresholds_deg),
+            example_limit=args.camera_error_example_limit,
+        )
         loss_plot = args.loss_plot or (args.output_dir / "loss_curve.png")
         tensorboard_dir = args.tensorboard_dir or (args.output_dir / "tensorboard")
         tensorboard_writer = create_tensorboard_writer(tensorboard_dir, dist_state, enabled=args.tensorboard)
+        rank0_print(f"[INFO] camera_stats_json = {camera_stats_json}", dist_state)
         max_duration_seconds = args.max_duration_minutes * 60.0 if args.max_duration_minutes > 0 else None
         started_at = time.time()
         metrics_history = []
@@ -731,6 +741,15 @@ def train(args: argparse.Namespace) -> None:
                 except torch.cuda.OutOfMemoryError:
                     print_cuda_memory(f"[OOM] rank={dist_state['rank']} step={global_step}", device)
                     raise
+                local_camera_records = camera_diag_records_from_batch(
+                    loss_dict=loss_dict,
+                    batch=batch,
+                    global_step=global_step,
+                    stage_name=active_stage_name,
+                    dist_state=dist_state,
+                )
+                camera_records = gather_camera_diag_records(local_camera_records, dist_state)
+                loss_dict = strip_camera_diag_tensors(loss_dict)
                 loss_dict = reduce_loss_dict(loss_dict, dist_state)
                 elapsed_seconds = time.time() - started_at
                 sampler_status = current_sampler_status(unwrap_model(model), args)
@@ -788,6 +807,14 @@ def train(args: argparse.Namespace) -> None:
                     "lr": optimizer.param_groups[0]["lr"],
                 }
                 if is_main_process(dist_state):
+                    if camera_records:
+                        camera_stats.update(camera_records)
+                    if (
+                        args.camera_stats_every > 0
+                        and global_step % args.camera_stats_every == 0
+                        and camera_stats.total_records > 0
+                    ):
+                        camera_stats.write(camera_stats_json)
                     metrics_history.append(metrics)
                     append_loss_csv(log_csv, metrics)
                     write_tensorboard_metrics(tensorboard_writer, metrics)
@@ -862,6 +889,9 @@ def train(args: argparse.Namespace) -> None:
         if "metrics_history" in locals() and is_main_process(dist_state):
             if metrics_history:
                 save_loss_plot(loss_plot, metrics_history)
+            if "camera_stats" in locals() and camera_stats.total_records > 0:
+                camera_stats.write(camera_stats_json)
+                print(f"[INFO] saved camera stats = {camera_stats_json}")
             if args.save_last and not args.smoke:
                 ckpt_path = args.output_dir / "last.pt"
                 save_checkpoint(ckpt_path, unwrap_model(model), args, global_step)
@@ -2108,6 +2138,426 @@ def append_loss_csv(path: Path, metrics: Dict[str, float]) -> None:
         writer.writerow(metrics)
 
 
+def parse_float_list(value: str | Sequence[float]) -> Tuple[float, ...]:
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",") if item.strip()]
+        parsed = [float(item) for item in items]
+    else:
+        parsed = [float(item) for item in value]
+    parsed = [item for item in parsed if math.isfinite(item)]
+    return tuple(sorted(set(parsed))) or (5.0, 10.0, 15.0, 30.0, 45.0, 60.0, 90.0)
+
+
+def strip_camera_diag_tensors(loss_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {key: value for key, value in loss_dict.items() if not key.startswith("_camera_diag_")}
+
+
+def gather_camera_diag_records(
+    records: list[Dict[str, Any]],
+    dist_state: Dict[str, int | bool],
+) -> list[Dict[str, Any]]:
+    if not dist_state["distributed"]:
+        return records
+    gathered: list[list[Dict[str, Any]] | None] = [None for _ in range(int(dist_state["world_size"]))]
+    dist.all_gather_object(gathered, records)
+    merged: list[Dict[str, Any]] = []
+    for item in gathered:
+        if item:
+            merged.extend(item)
+    return merged
+
+
+def camera_diag_records_from_batch(
+    loss_dict: Dict[str, torch.Tensor],
+    batch: Dict[str, Any],
+    global_step: int,
+    stage_name: str,
+    dist_state: Dict[str, int | bool],
+) -> list[Dict[str, Any]]:
+    rotation_deg = _camera_diag_2d(loss_dict.get("_camera_diag_rotation_deg"))
+    translation_loss = _camera_diag_2d(loss_dict.get("_camera_diag_translation_loss"))
+    translation_l2_m = _camera_diag_2d(loss_dict.get("_camera_diag_translation_l2_m"))
+    translation_norm_l2 = _camera_diag_2d(loss_dict.get("_camera_diag_translation_norm_l2"))
+    rotation_valid = _camera_diag_bool_2d(loss_dict.get("_camera_diag_rotation_valid"))
+    translation_valid = _camera_diag_bool_2d(loss_dict.get("_camera_diag_translation_valid"))
+
+    reference = next(
+        (
+            item
+            for item in (rotation_deg, translation_loss, translation_l2_m, translation_norm_l2)
+            if item is not None
+        ),
+        None,
+    )
+    if reference is None:
+        return []
+    batch_size = len(reference)
+    pano_count = len(reference[0]) if batch_size > 0 else 0
+    if batch_size <= 0 or pano_count <= 0:
+        return []
+    rotation_deg = _ensure_diag_shape(rotation_deg, batch_size, pano_count, fill=0.0)
+    translation_loss = _ensure_diag_shape(translation_loss, batch_size, pano_count, fill=0.0)
+    translation_l2_m = _ensure_diag_shape(translation_l2_m, batch_size, pano_count, fill=0.0)
+    translation_norm_l2 = _ensure_diag_shape(translation_norm_l2, batch_size, pano_count, fill=0.0)
+    rotation_valid = _ensure_bool_diag_shape(rotation_valid, batch_size, pano_count, fill=False)
+    translation_valid = _ensure_bool_diag_shape(translation_valid, batch_size, pano_count, fill=False)
+
+    sequence_names = normalize_collated_string_matrix(batch.get("sequence_name"), batch_size, pano_count)
+    scene_names = normalize_collated_string_matrix(batch.get("scene_name"), batch_size, pano_count, split_pipe=True)
+    rgb_paths = normalize_collated_string_matrix(batch.get("rgb_path"), batch_size, pano_count)
+
+    sample_scale = _loss_scalar(loss_dict, "depth_sample_scale_median")
+    records: list[Dict[str, Any]] = []
+    for batch_index in range(batch_size):
+        for pano_index in range(pano_count):
+            t_valid = bool(translation_valid[batch_index][pano_index])
+            r_valid = bool(rotation_valid[batch_index][pano_index])
+            if not (t_valid or r_valid):
+                continue
+            sequence_name = sequence_names[batch_index][pano_index]
+            scene_name = scene_names[batch_index][pano_index]
+            dataset = canonical_dataset_name(sequence_name)
+            if dataset == "unknown":
+                dataset = canonical_dataset_name(scene_name)
+            records.append(
+                {
+                    "step": int(global_step),
+                    "stage": str(stage_name),
+                    "rank": int(dist_state.get("rank", 0)),
+                    "batch_index": int(batch_index),
+                    "pano_index": int(pano_index),
+                    "pano_count": int(pano_count),
+                    "dataset": dataset,
+                    "sequence_name": sequence_name,
+                    "scene_name": scene_name,
+                    "rgb_path": rgb_paths[batch_index][pano_index],
+                    "rotation_valid": r_valid,
+                    "translation_valid": t_valid,
+                    "rotation_deg": _finite_or_none(rotation_deg[batch_index][pano_index]) if r_valid else None,
+                    "translation_loss": _finite_or_none(translation_loss[batch_index][pano_index]) if t_valid else None,
+                    "translation_l2_m": _finite_or_none(translation_l2_m[batch_index][pano_index]) if t_valid else None,
+                    "translation_norm_l2": _finite_or_none(translation_norm_l2[batch_index][pano_index]) if t_valid else None,
+                    "sample_scale": sample_scale,
+                    "loss_camera": _loss_scalar(loss_dict, "loss_camera"),
+                    "loss_camera_t": _loss_scalar(loss_dict, "loss_camera_t"),
+                    "loss_camera_r": _loss_scalar(loss_dict, "loss_camera_r"),
+                }
+            )
+    return records
+
+
+def _camera_diag_2d(value: torch.Tensor | None) -> list[list[float]] | None:
+    if value is None or not torch.is_tensor(value):
+        return None
+    item = value.detach().float().cpu()
+    if item.ndim == 0:
+        item = item.reshape(1, 1)
+    elif item.ndim == 1:
+        item = item.reshape(1, -1)
+    elif item.ndim > 2:
+        item = item.reshape(item.shape[0], item.shape[1], -1).mean(dim=-1)
+    return item.tolist()
+
+
+def _camera_diag_bool_2d(value: torch.Tensor | None) -> list[list[bool]] | None:
+    if value is None or not torch.is_tensor(value):
+        return None
+    item = value.detach().bool().cpu()
+    if item.ndim == 0:
+        item = item.reshape(1, 1)
+    elif item.ndim == 1:
+        item = item.reshape(1, -1)
+    elif item.ndim > 2:
+        item = item.reshape(item.shape[0], item.shape[1], -1).any(dim=-1)
+    return [[bool(cell) for cell in row] for row in item.tolist()]
+
+
+def _ensure_diag_shape(
+    value: list[list[float]] | None,
+    batch_size: int,
+    pano_count: int,
+    fill: float,
+) -> list[list[float]]:
+    result = [[float(fill) for _ in range(pano_count)] for _ in range(batch_size)]
+    if value is None:
+        return result
+    for batch_index in range(min(batch_size, len(value))):
+        row = value[batch_index]
+        for pano_index in range(min(pano_count, len(row))):
+            result[batch_index][pano_index] = float(row[pano_index])
+    return result
+
+
+def _ensure_bool_diag_shape(
+    value: list[list[bool]] | None,
+    batch_size: int,
+    pano_count: int,
+    fill: bool,
+) -> list[list[bool]]:
+    result = [[bool(fill) for _ in range(pano_count)] for _ in range(batch_size)]
+    if value is None:
+        return result
+    for batch_index in range(min(batch_size, len(value))):
+        row = value[batch_index]
+        for pano_index in range(min(pano_count, len(row))):
+            result[batch_index][pano_index] = bool(row[pano_index])
+    return result
+
+
+def normalize_collated_string_matrix(
+    raw: Any,
+    batch_size: int,
+    pano_count: int,
+    split_pipe: bool = False,
+) -> list[list[str]]:
+    result = [["unknown" for _ in range(pano_count)] for _ in range(batch_size)]
+    if raw is None:
+        return result
+    if isinstance(raw, str):
+        values = raw.split("|") if split_pipe and "|" in raw else [raw]
+        for batch_index in range(batch_size):
+            for pano_index in range(pano_count):
+                result[batch_index][pano_index] = stringify_nested(values[min(pano_index, len(values) - 1)])
+        return result
+    if not isinstance(raw, (list, tuple)):
+        text = stringify_nested(raw)
+        for batch_index in range(batch_size):
+            for pano_index in range(pano_count):
+                result[batch_index][pano_index] = text
+        return result
+
+    if len(raw) >= pano_count and all(isinstance(item, (list, tuple)) for item in raw[:pano_count]):
+        for pano_index, item in enumerate(raw[:pano_count]):
+            for batch_index in range(min(batch_size, len(item))):
+                result[batch_index][pano_index] = stringify_nested(item[batch_index])
+    elif len(raw) >= batch_size and all(isinstance(item, (list, tuple)) for item in raw[:batch_size]):
+        for batch_index, item in enumerate(raw[:batch_size]):
+            for pano_index in range(min(pano_count, len(item))):
+                result[batch_index][pano_index] = stringify_nested(item[pano_index])
+    elif batch_size == 1 and len(raw) >= pano_count:
+        for pano_index, item in enumerate(raw[:pano_count]):
+            result[0][pano_index] = stringify_nested(item)
+    elif len(raw) >= batch_size:
+        for batch_index, item in enumerate(raw[:batch_size]):
+            text = stringify_nested(item)
+            for pano_index in range(pano_count):
+                result[batch_index][pano_index] = text
+
+    if split_pipe:
+        for batch_index in range(batch_size):
+            row = result[batch_index]
+            if row and all(value == row[0] for value in row) and "|" in row[0]:
+                parts = [part for part in row[0].split("|") if part]
+                if parts:
+                    for pano_index in range(pano_count):
+                        result[batch_index][pano_index] = stringify_nested(parts[min(pano_index, len(parts) - 1)])
+    return result
+
+
+def stringify_nested(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return stringify_nested(value[0])
+    return str(value)
+
+
+def canonical_dataset_name(value: Any) -> str:
+    text = stringify_nested(value).strip().lower()
+    compact = text.replace("_", "").replace("-", "").replace(" ", "")
+    if not compact or compact in {"none", "unknown"}:
+        return "unknown"
+    if "matterport" in compact or "mp3d" in compact:
+        return "matterport3d"
+    if "stanford" in compact or "2d3ds" in compact:
+        return "stanford2d3ds"
+    if "structured3d" in compact or compact.startswith("s3d"):
+        return "structured3d"
+    if "panocity" in compact or "pano-city" in compact:
+        return "panocity"
+    return compact
+
+
+def _loss_scalar(loss_dict: Dict[str, torch.Tensor], key: str) -> float | None:
+    value = loss_dict.get(key)
+    if value is None or not torch.is_tensor(value) or value.numel() != 1:
+        return None
+    return _finite_or_none(float(value.detach().cpu().item()))
+
+
+def _finite_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+class CameraErrorStats:
+    def __init__(self, thresholds_deg: Sequence[float], example_limit: int) -> None:
+        self.thresholds_deg = tuple(sorted(float(item) for item in thresholds_deg))
+        self.example_limit = max(0, int(example_limit))
+        self.total_records = 0
+        self.overall = self._new_group()
+        self.by_dataset: Dict[str, Dict[str, Any]] = {}
+        self.by_stage: Dict[str, Dict[str, Any]] = {}
+        self.by_stage_dataset: Dict[str, Dict[str, Any]] = {}
+        self.high_rotation_examples: list[Dict[str, Any]] = []
+
+    def update(self, records: Sequence[Dict[str, Any]]) -> None:
+        for record in records:
+            self.total_records += 1
+            dataset = str(record.get("dataset") or "unknown")
+            stage = str(record.get("stage") or "unknown")
+            self._update_group(self.overall, record)
+            self._update_group(self.by_dataset.setdefault(dataset, self._new_group()), record)
+            self._update_group(self.by_stage.setdefault(stage, self._new_group()), record)
+            stage_dataset = f"{stage}/{dataset}"
+            self._update_group(self.by_stage_dataset.setdefault(stage_dataset, self._new_group()), record)
+            self._maybe_add_high_rotation_example(record)
+
+    def write(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(path.name + ".tmp")
+        tmp_path.write_text(json.dumps(self.to_json(), indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(path)
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "updated_at_unix": time.time(),
+            "thresholds_deg": list(self.thresholds_deg),
+            "total_records": int(self.total_records),
+            "overall": self._finalize_group(self.overall),
+            "by_dataset": {
+                key: self._finalize_group(value)
+                for key, value in sorted(self.by_dataset.items())
+            },
+            "by_stage": {
+                key: self._finalize_group(value)
+                for key, value in sorted(self.by_stage.items())
+            },
+            "by_stage_dataset": {
+                key: self._finalize_group(value)
+                for key, value in sorted(self.by_stage_dataset.items())
+            },
+            "high_rotation_examples": list(self.high_rotation_examples),
+        }
+
+    def _new_group(self) -> Dict[str, Any]:
+        return {
+            "records": 0,
+            "rotation": self._new_metric_group(),
+            "translation_loss": self._new_metric_group(),
+            "translation_l2_m": self._new_metric_group(),
+            "translation_norm_l2": self._new_metric_group(),
+            "rotation_over_threshold_counts": {
+                self._threshold_key(threshold): 0 for threshold in self.thresholds_deg
+            },
+        }
+
+    @staticmethod
+    def _new_metric_group() -> Dict[str, Any]:
+        return {
+            "count": 0,
+            "sum": 0.0,
+            "sumsq": 0.0,
+            "min": None,
+            "max": None,
+        }
+
+    def _update_group(self, group: Dict[str, Any], record: Dict[str, Any]) -> None:
+        group["records"] += 1
+        rotation_deg = record.get("rotation_deg")
+        if record.get("rotation_valid") and rotation_deg is not None:
+            self._update_metric_group(group["rotation"], float(rotation_deg))
+            for threshold in self.thresholds_deg:
+                if float(rotation_deg) >= threshold:
+                    group["rotation_over_threshold_counts"][self._threshold_key(threshold)] += 1
+        for key in ("translation_loss", "translation_l2_m", "translation_norm_l2"):
+            value = record.get(key)
+            if record.get("translation_valid") and value is not None:
+                self._update_metric_group(group[key], float(value))
+
+    @staticmethod
+    def _update_metric_group(group: Dict[str, Any], value: float) -> None:
+        if not math.isfinite(value):
+            return
+        group["count"] += 1
+        group["sum"] += value
+        group["sumsq"] += value * value
+        group["min"] = value if group["min"] is None else min(float(group["min"]), value)
+        group["max"] = value if group["max"] is None else max(float(group["max"]), value)
+
+    def _finalize_group(self, group: Dict[str, Any]) -> Dict[str, Any]:
+        rotation = self._finalize_metric_group(group["rotation"])
+        rotation_count = max(1, int(group["rotation"]["count"]))
+        threshold_counts = dict(group["rotation_over_threshold_counts"])
+        threshold_ratios = {
+            key: float(value) / float(rotation_count)
+            for key, value in threshold_counts.items()
+        }
+        rotation["over_threshold_counts"] = threshold_counts
+        rotation["over_threshold_ratios"] = threshold_ratios
+        return {
+            "records": int(group["records"]),
+            "rotation_deg": rotation,
+            "translation_loss": self._finalize_metric_group(group["translation_loss"]),
+            "translation_l2_m": self._finalize_metric_group(group["translation_l2_m"]),
+            "translation_norm_l2": self._finalize_metric_group(group["translation_norm_l2"]),
+        }
+
+    @staticmethod
+    def _finalize_metric_group(group: Dict[str, Any]) -> Dict[str, Any]:
+        count = int(group["count"])
+        if count <= 0:
+            return {"count": 0, "mean": None, "std": None, "min": None, "max": None}
+        mean = float(group["sum"]) / float(count)
+        variance = max(0.0, float(group["sumsq"]) / float(count) - mean * mean)
+        return {
+            "count": count,
+            "mean": mean,
+            "std": math.sqrt(variance),
+            "min": group["min"],
+            "max": group["max"],
+        }
+
+    def _maybe_add_high_rotation_example(self, record: Dict[str, Any]) -> None:
+        rotation_deg = record.get("rotation_deg")
+        if self.example_limit <= 0 or not record.get("rotation_valid") or rotation_deg is None:
+            return
+        example = {
+            key: record.get(key)
+            for key in (
+                "step",
+                "stage",
+                "rank",
+                "dataset",
+                "sequence_name",
+                "scene_name",
+                "rgb_path",
+                "pano_index",
+                "pano_count",
+                "rotation_deg",
+                "translation_l2_m",
+                "translation_norm_l2",
+                "translation_loss",
+                "sample_scale",
+            )
+        }
+        self.high_rotation_examples.append(example)
+        self.high_rotation_examples.sort(
+            key=lambda item: float(item.get("rotation_deg") or float("-inf")),
+            reverse=True,
+        )
+        del self.high_rotation_examples[self.example_limit :]
+
+    @staticmethod
+    def _threshold_key(threshold: float) -> str:
+        return f"ge_{threshold:g}"
+
+
 def save_loss_plot(path: Path, metrics_history: list[Dict[str, float]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -2576,12 +3026,19 @@ def pano_relative_pose_loss(
         loss_t = distributed_masked_mean(pred_center[..., 0] * 0.0, valid)
         loss_r = distributed_masked_mean(pred_quat[..., 0] * 0.0, valid)
         rotation_deg = distributed_masked_mean(pred_quat[..., 0].detach() * 0.0, valid)
+        diag_zero = pred_center[..., 0].detach() * 0.0
         return {
             "loss_camera_t": loss_t,
             "loss_camera_r": loss_r,
             "camera_rotation_deg": rotation_deg,
             "camera_translation_valid_count": pred_center.new_zeros(()),
             "camera_rotation_valid_count": pred_center.new_zeros(()),
+            "_camera_diag_translation_loss": diag_zero,
+            "_camera_diag_translation_l2_m": diag_zero,
+            "_camera_diag_translation_norm_l2": diag_zero,
+            "_camera_diag_translation_valid": valid.detach(),
+            "_camera_diag_rotation_deg": diag_zero,
+            "_camera_diag_rotation_valid": valid.detach(),
         }
     target_center, target_quat, position_valid, rotation_valid = targets
     if pred_center.shape != target_center.shape or pred_quat.shape != target_quat.shape:
@@ -2590,14 +3047,15 @@ def pano_relative_pose_loss(
             f"center {tuple(pred_center.shape)} vs {tuple(target_center.shape)}, "
             f"rotation {tuple(pred_quat.shape)} vs {tuple(target_quat.shape)}"
         )
-    loss_t = pano_center_loss(
+    translation_loss_map, translation_l2_m, translation_norm_l2, translation_valid = pano_center_error_maps(
         pred_center=pred_center,
         target_center=target_center,
         position_valid=position_valid,
         translation_normalization=translation_normalization,
         translation_normalization_eps=translation_normalization_eps,
     )
-    loss_r, rotation_deg = pano_rotation_geodesic_loss(
+    loss_t = distributed_masked_mean(translation_loss_map, translation_valid)
+    loss_r, rotation_deg, rotation_deg_map, rotation_valid_mask = pano_rotation_geodesic_loss(
         pred_quat=pred_quat,
         target_quat=target_quat,
         rotation_valid=rotation_valid,
@@ -2608,7 +3066,48 @@ def pano_relative_pose_loss(
         "camera_rotation_deg": rotation_deg.detach(),
         "camera_translation_valid_count": position_valid[:, 1:].sum().to(dtype=pred_center.dtype),
         "camera_rotation_valid_count": rotation_valid[:, 1:].sum().to(dtype=pred_center.dtype),
+        "_camera_diag_translation_loss": translation_loss_map.detach(),
+        "_camera_diag_translation_l2_m": translation_l2_m.detach(),
+        "_camera_diag_translation_norm_l2": translation_norm_l2.detach(),
+        "_camera_diag_translation_valid": translation_valid.detach(),
+        "_camera_diag_rotation_deg": rotation_deg_map.detach(),
+        "_camera_diag_rotation_valid": rotation_valid_mask.detach(),
     }
+
+
+def pano_center_error_maps(
+    pred_center: torch.Tensor,
+    target_center: torch.Tensor,
+    position_valid: torch.Tensor,
+    translation_normalization: str,
+    translation_normalization_eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    zero_map = pred_center[..., 0] * 0.0
+    false_valid = torch.zeros(pred_center.shape[:2], device=pred_center.device, dtype=torch.bool)
+    if target_center.ndim != 3 or target_center.shape[1] < 2:
+        return zero_map, zero_map.detach(), zero_map.detach(), false_valid
+    valid = position_valid.to(device=pred_center.device).bool()
+    if valid.shape != pred_center.shape[:2]:
+        return zero_map, zero_map.detach(), zero_map.detach(), false_valid
+    valid = valid.clone()
+    valid[:, 0] = False
+    scale = camera_translation_normalization_scale(
+        target_center,
+        mode=translation_normalization,
+        eps=translation_normalization_eps,
+        valid_mask=valid,
+    )
+    delta = pred_center - target_center
+    normalized_error = delta / scale[:, None, None]
+    per_pano = F.smooth_l1_loss(
+        normalized_error,
+        torch.zeros_like(normalized_error),
+        beta=0.1,
+        reduction="none",
+    ).mean(dim=-1)
+    translation_l2_m = torch.linalg.vector_norm(delta.detach(), dim=-1)
+    translation_norm_l2 = torch.linalg.vector_norm(normalized_error.detach(), dim=-1)
+    return per_pano, translation_l2_m, translation_norm_l2, valid
 
 
 def pano_center_loss(
@@ -2618,23 +3117,13 @@ def pano_center_loss(
     translation_normalization: str,
     translation_normalization_eps: float,
 ) -> torch.Tensor:
-    if target_center.ndim != 3 or target_center.shape[1] < 2:
-        return pred_center.new_zeros(())
-    valid = position_valid.to(device=pred_center.device).bool().clone()
-    valid[:, 0] = False
-    scale = camera_translation_normalization_scale(
-        target_center,
-        mode=translation_normalization,
-        eps=translation_normalization_eps,
-        valid_mask=valid,
+    per_pano, _, _, valid = pano_center_error_maps(
+        pred_center=pred_center,
+        target_center=target_center,
+        position_valid=position_valid,
+        translation_normalization=translation_normalization,
+        translation_normalization_eps=translation_normalization_eps,
     )
-    normalized_error = (pred_center - target_center) / scale[:, None, None]
-    per_pano = F.smooth_l1_loss(
-        normalized_error,
-        torch.zeros_like(normalized_error),
-        beta=0.1,
-        reduction="none",
-    ).mean(dim=-1)
     return distributed_masked_mean(per_pano, valid)
 
 
@@ -2672,11 +3161,19 @@ def pano_rotation_geodesic_loss(
     pred_quat: torch.Tensor,
     target_quat: torch.Tensor,
     rotation_valid: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if target_quat.ndim != 3 or rotation_valid.ndim != 2 or target_quat.shape[1] < 2:
         zero = pred_quat.new_zeros(())
-        return zero, zero
+        zero_map = pred_quat[..., 0].detach() * 0.0
+        valid = torch.zeros(pred_quat.shape[:2], device=pred_quat.device, dtype=torch.bool)
+        return zero, zero, zero_map, valid
     valid = rotation_valid.to(device=pred_quat.device).bool()
+    if valid.shape != pred_quat.shape[:2]:
+        zero = pred_quat.new_zeros(())
+        zero_map = pred_quat[..., 0].detach() * 0.0
+        valid = torch.zeros(pred_quat.shape[:2], device=pred_quat.device, dtype=torch.bool)
+        return zero, zero, zero_map, valid
+    valid = valid.clone()
     valid = valid & valid[:, :1]
     valid[:, 0] = False
 
@@ -2688,7 +3185,7 @@ def pano_rotation_geodesic_loss(
     angle = (2.0 * torch.acos(cosine.clamp_max(1.0 - eps)) - floor).clamp_min(0.0)
     loss = distributed_masked_mean(angle, valid)
     degrees = distributed_masked_mean(angle.detach(), valid) * (180.0 / math.pi)
-    return loss, degrees
+    return loss, degrees, angle.detach() * (180.0 / math.pi), valid.detach()
 
 
 def distributed_masked_mean(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
