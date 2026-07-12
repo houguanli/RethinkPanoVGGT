@@ -472,39 +472,12 @@ def score_candidate(
     total_requested = 0
     pair_scores: list[float] = []
     for sample in samples:
-        source_rays = sample["source_rays"]
-        source_depth = sample["source_depth"]
-        native_rays = (camera_basis @ source_rays.T).T
-        world_rays = (sample["source_rotation"] @ native_rays.T).T
-        world_points = (
-            float(position_scale) * sample["source_center"][None, :]
-            + source_depth[:, None] * world_rays
-        )
-        target_native = (
-            sample["target_rotation"].T
-            @ (
-                world_points
-                - float(position_scale) * sample["target_center"][None, :]
-            ).T
-        ).T
-        target_canonical = (camera_basis.T @ target_native.T).T
-        predicted_range = np.linalg.norm(target_canonical, axis=-1)
-        valid_direction = np.isfinite(predicted_range) & (predicted_range > 1e-6)
-        directions = target_canonical / np.maximum(predicted_range[:, None], 1e-8)
-        u, v = rays_to_erp(directions)
-        height, width = sample["target_depth"].shape
-        x = np.mod(np.floor(u * width).astype(np.int64), width)
-        y = np.clip(np.floor(v * height).astype(np.int64), 0, height - 1)
-        pixel_index = y * width + x
-        z_buffer = np.full(height * width, np.inf, dtype=np.float64)
-        np.minimum.at(z_buffer, pixel_index[valid_direction], predicted_range[valid_direction])
-        target_depth = sample["target_depth"].reshape(-1).astype(np.float64)
-        projected = np.isfinite(z_buffer)
+        reprojection = reproject_sample_depth(sample, camera_basis, position_scale)
+        z_buffer = reprojection["reprojected_depth"].reshape(-1)
+        target_depth = reprojection["target_depth"].reshape(-1)
+        projected = reprojection["projected_mask"].reshape(-1)
         total_requested += int(projected.sum())
-        target_valid = np.isfinite(target_depth) & (target_depth > 0)
-        # A source surface behind the target's first hit is occluded in the
-        # target panorama and must not be scored as a pose error.
-        valid = projected & target_valid & (z_buffer <= target_depth * 1.05)
+        valid = reprojection["visible_mask"].reshape(-1)
         if not np.any(valid):
             continue
         errors = np.abs(
@@ -541,6 +514,59 @@ def score_candidate(
         "inlier_20pct": float(np.mean(errors < math.log(1.20))),
         "pair_score_mean": float(np.mean(pair_scores)),
         "pair_score_std": float(np.std(pair_scores)),
+    }
+
+
+def reproject_sample_depth(
+    sample: dict[str, Any],
+    camera_basis: np.ndarray,
+    position_scale: float,
+) -> dict[str, np.ndarray]:
+    """Reproject one sampled source depth map into the target ERP."""
+    source_rays = sample["source_rays"]
+    source_depth = sample["source_depth"]
+    native_rays = (camera_basis @ source_rays.T).T
+    world_rays = (sample["source_rotation"] @ native_rays.T).T
+    world_points = (
+        float(position_scale) * sample["source_center"][None, :]
+        + source_depth[:, None] * world_rays
+    )
+    target_native = (
+        sample["target_rotation"].T
+        @ (
+            world_points
+            - float(position_scale) * sample["target_center"][None, :]
+        ).T
+    ).T
+    target_canonical = (camera_basis.T @ target_native.T).T
+    predicted_range = np.linalg.norm(target_canonical, axis=-1)
+    valid_direction = np.isfinite(predicted_range) & (predicted_range > 1e-6)
+    directions = target_canonical / np.maximum(predicted_range[:, None], 1e-8)
+    u, v = rays_to_erp(directions)
+    height, width = sample["target_depth"].shape
+    x = np.mod(np.floor(u * width).astype(np.int64), width)
+    y = np.clip(np.floor(v * height).astype(np.int64), 0, height - 1)
+    pixel_index = y * width + x
+    z_buffer = np.full(height * width, np.inf, dtype=np.float64)
+    np.minimum.at(z_buffer, pixel_index[valid_direction], predicted_range[valid_direction])
+    z_buffer = z_buffer.reshape(height, width)
+    target_depth = sample["target_depth"].astype(np.float64)
+    projected = np.isfinite(z_buffer)
+    target_valid = np.isfinite(target_depth) & (target_depth > 0)
+    # A source surface behind the target's first hit is occluded in the target
+    # panorama and must not be scored as a pose error.
+    visible = projected & target_valid & (z_buffer <= target_depth * 1.05)
+    error = np.full((height, width), np.nan, dtype=np.float64)
+    error[visible] = np.abs(
+        np.log(np.maximum(z_buffer[visible], 1e-6))
+        - np.log(np.maximum(target_depth[visible], 1e-6))
+    )
+    return {
+        "target_depth": target_depth,
+        "reprojected_depth": z_buffer,
+        "projected_mask": projected,
+        "visible_mask": visible,
+        "abs_log_error": error,
     }
 
 
