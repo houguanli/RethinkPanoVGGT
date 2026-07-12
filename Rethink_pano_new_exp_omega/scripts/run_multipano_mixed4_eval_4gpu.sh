@@ -7,6 +7,7 @@ LUNA="$(cd "$SCRIPT_DIR/.." && pwd)"
 PYTHON="${PYTHON:-/home/aoki/miniconda3/envs/RethinkPanoVGGT_omega/bin/python}"
 GPUS="${GPUS:-0,1,2,3}"
 CONFIG="${CONFIG:-configs/multipano_rtx5000x4_mixed4_pano_all384_luna_after_full_warmup_9h.yaml}"
+DATASET_ROOT="${DATASET_ROOT:-}"
 LUNA_OUT="${LUNA_OUT:-logs/mixed4_pano_all384_4xrtx5000_multipano_after_full_warmup_9h}"
 CHECKPOINT="${CHECKPOINT:-$LUNA_OUT/last.pt}"
 TRAIN_LOSS_CSV="${TRAIN_LOSS_CSV:-$LUNA_OUT/loss.csv}"
@@ -59,6 +60,7 @@ fi
   echo "[eval-4gpu] started $(date --iso-8601=seconds)"
   echo "[eval-4gpu] luna=$LUNA"
   echo "[eval-4gpu] config=$CONFIG"
+  echo "[eval-4gpu] dataset_root=${DATASET_ROOT:-<config>}"
   echo "[eval-4gpu] checkpoint=$EVAL_CHECKPOINT"
   echo "[eval-4gpu] train_loss_csv=$TRAIN_LOSS_CSV"
   echo "[eval-4gpu] eval_out=$EVAL_OUT"
@@ -106,8 +108,13 @@ with open(path, "w", encoding="utf-8") as handle:
     )
 PY
   (
+    dataset_root_args=()
+    if [[ -n "$DATASET_ROOT" ]]; then
+      dataset_root_args=(--dataset-root "$DATASET_ROOT")
+    fi
     CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$gpu" PYTHONUNBUFFERED=1 PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/evaluate_mixed4_depth_checkpoint.py \
       --config "$CONFIG" \
+      "${dataset_root_args[@]}" \
       --checkpoint "$EVAL_CHECKPOINT" \
       --output "$shard_json" \
       --per-sample-csv "$shard_csv" \

@@ -211,6 +211,7 @@ if [[ "${RUN_VALIDATION:-1}" == "1" ]]; then
     PYTHON="$PYTHON" \
     GPUS="$VALIDATION_GPUS" \
     CONFIG="$LUNA_CONFIG" \
+    DATASET_ROOT="$PANOVGGT_ROOT" \
     LUNA_OUT="$LUNA_OUT" \
     CHECKPOINT="$LUNA_OUT/last.pt" \
     TRAIN_LOSS_CSV="$LUNA_OUT/loss.csv" \

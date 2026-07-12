@@ -6,6 +6,7 @@ LUNA="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PYTHON="${PYTHON:-/home/aoki/miniconda3/envs/RethinkPanoVGGT_omega/bin/python}"
 CONFIG="${CONFIG:-configs/multipano_rtx5000x4_mixed4_pano_all384_luna_after_full_warmup_9h.yaml}"
+DATASET_ROOT="${DATASET_ROOT:-}"
 LUNA_OUT="${LUNA_OUT:-logs/mixed4_pano_all384_4xrtx5000_multipano_after_full_warmup_9h}"
 CHECKPOINT="${CHECKPOINT:-$LUNA_OUT/last.pt}"
 TRAIN_LOSS_CSV="${TRAIN_LOSS_CSV:-$LUNA_OUT/loss.csv}"
@@ -37,6 +38,7 @@ mkdir -p "$EVAL_OUT"
   echo "[eval-after-training] started $(date --iso-8601=seconds)"
   echo "[eval-after-training] luna=$LUNA"
   echo "[eval-after-training] config=$CONFIG"
+  echo "[eval-after-training] dataset_root=${DATASET_ROOT:-<config>}"
   echo "[eval-after-training] luna_out=$LUNA_OUT"
   echo "[eval-after-training] checkpoint=$CHECKPOINT"
   echo "[eval-after-training] train_loss_csv=$TRAIN_LOSS_CSV"
@@ -77,6 +79,7 @@ env \
   PYTHON="$PYTHON" \
   GPUS="$GPUS" \
   CONFIG="$CONFIG" \
+  DATASET_ROOT="$DATASET_ROOT" \
   LUNA_OUT="$LUNA_OUT" \
   CHECKPOINT="$CHECKPOINT" \
   TRAIN_LOSS_CSV="$TRAIN_LOSS_CSV" \

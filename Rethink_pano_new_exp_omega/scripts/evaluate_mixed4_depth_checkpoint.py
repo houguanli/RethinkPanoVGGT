@@ -70,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="Training config used to build model/datasets.")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Checkpoint to validate.")
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=None,
+        help="Override the dataset root from the training config.",
+    )
     parser.add_argument("--output", type=Path, required=True, help="Summary JSON path.")
     parser.add_argument("--per-sample-csv", type=Path, default=None, help="Optional per-sample CSV path.")
     parser.add_argument("--train-loss-csv", type=Path, default=None, help="Optional training loss.csv for comparison.")
@@ -112,6 +118,8 @@ def main() -> None:
     )
 
     train_args = parse_training_args(["--config", str(args.config)])
+    if args.dataset_root is not None:
+        train_args.dataset_root = args.dataset_root
     train_args.device = args.device
     train_args.distributed = "none"
     train_args.batch_size = args.batch_size
