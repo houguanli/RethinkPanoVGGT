@@ -12,6 +12,7 @@ MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 BASE_PORT="${BASE_PORT:-29691}"
 LUNA_PORT="${LUNA_PORT:-29692}"
 PANOVGGT_ROOT="${PANOVGGT_ROOT:-/mnt/e/PanoVGGT_minimal_datasets/datasets}"
+BASE_CHECKPOINT="${BASE_CHECKPOINT:-/home/aoki/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt}"
 
 BASE_CONFIG="mixed4_pano_weighted_officialscale_full_warmup_4090_3h_for_luna"
 BASE_OUT="$BASELINE/logs/$BASE_CONFIG"
@@ -46,6 +47,7 @@ mkdir -p "$BASE_OUT" "$LUNA_OUT"
   echo "[sequence] python=$PYTHON"
   echo "[sequence] cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
   echo "[sequence] panovggt_root=$PANOVGGT_ROOT"
+  echo "[sequence] base_checkpoint=$BASE_CHECKPOINT"
   echo "[sequence] calibration_samples_per_dataset=$CALIB_SAMPLES_PER_DATASET"
   echo "[sequence] num_yaw=$NUM_YAW"
   echo "[sequence] eval_limit_per_dataset=$EVAL_LIMIT_PER_DATASET"
@@ -66,6 +68,7 @@ if [[ "${SKIP_CALIBRATION:-0}" != "1" ]]; then
   cd "$BASELINE"
   PYTHONPATH="$BASELINE${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/calibrate_mixed4_depth_scale.py \
     --root "$PANOVGGT_ROOT" \
+    --checkpoint "$BASE_CHECKPOINT" \
     --output "$CALIB_JSON" \
     --samples-per-dataset "$CALIB_SAMPLES_PER_DATASET" \
     --max-pixels-per-sample "$CALIB_MAX_PIXELS_PER_SAMPLE" \
@@ -105,6 +108,7 @@ cd "$BASELINE"
 echo "[sequence] stage1 baseline full warmup weighted official-scale low384 started $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 LOCAL_RANK=0 RANK=0 WORLD_SIZE=1 MASTER_ADDR="$MASTER_ADDR" MASTER_PORT="$BASE_PORT" CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
   PYTHONPATH="$BASELINE${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" training/launch.py --config "$BASE_CONFIG" \
+    model.checkpoint_path="$BASE_CHECKPOINT" \
     loss.depth.pred_depth_scale="$PRED_DEPTH_SCALE" \
     loss.depth.mode=log_huber \
     ++loss.depth.depth_scale_alignment=sample_lstsq \
