@@ -47,6 +47,26 @@ _MATTERPORT3D_DEPTH_SCALE = 4000.0
 _STANFORD2D3DS_DEPTH_SCALE = 512.0
 _STRUCTURED3D_DEPTH_SCALE = 1000.0
 
+# PanoVGGT trains camera poses in OpenCV coordinates: X-right, Y-down,
+# Z-forward. The minimal bundle stores each source dataset in its native world
+# and camera frames, so normalize both before constructing relative targets.
+_Y_FORWARD_Z_UP_WORLD_TO_OPENCV = np.asarray(
+    [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+    dtype=np.float64,
+)
+_CAMERA_CANONICAL_TO_NATIVE = {
+    "panocity": np.eye(3, dtype=np.float64),
+    "matterport3d": np.diag([1.0, -1.0, -1.0]),
+    "stanford2d3ds": np.eye(3, dtype=np.float64),
+    "structured3d": _Y_FORWARD_Z_UP_WORLD_TO_OPENCV.T,
+}
+_WORLD_NATIVE_TO_CANONICAL = {
+    "panocity": np.eye(3, dtype=np.float64),
+    "matterport3d": _Y_FORWARD_Z_UP_WORLD_TO_OPENCV,
+    "stanford2d3ds": _Y_FORWARD_Z_UP_WORLD_TO_OPENCV,
+    "structured3d": _Y_FORWARD_Z_UP_WORLD_TO_OPENCV,
+}
+
 
 class MixedPanoDataset(Dataset):
     """Concatenate multiple pano datasets while preserving the training batch schema."""
@@ -97,6 +117,7 @@ class PanoMinimalDataset(Dataset):
         dataset_sampling_weights: Optional[str | Dict[str, float]] = None,
         output_depth_scale: float = 1000.0,
         invalid_depth_value: Optional[float] = 65535.0,
+        canonicalize_camera: bool = True,
         strict: bool = True,
     ) -> None:
         if panos_per_sample is not None:
@@ -125,6 +146,7 @@ class PanoMinimalDataset(Dataset):
         self.dataset_sampling_weights = _parse_dataset_sampling_weights(dataset_sampling_weights)
         self.output_depth_scale = float(output_depth_scale)
         self.invalid_depth_value = None if invalid_depth_value is None else float(invalid_depth_value)
+        self.canonicalize_camera = bool(canonicalize_camera)
         self.items = self._build_index(max_samples=max_samples)
         self.sample_indices, self.dataset_sampling_summary = _build_balanced_sample_indices(
             self.items,
@@ -257,6 +279,8 @@ class PanoMinimalDataset(Dataset):
             items.extend(_index_structured3d(self.root / "Structured3D", self.split, _STRUCTURED3D_DEPTH_SCALE))
         if "panocity" in self.dataset_names:
             items.extend(_index_panocity_official(self.root / "Panocity", self.split, _PANOCITY_DEPTH_SCALE))
+        if self.canonicalize_camera:
+            items = [_canonicalize_camera_item(item) for item in items]
         if self.bad_samples:
             before = len(items)
             items = [
@@ -663,6 +687,26 @@ def _item(
         "pano_rotation_valid": bool(rotation_valid and rotation_c2w is not None),
         "output_depth_scale": scale,
     }
+
+
+def _canonicalize_camera_item(item: Dict) -> Dict:
+    """Convert a native dataset pose to PanoVGGT's OpenCV camera frame."""
+    dataset = _dataset_key(item.get("dataset") or item.get("sequence_name"))
+    world_basis = _WORLD_NATIVE_TO_CANONICAL.get(dataset)
+    camera_basis = _CAMERA_CANONICAL_TO_NATIVE.get(dataset)
+    if world_basis is None or camera_basis is None:
+        return item
+
+    canonical = dict(item)
+    center_native = np.asarray(item.get("pano_position_m", [0.0, 0.0, 0.0]), dtype=np.float64)
+    rotation_native = np.asarray(item.get("pano_rotation_c2w", _identity_rotation()), dtype=np.float64)
+    if center_native.shape == (3,) and np.isfinite(center_native).all():
+        canonical["pano_position_m"] = (world_basis @ center_native).astype(np.float32).tolist()
+    if rotation_native.shape == (3, 3) and np.isfinite(rotation_native).all():
+        rotation_canonical = world_basis @ rotation_native @ camera_basis
+        canonical["pano_rotation_c2w"] = _orthonormalize_rotation(rotation_canonical.tolist())
+    canonical["camera_coordinate_system"] = "opencv_x_right_y_down_z_forward"
+    return canonical
 
 
 def _resolve_cached_path(root: Path, value: object) -> Optional[Path]:
