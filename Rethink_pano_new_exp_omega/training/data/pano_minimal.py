@@ -58,6 +58,7 @@ _MP3D_WORLD_TO_OPENCV = np.asarray(
     dtype=np.float32,
 )
 _S3D_WORLD_TO_OPENCV = _MP3D_WORLD_TO_OPENCV
+_STANFORD_WORLD_TO_OPENCV = _MP3D_WORLD_TO_OPENCV
 
 
 class MixedPanoDataset(Dataset):
@@ -173,6 +174,7 @@ class PanoMinimalDataset(Dataset):
             "depth_path": [sample["depth_path"] for sample in samples],
             "pano_position_m": torch.stack([sample["pano_position_m"] for sample in samples], dim=0),
             "pano_position_valid": torch.stack([sample["pano_position_valid"] for sample in samples], dim=0),
+            "pano_translation_valid": torch.stack([sample["pano_translation_valid"] for sample in samples], dim=0),
             "pano_rotation_c2w": torch.stack([sample["pano_rotation_c2w"] for sample in samples], dim=0),
             "pano_rotation_valid": torch.stack([sample["pano_rotation_valid"] for sample in samples], dim=0),
             "sample_weight": torch.stack([sample["sample_weight"] for sample in samples], dim=0),
@@ -272,6 +274,10 @@ class PanoMinimalDataset(Dataset):
             "depth_path": str(item["depth_path"]),
             "pano_position_m": torch.tensor(item["pano_position_m"], dtype=torch.float32),
             "pano_position_valid": torch.tensor(bool(item.get("pano_position_valid", True)), dtype=torch.bool),
+            "pano_translation_valid": torch.tensor(
+                bool(item.get("pano_translation_valid", item.get("pano_position_valid", True))),
+                dtype=torch.bool,
+            ),
             "pano_rotation_c2w": torch.tensor(item.get("pano_rotation_c2w", _identity_rotation()), dtype=torch.float32),
             "pano_rotation_valid": torch.tensor(bool(item.get("pano_rotation_valid", False)), dtype=torch.bool),
             "sample_weight": torch.tensor(1.0, dtype=torch.float32),
@@ -544,10 +550,15 @@ def _build_balanced_sample_indices(
 def _index_matterport3d(root: Path, split: str, scale: float) -> List[Dict]:
     index_path = root / "cache" / f"matterport3d_{split}_index.json"
     rows = _read_json_list(index_path)
+    room_lookup = _load_matterport_room_lookup(root)
     items: List[Dict] = []
     for row in rows:
         scan, room_id, _room_name, pano_ids, _size = row
         for pano_id in pano_ids:
+            actual_room_id = str(room_id)
+            room_record = room_lookup.get((str(scan), str(pano_id)))
+            if room_record is not None:
+                actual_room_id = room_record[0]
             rgb_path = root / str(scan) / "pano_skybox_color" / f"{pano_id}.jpg"
             depth_path = root / str(scan) / "pano_depth" / f"{pano_id}.png"
             pose_path = root / str(scan) / "pano_poses" / f"{pano_id}.txt"
@@ -555,7 +566,7 @@ def _index_matterport3d(root: Path, split: str, scale: float) -> List[Dict]:
             items.append(
                 _item(
                     "Matterport3D",
-                    f"{scan}_{room_id}_{pano_id}",
+                    f"{scan}_{actual_room_id}_{pano_id}",
                     rgb_path,
                     depth_path,
                     position,
@@ -563,10 +574,39 @@ def _index_matterport3d(root: Path, split: str, scale: float) -> List[Dict]:
                     position_valid=position_valid,
                     rotation_c2w=rotation,
                     rotation_valid=rotation_valid,
-                    scene_group_key=_join_scene_key("Matterport3D", scan, room_id),
+                    scene_group_key=_join_scene_key("Matterport3D", scan, actual_room_id),
                 )
             )
     return items
+
+
+def _load_matterport_room_lookup(root: Path) -> Dict[Tuple[str, str], Tuple[str, str]]:
+    """Map Matterport panorama ids to official room ids.
+
+    The mixed4 cache intentionally stores Matterport rows as ``room_id=all`` so
+    every scan can be indexed quickly. Multi-pano training must not group across
+    Matterport rooms, so recover the official room membership from parsed_json.
+    """
+    parsed_dir = root / "parsed_json"
+    lookup: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    if not parsed_dir.is_dir():
+        return lookup
+    for json_path in sorted(parsed_dir.glob("*.json")):
+        scan = json_path.stem
+        try:
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            print(f"[WARN] skipping malformed Matterport room metadata {json_path}: {exc}")
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for room_id, room in payload.items():
+            if not isinstance(room, dict):
+                continue
+            room_name = str(room.get("room_name", ""))
+            for pano_id in room.get("panoramas", []) or []:
+                lookup[(scan, str(pano_id))] = (str(room_id), room_name)
+    return lookup
 
 
 def _index_stanford2d3ds(root: Path, split: str, scale: float) -> List[Dict]:
@@ -629,6 +669,11 @@ def _index_structured3d(root: Path, split: str, scale: float) -> List[Dict]:
                     position,
                     scale,
                     position_valid=position_valid,
+                    # Structured3D provides one panorama per room and has no
+                    # reliable cross-room image overlap. Keep metric positions
+                    # for geometry audits, but exclude them from camera
+                    # translation optimization/evaluation.
+                    translation_valid=False,
                     rotation_c2w=_identity_rotation(),
                     rotation_valid=False,
                     scene_group_key=_join_scene_key("Structured3D", scene),
@@ -739,10 +784,17 @@ def _item(
     position: List[float],
     scale: float,
     position_valid: bool = True,
+    translation_valid: Optional[bool] = None,
     rotation_c2w: Optional[List[List[float]]] = None,
     rotation_valid: bool = False,
     scene_group_key: Optional[str] = None,
 ) -> Dict:
+    raw_rotation = rotation_c2w if rotation_c2w is not None else _identity_rotation()
+    erp_rotation, erp_rotation_valid = _canonical_erp_rotation(
+        sequence_name,
+        raw_rotation,
+        bool(rotation_valid and rotation_c2w is not None),
+    )
     return {
         "dataset": sequence_name,
         "sequence_name": sequence_name,
@@ -752,10 +804,30 @@ def _item(
         "depth_path": depth_path,
         "pano_position_m": position,
         "pano_position_valid": bool(position_valid),
-        "pano_rotation_c2w": rotation_c2w if rotation_c2w is not None else _identity_rotation(),
-        "pano_rotation_valid": bool(rotation_valid and rotation_c2w is not None),
+        "pano_translation_valid": bool(position_valid if translation_valid is None else translation_valid),
+        "pano_rotation_c2w": erp_rotation,
+        "pano_rotation_valid": erp_rotation_valid,
+        "pano_rotation_raw_c2w": raw_rotation,
+        "pano_rotation_raw_valid": bool(rotation_valid and rotation_c2w is not None),
         "output_depth_scale": scale,
     }
+
+
+def _canonical_erp_rotation(
+    sequence_name: str,
+    rotation_c2w: List[List[float]],
+    rotation_valid: bool,
+) -> Tuple[List[List[float]], bool]:
+    """Return the camera rotation used for pano-level supervision.
+
+    Dataset-specific loaders have already converted native poses into the
+    common OpenCV/ERP camera basis. Keep that relative heading as the pano-level
+    target; forcing identity would erase valid Matterport/Stanford panorama yaw
+    differences and make Omega's pretrained camera estimates look wrong.
+    """
+    if not rotation_valid:
+        return _identity_rotation(), False
+    return _orthonormalize_rotation(rotation_c2w), True
 
 
 def _resolve_cached_path(root: Path, value: object) -> Optional[Path]:
@@ -970,24 +1042,37 @@ def _read_stanford_pose(path: Optional[Path]) -> Tuple[List[float], bool, List[L
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return [0.0, 0.0, 0.0], False, _identity_rotation(), False
+    rt_matrix = data.get("camera_rt_matrix")
+    try:
+        rt = np.asarray(rt_matrix, dtype=np.float32)
+        if rt.shape[0] >= 3 and rt.shape[1] >= 4:
+            # Stanford stores camera_rt_matrix as native world-to-camera.
+            # Convert world axes to the same OpenCV ERP frame used by the other
+            # datasets, then invert to c2w so position and rotation are coherent.
+            w2c_native = np.eye(4, dtype=np.float32)
+            w2c_native[:3, :4] = rt[:3, :4]
+            w2c_opencv = w2c_native @ np.linalg.inv(_STANFORD_WORLD_TO_OPENCV)
+            c2w_opencv = np.linalg.inv(w2c_opencv)
+            rotation = _orthonormalize_rotation(c2w_opencv[:3, :3].tolist())
+            return (
+                [float(value) for value in c2w_opencv[:3, 3]],
+                True,
+                rotation,
+                True,
+            )
+    except (TypeError, ValueError, IndexError):
+        pass
+
     position = [0.0, 0.0, 0.0]
     position_valid = False
     for key in ("camera_location", "position", "translation"):
         value = data.get(key)
         if isinstance(value, list) and len(value) >= 3:
-            position = [float(value[0]), float(value[1]), float(value[2])]
+            native_position = np.asarray([float(value[0]), float(value[1]), float(value[2])], dtype=np.float32)
+            position = [float(v) for v in (_STANFORD_WORLD_TO_OPENCV[:3, :3] @ native_position[:, None])[:, 0]]
             position_valid = True
             break
-    rt_matrix = data.get("camera_rt_matrix")
     rotation = None
-    try:
-        rt = np.asarray(rt_matrix, dtype=np.float32)
-        if rt.shape[0] >= 3 and rt.shape[1] >= 3:
-            # Stanford stores camera_rt_matrix as world-to-camera. Convert it to
-            # camera-to-world so all pano rotations share the same convention.
-            rotation = _orthonormalize_rotation(rt[:3, :3].T.tolist())
-    except (TypeError, ValueError, IndexError):
-        rotation = None
     return position, position_valid, rotation or _identity_rotation(), rotation is not None
 
 

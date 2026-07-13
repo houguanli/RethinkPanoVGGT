@@ -126,6 +126,8 @@ cd "$LUNA"
 echo "[sequence] stage2/3 multi-pano LUNA weighted official-scale low384 started $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 LOCAL_RANK=0 RANK=0 WORLD_SIZE=1 MASTER_ADDR="$MASTER_ADDR" MASTER_PORT="$LUNA_PORT" CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
   PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" training/train_pano_omega.py --config "$LUNA_CONFIG" \
+    --base-checkpoint "$BASE_CHECKPOINT" \
+    --checkpoint "$BASE_CKPT" \
     --pred-depth-scale "$PRED_DEPTH_SCALE" \
     --depth-loss-mode log_huber \
     --depth-scale-alignment sample_lstsq \

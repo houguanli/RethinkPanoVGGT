@@ -67,7 +67,7 @@ def test_minimal_multipano_groups_stay_inside_scene():
             scene_keys = {_scene_key(dataset, item_index) for item_index in group}
             assert len(scene_keys) == 1
         sample = dataset[0]
-        assert all(name.startswith("scan_a_all_") for name in sample["scene_name"].split("|"))
+        assert all(name.startswith("scan_a_room0_") for name in sample["scene_name"].split("|"))
 
 
 def test_minimal_multipano_fallback_stays_inside_scene():
@@ -85,7 +85,29 @@ def test_minimal_multipano_fallback_stays_inside_scene():
             grouping="nearest",
         )
         sample = dataset[0]
-        assert all(name.startswith("scan_a_all_") for name in sample["scene_name"].split("|"))
+        assert all(name.startswith("scan_a_room0_") for name in sample["scene_name"].split("|"))
+
+
+def test_minimal_matterport_groups_use_official_room_membership():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "minimal"
+        _write_matterport_minimal_bundle(root)
+        dataset = PanoMinimalDataset(
+            root=root,
+            datasets="matterport3d",
+            pano_size=(16, 32),
+            pano_sample_mode="fixed_neighborhood",
+            pano_min_count=2,
+            pano_max_count=2,
+            grouping="nearest",
+        )
+        keys = {str(item["scene_group_key"]) for item in dataset.items}
+        assert keys == {
+            "Matterport3D:scan_a:room0",
+            "Matterport3D:scan_b:room0",
+        }
+        for group in dataset.groups:
+            assert len({_scene_key(dataset, item_index) for item_index in group}) == 1
 
 
 def test_minimal_matterport_pose_is_converted_to_opencv():
@@ -114,6 +136,41 @@ def test_minimal_structured3d_position_is_converted_to_opencv():
         np.testing.assert_allclose(position, [1.0, -3.0, 2.0], atol=1e-6)
 
 
+def test_structured3d_keeps_positions_but_disables_translation_supervision():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "minimal"
+        dataset_root = root / "Structured3D"
+        cache_dir = dataset_root / "cache"
+        cache_dir.mkdir(parents=True)
+        rows = [["scene_00000", ["00", "01"], [32, 64]]]
+        (cache_dir / "structured3d_train_index.json").write_text(json.dumps(rows), encoding="utf-8")
+        for pano_index, pano_id in enumerate(("00", "01")):
+            pano_dir = dataset_root / "scene_00000" / "2D_rendering" / pano_id / "panorama"
+            (pano_dir / "full").mkdir(parents=True)
+            Image.new("RGB", (64, 32), (80 + pano_index * 30, 100, 160)).save(
+                pano_dir / "full" / "rgb_rawlight.png"
+            )
+            Image.fromarray(np.full((32, 64), 4000, dtype=np.uint16)).save(
+                pano_dir / "full" / "depth.png"
+            )
+            (pano_dir / "camera_xyz.txt").write_text(
+                f"{pano_index * 1000} 0 0\n",
+                encoding="utf-8",
+            )
+        dataset = PanoMinimalDataset(
+            root=root,
+            datasets="structured3d",
+            pano_size=(16, 32),
+            pano_sample_mode="fixed_neighborhood",
+            pano_min_count=2,
+            pano_max_count=2,
+            grouping="nearest",
+        )
+        sample = dataset[0]
+        assert sample["pano_position_valid"].all()
+        assert not sample["pano_translation_valid"].any()
+
+
 def _scene_key(dataset: PanoMinimalDataset, item_index: int) -> str:
     return str(dataset.items[item_index].get("scene_group_key"))
 
@@ -126,7 +183,20 @@ def _write_matterport_minimal_bundle(root: Path) -> None:
         ["scan_b", "all", "all", ["pano_0", "pano_1"], [32, 64]],
     ]
     (cache_dir / "matterport3d_train_index.json").write_text(json.dumps(rows), encoding="utf-8")
+    parsed_dir = root / "Matterport3D" / "parsed_json"
+    parsed_dir.mkdir(parents=True)
     for scan_index, scan in enumerate(("scan_a", "scan_b")):
+        (parsed_dir / f"{scan}.json").write_text(
+            json.dumps(
+                {
+                    "room0": {
+                        "room_name": "test room",
+                        "panoramas": ["pano_0", "pano_1"],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
         for subdir in ("pano_skybox_color", "pano_depth", "pano_poses"):
             (root / "Matterport3D" / scan / subdir).mkdir(parents=True, exist_ok=True)
         for pano_index, pano_id in enumerate(("pano_0", "pano_1")):
@@ -146,6 +216,8 @@ if __name__ == "__main__":
     test_variable_neighborhood_sampling_returns_anchor_first_sequence()
     test_minimal_multipano_groups_stay_inside_scene()
     test_minimal_multipano_fallback_stays_inside_scene()
+    test_minimal_matterport_groups_use_official_room_membership()
     test_minimal_matterport_pose_is_converted_to_opencv()
     test_minimal_structured3d_position_is_converted_to_opencv()
+    test_structured3d_keeps_positions_but_disables_translation_supervision()
     print("pano dataset sampling (omega) ok")

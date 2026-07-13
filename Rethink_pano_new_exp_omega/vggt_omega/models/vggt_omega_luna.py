@@ -16,11 +16,13 @@ Regular omega input still works: pass ``images`` ([B, S, 3, H, W]) and leave
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 from vggt_omega.checkpoint import DEFAULT_CHECKPOINT_PATH
 from vggt_omega.data.pano_sampler import PanoWindowSampler
 from vggt_omega.models.heads import PanoCameraHead
 from vggt_omega.models.vggt_omega import VGGTOmega
+from vggt_omega.utils.rotation import mat_to_quat, quat_to_mat
 
 
 class VGGTOmega_LUNA(VGGTOmega):
@@ -116,6 +118,12 @@ class VGGTOmega_LUNA(VGGTOmega):
 
         num_panos = int(pano_images.shape[1]) if pano_images.ndim == 5 else 1
         sampler_output = self.sample_pano_windows(pano_images, yaw=yaw, pitch=pitch, fov=fov)
+        requested_return_window_pose = bool(kwargs.get("return_window_pose", True))
+        if self.pano_camera_head is not None:
+            # The pano-level head predicts only a residual. Use Omega's
+            # pretrained window camera head as the initial pano pose.
+            kwargs = dict(kwargs)
+            kwargs["return_window_pose"] = True
         predictions = super().forward(
             sampler_output.windows,
             pano_view_params=sampler_output.camera_meta["view_params"],
@@ -125,12 +133,33 @@ class VGGTOmega_LUNA(VGGTOmega):
         )
         if self.pano_camera_head is not None:
             camera_tokens = predictions["camera_and_register_tokens"][:, :, 0]
-            pano_camera = self.pano_camera_head(
+            pano_camera_residual = self.pano_camera_head(
                 camera_tokens,
                 sampler_output.camera_meta["camera_encoding"],
                 num_panos=num_panos,
             )
-            predictions.update(pano_camera)
+            base_center, base_quat = _omega_window_pose_to_relative_pano_pose(
+                predictions["pose_enc"],
+                sampler_output.camera_meta["rotations"],
+                num_panos=num_panos,
+            )
+            # Treat the pretrained Omega window-pose estimate as the fixed
+            # initializer; camera supervision should train the pano residual,
+            # not distort the base camera path through the shared tokens.
+            base_center = base_center.detach()
+            base_quat = base_quat.detach()
+            predictions["pano_camera_center_init"] = base_center
+            predictions["pano_rotation_quat_w2c_init"] = base_quat
+            center_residual = pano_camera_residual["pano_camera_center_residual"]
+            rotation_residual = pano_camera_residual["pano_rotation_quat_w2c_residual"]
+            predictions["pano_camera_center_residual"] = center_residual
+            predictions["pano_rotation_quat_w2c_residual"] = rotation_residual
+            predictions["pano_camera_center"] = base_center + center_residual
+            predictions["pano_rotation_quat_w2c"] = F.normalize(
+                _quaternion_multiply(rotation_residual, base_quat),
+                dim=-1,
+                eps=1e-6,
+            )
             predictions["pano_pose_enc"] = torch.cat(
                 [
                     predictions["pano_camera_center"],
@@ -138,6 +167,8 @@ class VGGTOmega_LUNA(VGGTOmega):
                 ],
                 dim=-1,
             )
+            if not requested_return_window_pose:
+                predictions.pop("pose_enc", None)
         if return_sampler_output:
             predictions["pano_windows"] = sampler_output.windows
             predictions["pano_camera_meta"] = sampler_output.camera_meta
@@ -204,3 +235,118 @@ def _merge_multi_pano_meta(meta, batch_size: int, num_panos: int, views_per_pano
         else:
             merged[key] = value
     return merged
+
+
+def _omega_window_pose_to_relative_pano_pose(
+    pose_enc: torch.Tensor,
+    window_rotations_c2w: torch.Tensor,
+    num_panos: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Aggregate Omega window poses into pano-relative pose initialization.
+
+    ``pose_enc`` stores window camera-from-world extrinsics. Each sampled
+    window also has a known ERP crop rotation. Removing that known crop rotation
+    gives a pano-level pose. The result is expressed relative to pano 0, which
+    is the gauge used by the pano-relative camera loss.
+    """
+    if pose_enc.ndim != 3 or pose_enc.shape[-1] < 7:
+        raise ValueError(f"Expected pose_enc [B, N*V, >=7], got {tuple(pose_enc.shape)}")
+    if window_rotations_c2w.ndim != 4 or window_rotations_c2w.shape[-2:] != (3, 3):
+        raise ValueError(
+            "Expected window_rotations_c2w [B, N*V, 3, 3], "
+            f"got {tuple(window_rotations_c2w.shape)}"
+        )
+    if int(num_panos) < 1 or pose_enc.shape[1] % int(num_panos) != 0:
+        raise ValueError(f"Cannot group {pose_enc.shape[1]} window poses into {num_panos} panos.")
+
+    batch_size, total_windows, _ = pose_enc.shape
+    views_per_pano = total_windows // int(num_panos)
+    raw_pose = pose_enc.float()
+    raw_window_quat = raw_pose[..., 3:7]
+    window_pose_valid = (
+        torch.isfinite(raw_pose[..., :7]).all(dim=-1)
+        & (torch.linalg.vector_norm(raw_window_quat, dim=-1) > 1e-6)
+    )
+    pose = torch.nan_to_num(raw_pose, nan=0.0, posinf=0.0, neginf=0.0)
+    crop_c2w = window_rotations_c2w.to(device=pose.device, dtype=pose.dtype)
+
+    fallback_window_quat_w2c = mat_to_quat(crop_c2w.transpose(-1, -2).contiguous())
+    window_quat_w2c = torch.where(
+        window_pose_valid[..., None],
+        F.normalize(pose[..., 3:7], dim=-1, eps=1e-6),
+        fallback_window_quat_w2c,
+    )
+    window_w2c = quat_to_mat(window_quat_w2c)
+    window_c2w = window_w2c.transpose(-1, -2).contiguous()
+    window_translation = pose[..., :3]
+    window_centers = -(window_c2w @ window_translation[..., None])[..., 0]
+    window_centers = torch.where(window_pose_valid[..., None], window_centers, torch.zeros_like(window_centers))
+
+    pano_c2w_by_window = window_c2w @ crop_c2w.transpose(-1, -2)
+    grouped_valid = window_pose_valid.reshape(batch_size, int(num_panos), views_per_pano)
+    grouped_centers = window_centers.reshape(batch_size, int(num_panos), views_per_pano, 3)
+    valid_count = grouped_valid.sum(dim=2, keepdim=True).clamp_min(1)
+    pano_centers = (
+        torch.where(grouped_valid[..., None], grouped_centers, torch.zeros_like(grouped_centers)).sum(dim=2)
+        / valid_count.to(dtype=grouped_centers.dtype)
+    )
+    pano_c2w_by_window = pano_c2w_by_window.reshape(
+        batch_size,
+        int(num_panos),
+        views_per_pano,
+        3,
+        3,
+    )
+    pano_quat_c2w_by_window = mat_to_quat(pano_c2w_by_window.reshape(-1, 3, 3)).reshape(
+        batch_size,
+        int(num_panos),
+        views_per_pano,
+        4,
+    )
+    pano_quat_c2w = _average_quaternions(pano_quat_c2w_by_window, dim=2, valid=grouped_valid)
+    pano_c2w = quat_to_mat(pano_quat_c2w)
+
+    anchor_w2c = pano_c2w[:, :1].transpose(-1, -2).contiguous()
+    relative_centers = (anchor_w2c @ (pano_centers - pano_centers[:, :1])[..., None])[..., 0]
+    relative_c2w = anchor_w2c @ pano_c2w
+    relative_w2c = relative_c2w.transpose(-1, -2).contiguous()
+    relative_quat_w2c = F.normalize(mat_to_quat(relative_w2c), dim=-1, eps=1e-6)
+    return relative_centers, relative_quat_w2c
+
+
+def _average_quaternions(
+    quaternions: torch.Tensor,
+    dim: int,
+    valid: torch.Tensor | None = None,
+) -> torch.Tensor:
+    quaternions = F.normalize(quaternions, dim=-1, eps=1e-6)
+    reference = quaternions.select(dim, 0).unsqueeze(dim)
+    sign = torch.where(
+        (quaternions * reference).sum(dim=-1, keepdim=True) < 0,
+        -torch.ones((), device=quaternions.device, dtype=quaternions.dtype),
+        torch.ones((), device=quaternions.device, dtype=quaternions.dtype),
+    )
+    signed = quaternions * sign
+    if valid is None:
+        return F.normalize(signed.mean(dim=dim), dim=-1, eps=1e-6)
+    weights = valid.to(device=quaternions.device, dtype=quaternions.dtype)[..., None]
+    summed = (signed * weights).sum(dim=dim)
+    count = weights.sum(dim=dim)
+    averaged = F.normalize(summed / count.clamp_min(1.0), dim=-1, eps=1e-6)
+    identity = torch.zeros_like(averaged)
+    identity[..., 3] = 1.0
+    return torch.where(count > 0, averaged, identity)
+
+
+def _quaternion_multiply(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    lx, ly, lz, lw = left.unbind(dim=-1)
+    rx, ry, rz, rw = right.unbind(dim=-1)
+    return torch.stack(
+        [
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+            lw * rw - lx * rx - ly * ry - lz * rz,
+        ],
+        dim=-1,
+    )

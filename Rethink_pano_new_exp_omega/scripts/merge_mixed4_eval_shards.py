@@ -39,9 +39,12 @@ NUMERIC_FIELDS = {
     "loss",
     "loss_depth",
     "loss_overlap",
+    "loss_global_point",
+    "global_point_valid_ratio",
     "loss_camera",
     "loss_camera_t",
     "loss_camera_r",
+    "camera_translation_deg",
     "camera_rotation_deg",
     "camera_translation_valid_count",
     "camera_rotation_valid_count",
@@ -96,9 +99,19 @@ def main() -> None:
                 "summary": summarize_values([float(row["loss"]) for row in run_rows]),
                 "depth_summary": summarize_values([float(row["loss_depth"]) for row in run_rows]),
                 "overlap_summary": summarize_values([float(row["loss_overlap"]) for row in run_rows]),
+                "global_point_summary": summarize_values(
+                    optional_numeric_values(run_rows, "loss_global_point")
+                ),
                 "camera_summary": summarize_values(optional_numeric_values(run_rows, "loss_camera")),
                 "camera_translation_summary": summarize_values(
                     optional_numeric_values(run_rows, "loss_camera_t")
+                ),
+                "camera_translation_deg_summary": summarize_values(
+                    optional_numeric_values(
+                        run_rows,
+                        "camera_translation_deg",
+                        valid_count_key="camera_translation_valid_count",
+                    )
                 ),
                 "camera_rotation_rad_summary": summarize_values(
                     optional_numeric_values(run_rows, "loss_camera_r")

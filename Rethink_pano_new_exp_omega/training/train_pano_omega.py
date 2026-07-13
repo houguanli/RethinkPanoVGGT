@@ -37,7 +37,11 @@ from vggt_omega.models.heads.dense_head import DenseHead  # noqa: E402
 from vggt_omega.models.layers import PatchEmbed  # noqa: E402
 from vggt_omega.models.layers.pano_position import pinhole_rays  # noqa: E402
 from vggt_omega.models.vggt_omega_luna import VGGTOmega_LUNA  # noqa: E402
-from vggt_omega.utils.rotation import mat_to_quat  # noqa: E402
+from vggt_omega.utils.pano_pose import (  # noqa: E402
+    omega_y_up_pose_to_official_y_down,
+    omega_y_up_vectors_to_official_y_down,
+)
+from vggt_omega.utils.rotation import mat_to_quat, quat_to_mat  # noqa: E402
 
 
 DEFAULT_DATASET_ROOT = Path("whitehole/AOKI/datasets/PANO_LUNA_omega")
@@ -45,6 +49,7 @@ DEFAULT_CHECKPOINT = PROJECT_ROOT / "ckpt" / "vggt_omega_1b_512.pt"
 CONFIG_PATH_KEYS = {
     "dataset_root",
     "checkpoint",
+    "base_checkpoint",
     "output_dir",
     "log_csv",
     "loss_plot",
@@ -71,6 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional mixed dataset sampling weights, e.g. panocity:0.5,matterport3d:0.3,structured3d:0.15,stanford2d3ds:0.05.",
     )
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    parser.add_argument(
+        "--base-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional original Omega checkpoint loaded before a warmup/fine-tune checkpoint.",
+    )
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "pano_omega_luna")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--distributed", choices=["auto", "none", "ddp"], default="auto")
@@ -224,6 +235,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-translation-weight", type=float, default=1.0)
     parser.add_argument("--camera-rotation-weight", type=float, default=1.0)
     parser.add_argument("--camera-fov-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--global-point-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight for sparse shared-frame point supervision built from predicted depth and pano pose.",
+    )
+    parser.add_argument(
+        "--global-point-stride",
+        type=int,
+        default=16,
+        help="Spatial stride for shared-frame point supervision; larger values reduce memory use.",
+    )
     parser.add_argument(
         "--camera-translation-normalization",
         choices=["none", "target_rms", "target_mean_norm", "target_max_norm"],
@@ -529,6 +552,10 @@ def train(args: argparse.Namespace) -> None:
         checkpoint_payload = load_checkpoint_payload(args.checkpoint) if args.checkpoint is not None else {}
         if args.inherit_checkpoint_training_defaults:
             apply_checkpoint_training_defaults(args, checkpoint_payload)
+        if args.base_checkpoint is not None and (
+            args.checkpoint is None or args.base_checkpoint.resolve() != args.checkpoint.resolve()
+        ):
+            load_checkpoint(model, args.base_checkpoint, strict=False)
         if args.checkpoint is not None:
             load_checkpoint(model, args.checkpoint, strict=args.strict_checkpoint)
 
@@ -614,6 +641,21 @@ def train(args: argparse.Namespace) -> None:
             f"translation_norm={args.camera_translation_normalization}",
             dist_state,
         )
+        if args.camera_supervision_mode == "pano_relative":
+            rank0_print(
+                "[INFO] camera_prediction_basis = omega_y_up_to_official_y_down",
+                dist_state,
+            )
+            rank0_print(
+                "[INFO] camera_pair_graph = all_ordered_pairs_after_joint_forward "
+                "(N input panos -> N*(N-1) directed camera edges)",
+                dist_state,
+            )
+            rank0_print(
+                f"[INFO] shared_frame_points = weight:{args.global_point_loss_weight} "
+                f"stride:{args.global_point_stride}",
+                dist_state,
+            )
         rank0_print(f"[INFO] pred_depth_scale = {args.pred_depth_scale}", dist_state)
         rank0_print(f"[INFO] learn_pred_depth_scale = {args.learn_pred_depth_scale}", dist_state)
         rank0_print(
@@ -764,6 +806,12 @@ def train(args: argparse.Namespace) -> None:
                     "loss_overlap_weighted": float(
                         loss_dict.get("loss_overlap_weighted", torch.tensor(0.0)).item()
                     ),
+                    "loss_global_point": float(
+                        loss_dict.get("loss_global_point", torch.tensor(0.0)).item()
+                    ),
+                    "loss_global_point_weighted": float(
+                        loss_dict.get("loss_global_point_weighted", torch.tensor(0.0)).item()
+                    ),
                     "loss_camera": float(loss_dict["loss_camera"].item()),
                     "loss_camera_weighted": float(
                         loss_dict.get("loss_camera_weighted", torch.tensor(0.0)).item()
@@ -777,11 +825,23 @@ def train(args: argparse.Namespace) -> None:
                     "camera_rotation_deg": float(
                         loss_dict.get("camera_rotation_deg", torch.tensor(0.0)).item()
                     ),
+                    "camera_translation_deg": float(
+                        loss_dict.get("camera_translation_deg", torch.tensor(0.0)).item()
+                    ),
                     "camera_translation_valid_count": float(
                         loss_dict.get("camera_translation_valid_count", torch.tensor(0.0)).item()
                     ),
                     "camera_rotation_valid_count": float(
                         loss_dict.get("camera_rotation_valid_count", torch.tensor(0.0)).item()
+                    ),
+                    "global_point_valid_ratio": float(
+                        loss_dict.get("global_point_valid_ratio", torch.tensor(0.0)).item()
+                    ),
+                    "global_point_finite_ratio": float(
+                        loss_dict.get("global_point_finite_ratio", torch.tensor(0.0)).item()
+                    ),
+                    "global_point_geometry_finite_ratio": float(
+                        loss_dict.get("global_point_geometry_finite_ratio", torch.tensor(0.0)).item()
                     ),
                     "pano_count": float(loss_dict.get("pano_count", torch.tensor(1.0)).item()),
                     "depth_valid_ratio": float(loss_dict.get("depth_valid_ratio", torch.tensor(0.0)).item()),
@@ -822,8 +882,10 @@ def train(args: argparse.Namespace) -> None:
                         f"[TRAIN] epoch={epoch + 1} step={global_step} "
                         f"stage={active_stage_name} elapsed={elapsed_seconds / 60.0:.2f}m "
                         f"loss={metrics['loss']:.6f} depth={metrics['loss_depth']:.6f} "
-                        f"overlap={metrics['loss_overlap']:.6f} camera={metrics['loss_camera']:.6f} "
+                        f"overlap={metrics['loss_overlap']:.6f} global={metrics['loss_global_point']:.6f} "
+                        f"camera={metrics['loss_camera']:.6f} "
                         f"camera_t={metrics['loss_camera_t']:.6f} "
+                        f"camera_t_deg={metrics['camera_translation_deg']:.3f} "
                         f"camera_r_deg={metrics['camera_rotation_deg']:.3f} "
                         f"camera_valid=t{metrics['camera_translation_valid_count']:.1f}/"
                         f"r{metrics['camera_rotation_valid_count']:.1f} "
@@ -850,7 +912,11 @@ def train(args: argparse.Namespace) -> None:
                             loss=f"{metrics['loss']:.4f}",
                             comp=f"{metrics['loss_comparable']:.4f}",
                             depth=f"{metrics['loss_depth']:.4f}",
+                            global_pt=f"{metrics['loss_global_point']:.4f}",
+                            gfinite=f"{metrics['global_point_finite_ratio']:.3f}",
+                            ggeom=f"{metrics['global_point_geometry_finite_ratio']:.3f}",
                             camera=f"{metrics['loss_camera']:.4f}",
+                            tdeg=f"{metrics['camera_translation_deg']:.1f}",
                             rdeg=f"{metrics['camera_rotation_deg']:.1f}",
                             valid=f"{metrics['depth_valid_ratio']:.3f}",
                             lvalid=f"{metrics['depth_loss_valid_ratio']:.3f}",
@@ -1274,6 +1340,7 @@ LOSS_STAGE_OVERRIDE_KEYS = (
     "pano_translation_consistency_weight",
     "camera_translation_normalization",
     "camera_translation_normalization_eps",
+    "global_point_loss_weight",
 )
 
 
@@ -1786,10 +1853,39 @@ def train_step(
             ),
         )
         loss_camera = loss_camera_dict["loss_camera"]
-        loss = loss_depth + float(args.overlap_consistency_weight) * loss_overlap + args.camera_loss_weight * loss_camera
+        if float(args.global_point_loss_weight) > 0:
+            global_point_dict = shared_frame_point_loss(
+                pred_depth=pred_depth,
+                target_depth=target_depth,
+                valid_mask=target_valid,
+                predictions=predictions,
+                batch=batch,
+                pred_translation_scale=(
+                    (base_depth_scale.detach() * sample_depth_scale)
+                    if args.camera_depth_scale_alignment and args.depth_scale_alignment != "none"
+                    else None
+                ),
+                stride=args.global_point_stride,
+            )
+        else:
+            zero_global = pred_depth.sum() * 0.0
+            global_point_dict = {
+                "loss_global_point": zero_global,
+                "global_point_valid_ratio": zero_global.detach(),
+                "global_point_finite_ratio": zero_global.detach(),
+                "global_point_geometry_finite_ratio": zero_global.detach(),
+            }
+        loss_global_point = global_point_dict["loss_global_point"]
+        loss = (
+            loss_depth
+            + float(args.overlap_consistency_weight) * loss_overlap
+            + float(args.global_point_loss_weight) * loss_global_point
+            + args.camera_loss_weight * loss_camera
+        )
         loss_comparable = (
             loss_depth
             + float(args.overlap_consistency_weight) * loss_overlap
+            + float(args.global_point_loss_weight) * loss_global_point
             + float(args.camera_comparable_weight) * loss_camera
         )
     loss.backward()
@@ -1811,8 +1907,12 @@ def train_step(
         "loss_comparable": loss_comparable.detach(),
         "loss_depth": loss_depth.detach(),
         "loss_overlap": loss_overlap.detach(),
+        "loss_global_point": loss_global_point.detach(),
         "loss_camera": loss_camera.detach(),
         "loss_overlap_weighted": (float(args.overlap_consistency_weight) * loss_overlap).detach(),
+        "loss_global_point_weighted": (
+            float(args.global_point_loss_weight) * loss_global_point
+        ).detach(),
         "loss_camera_weighted": (float(args.camera_loss_weight) * loss_camera).detach(),
         "pano_count": loss_depth.new_tensor(float(pano_images.shape[1] if pano_images.ndim == 5 else 1)),
         "depth_valid_ratio": depth_valid_ratio.detach(),
@@ -1825,6 +1925,7 @@ def train_step(
         "depth_sample_scale_min": sample_depth_scale.detach().float().min(),
         "depth_sample_scale_max": sample_depth_scale.detach().float().max(),
         "pred_depth_scale": logged_pred_depth_scale,
+        **{key: value.detach() for key, value in global_point_dict.items() if key != "loss_global_point"},
         **{key: value.detach() for key, value in loss_camera_dict.items() if key != "loss_camera"},
     }
 
@@ -2097,6 +2198,8 @@ def write_tensorboard_metrics(writer, metrics: Dict[str, Any]) -> None:
         "loss/depth": "loss_depth",
         "loss/overlap": "loss_overlap",
         "loss/overlap_weighted": "loss_overlap_weighted",
+        "loss/global_point": "loss_global_point",
+        "loss/global_point_weighted": "loss_global_point_weighted",
         "loss/camera": "loss_camera",
         "loss/camera_weighted": "loss_camera_weighted",
         "loss/camera_t": "loss_camera_t",
@@ -2113,8 +2216,12 @@ def write_tensorboard_metrics(writer, metrics: Dict[str, Any]) -> None:
         "data/depth_sample_scale_min": "depth_sample_scale_min",
         "data/depth_sample_scale_max": "depth_sample_scale_max",
         "camera/rotation_deg": "camera_rotation_deg",
+        "camera/translation_deg": "camera_translation_deg",
         "camera/translation_valid_count": "camera_translation_valid_count",
         "camera/rotation_valid_count": "camera_rotation_valid_count",
+        "data/global_point_valid_ratio": "global_point_valid_ratio",
+        "data/global_point_finite_ratio": "global_point_finite_ratio",
+        "data/global_point_geometry_finite_ratio": "global_point_geometry_finite_ratio",
         "data/pano_count": "pano_count",
         "train/lr": "lr",
         "train/pred_depth_scale": "pred_depth_scale",
@@ -2613,6 +2720,9 @@ def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace
             {
                 "checkpoint_format": "trainable_delta",
                 "model_delta": delta,
+                "foundation_checkpoint": (
+                    str(args.base_checkpoint) if args.base_checkpoint is not None else None
+                ),
                 "base_checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
                 "trainable": args.trainable,
                 "pred_depth_scale": pred_depth_scale,
@@ -2631,6 +2741,9 @@ def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace
         {
             "checkpoint_format": "full",
             "model": cpu_state,
+            "foundation_checkpoint": (
+                str(args.base_checkpoint) if args.base_checkpoint is not None else None
+            ),
             "base_checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
             "pred_depth_scale": pred_depth_scale,
             "learn_pred_depth_scale": bool(args.learn_pred_depth_scale),
@@ -2842,6 +2955,141 @@ def _expand_sample_weight(
     return weight.expand_as(target).clamp(min=float(sample_weight_min), max=float(sample_weight_max))
 
 
+def shared_frame_point_loss(
+    pred_depth: torch.Tensor,
+    target_depth: torch.Tensor,
+    valid_mask: torch.Tensor,
+    predictions: Dict,
+    batch: Dict,
+    pred_translation_scale: torch.Tensor | None,
+    stride: int = 16,
+) -> Dict[str, torch.Tensor]:
+    """Couple depth and pano pose in one GT-anchored 3D coordinate frame.
+
+    This is a memory-bounded analogue of PanoVGGT's global-point supervision:
+    existing window depth predictions are sparsely lifted to 3D and transformed
+    by the predicted pano poses. It requires valid translation and rotation GT,
+    so Structured3D is excluded through ``pano_translation_valid``.
+    """
+    zero = pred_depth.sum() * 0.0
+    pred_center = predictions.get("pano_camera_center")
+    pred_quat = predictions.get("pano_rotation_quat_w2c")
+    camera_meta = predictions.get("pano_camera_meta")
+    if pred_center is None or pred_quat is None or camera_meta is None:
+        return {"loss_global_point": zero, "global_point_valid_ratio": zero.detach()}
+
+    targets = build_relative_pano_pose_targets(
+        batch=batch,
+        position_mode="relative_anchor",
+        device=pred_depth.device,
+        dtype=pred_depth.dtype,
+    )
+    if targets is None:
+        return {"loss_global_point": zero, "global_point_valid_ratio": zero.detach()}
+    target_center, target_quat, position_valid, rotation_valid = targets
+    if pred_center.shape != target_center.shape or pred_quat.shape != target_quat.shape:
+        return {"loss_global_point": zero, "global_point_valid_ratio": zero.detach()}
+
+    pred_center = torch.nan_to_num(pred_center.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    pred_quat = F.normalize(
+        torch.nan_to_num(pred_quat.float(), nan=0.0, posinf=0.0, neginf=0.0),
+        dim=-1,
+        eps=1e-6,
+    )
+    pred_center, pred_quat = omega_y_up_pose_to_official_y_down(pred_center, pred_quat)
+    if pred_translation_scale is not None:
+        pred_center = pred_center * expand_sample_scale_like(pred_translation_scale, pred_center)
+
+    batch_size, view_count, height, width, _ = pred_depth.shape
+    num_panos = pred_center.shape[1]
+    if num_panos < 1 or view_count % num_panos != 0:
+        return {"loss_global_point": zero, "global_point_valid_ratio": zero.detach()}
+    views_per_pano = view_count // num_panos
+    low_h = max(2, int(math.ceil(height / max(int(stride), 1))))
+    low_w = max(2, int(math.ceil(width / max(int(stride), 1))))
+
+    def resize_depth(values: torch.Tensor, mode: str) -> torch.Tensor:
+        flat = values[..., 0].reshape(batch_size * view_count, 1, height, width)
+        resized = F.interpolate(
+            flat.float(),
+            size=(low_h, low_w),
+            mode=mode,
+            align_corners=False if mode in {"bilinear", "bicubic"} else None,
+        )
+        return resized.reshape(batch_size, view_count, low_h, low_w)
+
+    pred_z = resize_depth(pred_depth, "bilinear")
+    target_z = resize_depth(target_depth, "nearest")
+    point_valid = resize_depth(valid_mask.to(dtype=pred_depth.dtype), "nearest") > 0.5
+
+    yaw = camera_meta["yaw"].reshape(-1)
+    pitch = camera_meta["pitch"].reshape(-1)
+    fov_x = camera_meta["fov_x"].reshape(-1)
+    fov_y = camera_meta["fov_y"].reshape(-1)
+    rays_omega = pinhole_rays(
+        yaw,
+        pitch,
+        fov_x,
+        fov_y,
+        low_h,
+        low_w,
+        device=pred_depth.device,
+        dtype=torch.float32,
+    ).reshape(batch_size, view_count, low_h, low_w, 3)
+    z_factor = build_window_z_factor(camera_meta, low_h, low_w).float().clamp_min(1e-4)
+    pred_range = pred_z.float() / z_factor
+    target_range = target_z.float() / z_factor
+    point_valid = (
+        point_valid
+        & torch.isfinite(pred_range)
+        & torch.isfinite(target_range)
+        & (pred_range > 0)
+        & (target_range > 0)
+    )
+
+    pred_local = omega_y_up_vectors_to_official_y_down(rays_omega * pred_range[..., None])
+    target_local = omega_y_up_vectors_to_official_y_down(rays_omega * target_range[..., None])
+
+    pred_w2c = quat_to_mat(pred_quat)
+    target_w2c = quat_to_mat(F.normalize(target_quat.float(), dim=-1, eps=1e-6))
+    pred_c2w = pred_w2c.transpose(-1, -2).repeat_interleave(views_per_pano, dim=1)
+    target_c2w = target_w2c.transpose(-1, -2).repeat_interleave(views_per_pano, dim=1)
+    pred_centers = pred_center.repeat_interleave(views_per_pano, dim=1)
+    target_centers = target_center.float().repeat_interleave(views_per_pano, dim=1)
+    pred_world = torch.matmul(pred_c2w[:, :, None, None], pred_local[..., None])[..., 0]
+    pred_world = pred_world + pred_centers[:, :, None, None]
+    target_world = torch.matmul(target_c2w[:, :, None, None], target_local[..., None])[..., 0]
+    target_world = target_world + target_centers[:, :, None, None]
+
+    camera_valid = (position_valid & rotation_valid).repeat_interleave(views_per_pano, dim=1)
+    point_valid = point_valid & camera_valid[:, :, None, None]
+    geometry_finite = torch.isfinite(pred_world).all(dim=-1) & torch.isfinite(target_world).all(dim=-1)
+    depth_pose_valid_count = point_valid.sum().clamp_min(1)
+    geometry_finite_ratio = (point_valid & geometry_finite).sum().to(dtype=torch.float32) / depth_pose_valid_count
+    point_valid = point_valid & geometry_finite
+    valid_float = point_valid.to(dtype=torch.float32)
+    valid_count = valid_float.sum(dim=(1, 2, 3)).clamp_min(1.0)
+    safe_target_range = torch.where(point_valid, target_range, torch.zeros_like(target_range))
+    scene_scale = safe_target_range.sum(dim=(1, 2, 3)) / valid_count
+    scene_scale = scene_scale.clamp_min(1.0)
+    normalized_delta = (pred_world - target_world) / scene_scale[:, None, None, None, None]
+    point_error = F.smooth_l1_loss(
+        normalized_delta,
+        torch.zeros_like(normalized_delta),
+        beta=0.05,
+        reduction="none",
+    ).mean(dim=-1)
+    loss = distributed_masked_mean(point_error, point_valid)
+    finite_point_valid = point_valid & torch.isfinite(point_error)
+    finite_ratio = finite_point_valid.sum().to(dtype=torch.float32) / point_valid.sum().clamp_min(1)
+    return {
+        "loss_global_point": loss,
+        "global_point_valid_ratio": valid_float.mean().detach(),
+        "global_point_finite_ratio": finite_ratio.detach(),
+        "global_point_geometry_finite_ratio": geometry_finite_ratio.detach(),
+    }
+
+
 def adjacent_edge_overlap_loss(
     pred_depth: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
@@ -2903,6 +3151,7 @@ def camera_alignment_loss(
             "loss_camera_fov": zero,
             "loss_camera_consistency": zero,
             "camera_rotation_deg": zero,
+            "camera_translation_deg": zero,
             "camera_translation_valid_count": zero,
             "camera_rotation_valid_count": zero,
         }
@@ -2920,6 +3169,11 @@ def camera_alignment_loss(
             torch.nan_to_num(pred_quat.float(), nan=0.0, posinf=0.0, neginf=0.0),
             dim=-1,
         )
+        # The pano sampler/head operates in Omega's right/up/forward basis,
+        # while all loader GT poses are canonicalized to official OpenCV
+        # right/down/forward coordinates. Convert at the supervision boundary;
+        # the model and dense-depth path remain in their pretrained basis.
+        pred_center, pred_quat = omega_y_up_pose_to_official_y_down(pred_center, pred_quat)
         if pred_translation_scale is not None:
             pred_center = pred_center * expand_sample_scale_like(pred_translation_scale, pred_center)
         pano_losses = pano_relative_pose_loss(
@@ -2951,6 +3205,7 @@ def camera_alignment_loss(
             "loss_camera_fov": zero,
             "loss_camera_consistency": zero,
             "camera_rotation_deg": zero,
+            "camera_translation_deg": zero,
             "camera_translation_valid_count": zero,
             "camera_rotation_valid_count": zero,
         }
@@ -3001,6 +3256,7 @@ def camera_alignment_loss(
         "loss_camera_fov": loss_fov,
         "loss_camera_consistency": pred_translation.new_zeros(()),
         "camera_rotation_deg": pred_translation.new_zeros(()),
+        "camera_translation_deg": pred_translation.new_zeros(()),
         "camera_translation_valid_count": pred_translation.new_tensor(float(pred_translation.shape[1])),
         "camera_rotation_valid_count": pred_translation.new_tensor(float(pred_translation.shape[1])),
     }
@@ -3031,6 +3287,7 @@ def pano_relative_pose_loss(
             "loss_camera_t": loss_t,
             "loss_camera_r": loss_r,
             "camera_rotation_deg": rotation_deg,
+            "camera_translation_deg": rotation_deg,
             "camera_translation_valid_count": pred_center.new_zeros(()),
             "camera_rotation_valid_count": pred_center.new_zeros(()),
             "_camera_diag_translation_loss": diag_zero,
@@ -3047,6 +3304,8 @@ def pano_relative_pose_loss(
             f"center {tuple(pred_center.shape)} vs {tuple(target_center.shape)}, "
             f"rotation {tuple(pred_quat.shape)} vs {tuple(target_quat.shape)}"
         )
+    # Retain anchor-relative diagnostics for per-pano logging, but optimize and
+    # evaluate every valid ordered camera pair, matching PanoVGGT's pose loss.
     translation_loss_map, translation_l2_m, translation_norm_l2, translation_valid = pano_center_error_maps(
         pred_center=pred_center,
         target_center=target_center,
@@ -3054,24 +3313,135 @@ def pano_relative_pose_loss(
         translation_normalization=translation_normalization,
         translation_normalization_eps=translation_normalization_eps,
     )
-    loss_t = distributed_masked_mean(translation_loss_map, translation_valid)
-    loss_r, rotation_deg, rotation_deg_map, rotation_valid_mask = pano_rotation_geodesic_loss(
+    _anchor_loss_r, _anchor_rotation_deg, rotation_deg_map, rotation_valid_mask = pano_rotation_geodesic_loss(
         pred_quat=pred_quat,
         target_quat=target_quat,
         rotation_valid=rotation_valid,
     )
+    pair_errors = pano_pairwise_pose_error_maps(
+        pred_center=pred_center,
+        pred_quat_w2c=pred_quat,
+        target_center=target_center,
+        target_quat_w2c=target_quat,
+        position_valid=position_valid,
+        rotation_valid=rotation_valid,
+        translation_normalization=translation_normalization,
+        translation_normalization_eps=translation_normalization_eps,
+    )
+    loss_t = distributed_masked_mean(
+        pair_errors["translation_loss"],
+        pair_errors["translation_valid"],
+    )
+    loss_r = distributed_masked_mean(
+        pair_errors["rotation_rad"],
+        pair_errors["rotation_valid"],
+    )
+    translation_deg = distributed_masked_mean(
+        pair_errors["translation_deg"].detach(),
+        pair_errors["translation_angle_valid"],
+    )
+    rotation_deg = distributed_masked_mean(
+        pair_errors["rotation_rad"].detach(),
+        pair_errors["rotation_valid"],
+    ) * (180.0 / math.pi)
     return {
         "loss_camera_t": loss_t,
         "loss_camera_r": loss_r,
         "camera_rotation_deg": rotation_deg.detach(),
-        "camera_translation_valid_count": position_valid[:, 1:].sum().to(dtype=pred_center.dtype),
-        "camera_rotation_valid_count": rotation_valid[:, 1:].sum().to(dtype=pred_center.dtype),
+        "camera_translation_deg": translation_deg.detach(),
+        "camera_translation_valid_count": pair_errors["translation_angle_valid"].sum().to(dtype=pred_center.dtype),
+        "camera_rotation_valid_count": pair_errors["rotation_valid"].sum().to(dtype=pred_center.dtype),
         "_camera_diag_translation_loss": translation_loss_map.detach(),
         "_camera_diag_translation_l2_m": translation_l2_m.detach(),
         "_camera_diag_translation_norm_l2": translation_norm_l2.detach(),
         "_camera_diag_translation_valid": translation_valid.detach(),
         "_camera_diag_rotation_deg": rotation_deg_map.detach(),
         "_camera_diag_rotation_valid": rotation_valid_mask.detach(),
+    }
+
+
+def pano_pairwise_pose_error_maps(
+    pred_center: torch.Tensor,
+    pred_quat_w2c: torch.Tensor,
+    target_center: torch.Tensor,
+    target_quat_w2c: torch.Tensor,
+    position_valid: torch.Tensor,
+    rotation_valid: torch.Tensor,
+    translation_normalization: str,
+    translation_normalization_eps: float,
+) -> Dict[str, torch.Tensor]:
+    """Return PanoVGGT-style errors for every ordered relative camera pair."""
+    if pred_center.ndim != 3 or pred_center.shape[1] < 2:
+        shape = (*pred_center.shape[:2], pred_center.shape[1])
+        zero = pred_center.new_zeros(shape)
+        valid = torch.zeros(shape, device=pred_center.device, dtype=torch.bool)
+        return {
+            "translation_loss": zero,
+            "translation_deg": zero,
+            "translation_valid": valid,
+            "translation_angle_valid": valid,
+            "rotation_rad": zero,
+            "rotation_valid": valid,
+        }
+
+    pred_w2c = quat_to_mat(F.normalize(pred_quat_w2c, dim=-1, eps=1e-6))
+    target_w2c = quat_to_mat(F.normalize(target_quat_w2c, dim=-1, eps=1e-6))
+    pred_delta = pred_center[:, None, :, :] - pred_center[:, :, None, :]
+    target_delta = target_center[:, None, :, :] - target_center[:, :, None, :]
+    pred_translation = torch.matmul(pred_w2c[:, :, None], pred_delta[..., None])[..., 0]
+    target_translation = torch.matmul(target_w2c[:, :, None], target_delta[..., None])[..., 0]
+
+    pred_relative_rotation = pred_w2c[:, :, None] @ pred_w2c.transpose(-1, -2)[:, None, :]
+    target_relative_rotation = target_w2c[:, :, None] @ target_w2c.transpose(-1, -2)[:, None, :]
+
+    pair_count = pred_center.shape[1]
+    off_diagonal = ~torch.eye(pair_count, device=pred_center.device, dtype=torch.bool)[None]
+    translation_valid = (
+        position_valid.to(device=pred_center.device).bool()[:, :, None]
+        & position_valid.to(device=pred_center.device).bool()[:, None, :]
+        & off_diagonal
+    )
+    rotation_pair_valid = (
+        rotation_valid.to(device=pred_center.device).bool()[:, :, None]
+        & rotation_valid.to(device=pred_center.device).bool()[:, None, :]
+        & off_diagonal
+    )
+
+    scale = camera_translation_normalization_scale(
+        target_translation,
+        mode=translation_normalization,
+        eps=translation_normalization_eps,
+        valid_mask=translation_valid,
+    )
+    normalized_delta = (pred_translation - target_translation) / scale[:, None, None, None]
+    translation_loss = F.smooth_l1_loss(
+        normalized_delta,
+        torch.zeros_like(normalized_delta),
+        beta=0.1,
+        reduction="none",
+    ).mean(dim=-1)
+
+    target_norm = torch.linalg.vector_norm(target_translation, dim=-1)
+    pred_norm = torch.linalg.vector_norm(pred_translation, dim=-1)
+    cosine = (pred_translation * target_translation).sum(dim=-1) / (
+        pred_norm.clamp_min(1e-8) * target_norm.clamp_min(1e-8)
+    )
+    translation_deg = torch.acos(cosine.clamp(-1.0, 1.0)) * (180.0 / math.pi)
+    translation_angle_valid = translation_valid & (target_norm > 1e-8)
+
+    rotation_delta = pred_relative_rotation.transpose(-1, -2) @ target_relative_rotation
+    trace = torch.diagonal(rotation_delta, dim1=-2, dim2=-1).sum(dim=-1)
+    rotation_cosine = ((trace - 1.0) * 0.5).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    rotation_floor = torch.acos(rotation_cosine.new_tensor(1.0 - 1e-7))
+    rotation_rad = (torch.acos(rotation_cosine) - rotation_floor).clamp_min(0.0)
+    rotation_rad = torch.where(rotation_pair_valid, rotation_rad, torch.zeros_like(rotation_rad))
+    return {
+        "translation_loss": translation_loss,
+        "translation_deg": translation_deg,
+        "translation_valid": translation_valid,
+        "translation_angle_valid": translation_angle_valid,
+        "rotation_rad": rotation_rad,
+        "rotation_valid": rotation_pair_valid,
     }
 
 
@@ -3143,14 +3513,17 @@ def camera_translation_normalization_scale(
         valid = valid_mask.to(device=norms.device).bool()
         if valid.shape != norms.shape:
             raise ValueError(f"Translation validity shape {tuple(valid.shape)} != {tuple(norms.shape)}")
+    valid = valid & torch.isfinite(norms)
+    safe_norms = torch.where(valid, norms, torch.zeros_like(norms))
     valid_float = valid.to(dtype=norms.dtype)
-    count = valid_float.sum(dim=-1).clamp_min(1.0)
+    reduce_dims = tuple(range(1, norms.ndim))
+    count = valid_float.sum(dim=reduce_dims).clamp_min(1.0)
     if mode == "target_rms":
-        scale = ((norms.square() * valid_float).sum(dim=-1) / count).sqrt()
+        scale = ((safe_norms.square() * valid_float).sum(dim=reduce_dims) / count).sqrt()
     elif mode == "target_mean_norm":
-        scale = (norms * valid_float).sum(dim=-1) / count
+        scale = (safe_norms * valid_float).sum(dim=reduce_dims) / count
     elif mode == "target_max_norm":
-        scale = norms.masked_fill(~valid, float("-inf")).max(dim=-1).values
+        scale = safe_norms.masked_fill(~valid, float("-inf")).flatten(start_dim=1).max(dim=-1).values
         scale = torch.where(torch.isfinite(scale), scale, torch.zeros_like(scale))
     else:
         raise ValueError(f"Unknown camera translation normalization: {mode}")
@@ -3190,8 +3563,10 @@ def pano_rotation_geodesic_loss(
 
 def distributed_masked_mean(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     """Mean over valid labels with correct normalization under variable-label DDP."""
-    valid_float = valid.to(device=values.device, dtype=values.dtype)
-    numerator = (values * valid_float).sum()
+    finite_valid = valid.to(device=values.device, dtype=torch.bool) & torch.isfinite(values)
+    valid_float = finite_valid.to(dtype=values.dtype)
+    safe_values = torch.where(finite_valid, values, torch.zeros_like(values))
+    numerator = safe_values.sum()
     count = valid_float.sum()
     if not (dist.is_available() and dist.is_initialized()):
         return numerator / count.clamp_min(1.0)
@@ -3220,7 +3595,10 @@ def build_relative_pano_pose_targets(
         centers = centers[:, None, :]
     if centers.ndim != 3 or centers.shape[1] < 2:
         return None
-    position_valid_raw = batch.get("pano_position_valid", None)
+    # Position availability and translation-supervision eligibility are
+    # separate. Structured3D keeps metric centers for reprojection/debugging,
+    # but explicitly disables camera translation learning and evaluation.
+    position_valid_raw = batch.get("pano_translation_valid", batch.get("pano_position_valid", None))
     if position_valid_raw is None:
         position_valid = torch.ones(centers.shape[:2], device=device, dtype=torch.bool)
     else:
@@ -3229,6 +3607,9 @@ def build_relative_pano_pose_targets(
             position_valid = position_valid[None, :]
         if position_valid.shape != centers.shape[:2]:
             return None
+    position_finite = torch.isfinite(centers).all(dim=-1)
+    position_valid = position_valid & position_finite
+    centers = torch.where(position_finite[..., None], centers, torch.zeros_like(centers))
 
     pano_rotation = batch.get("pano_rotation_c2w", None)
     if pano_rotation is None:
@@ -3258,6 +3639,10 @@ def build_relative_pano_pose_targets(
                 rotation_valid = rotation_valid.reshape(1, 1).expand(*centers.shape[:2])
         if rotation_valid.shape != centers.shape[:2]:
             return None
+    rotation_finite = torch.isfinite(rotations_c2w).all(dim=(-1, -2))
+    rotation_valid = rotation_valid & rotation_finite
+    identity = torch.eye(3, device=device, dtype=dtype).reshape(1, 1, 3, 3)
+    rotations_c2w = torch.where(rotation_finite[..., None, None], rotations_c2w, identity)
 
     if position_mode in {"none", "local_zero"}:
         target_centers = torch.zeros_like(centers)
@@ -3349,6 +3734,15 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path, strict: bool)
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
     if isinstance(checkpoint, dict) and "model_delta" in checkpoint:
+        foundation_checkpoint = checkpoint.get("foundation_checkpoint")
+        if foundation_checkpoint is None:
+            foundation_checkpoint = checkpoint.get("args", {}).get("base_checkpoint")
+        if foundation_checkpoint:
+            foundation_checkpoint_path = Path(foundation_checkpoint)
+            if foundation_checkpoint_path.exists() and foundation_checkpoint_path.resolve() != checkpoint_path.resolve():
+                load_checkpoint(model, foundation_checkpoint_path, strict=False)
+            else:
+                print(f"[WARN] foundation checkpoint is unavailable for delta load: {foundation_checkpoint}")
         base_checkpoint = checkpoint.get("base_checkpoint")
         if base_checkpoint is None:
             base_checkpoint = checkpoint.get("args", {}).get("checkpoint")

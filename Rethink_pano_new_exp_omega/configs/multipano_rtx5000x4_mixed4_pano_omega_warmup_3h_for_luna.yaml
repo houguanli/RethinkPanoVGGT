@@ -8,7 +8,9 @@ data:
   dataset_root: ../../panovggt
   dataset_format: pano_minimal
   minimal_datasets: all
-  dataset_sampling_weights: "panocity:0.45,matterport3d:0.25,structured3d:0.25,stanford2d3ds:0.05"
+  # Match PanoVGGT's released mixed-data proportions: high-overlap PanoCity
+  # drives cross-view learning; low/no-overlap indoor data stays auxiliary.
+  dataset_sampling_weights: "panocity:0.64,matterport3d:0.18,structured3d:0.09,stanford2d3ds:0.09"
   dataset_split: train
   train_split_fraction: 0.95
   split_seed: 42
@@ -36,7 +38,7 @@ sampler:
   luna_camera_layers: "23"
 
 model:
-  enable_pano_global_token: false
+  enable_pano_global_token: true
   enable_pano_geometry_residual: false
   aggregator_use_checkpoint: true
   dense_head_frames_chunk_size: 1
@@ -57,7 +59,11 @@ supervision:
   valid_ratio_loss_power: 0.5
   sample_weight_min: 0.25
   sample_weight_max: 1.25
-  overlap_consistency_weight: 0.02
+  # Raw adjacent-window edge comparisons are not geometrically valid across
+  # pano boundaries (and 4x75-degree windows have no edge overlap).
+  overlap_consistency_weight: 0.0
+  global_point_loss_weight: 0.10
+  global_point_stride: 16
   overlap_band_fraction: 0.20
   pred_depth_scale: 2.7437050342559814
   learn_pred_depth_scale: false

@@ -167,6 +167,7 @@ PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   --nproc_per_node="$NPROC_PER_NODE" \
   training/train_pano_omega.py --config "$LUNA_CONFIG" \
   "${LUNA_DURATION_ARGS[@]}" \
+  --base-checkpoint "$BASE_CHECKPOINT" \
   --output-dir "$LUNA_OUT" \
   --tensorboard-dir "$LUNA_OUT/tensorboard" \
   --debug-dir "$LUNA_OUT/debug" \

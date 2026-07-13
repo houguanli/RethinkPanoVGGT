@@ -42,6 +42,7 @@ from training.train_pano_omega import (  # noqa: E402
     resolve_device,
     sample_depth_targets,
     set_seed,
+    shared_frame_point_loss,
     unwrap_model,
 )
 
@@ -384,9 +385,31 @@ def evaluate_run(
                         )
                     ),
                 )
+                if float(eval_args.global_point_loss_weight) > 0:
+                    global_point_metrics = shared_frame_point_loss(
+                        pred_depth=pred_depth,
+                        target_depth=target_depth,
+                        valid_mask=target_valid,
+                        predictions=predictions,
+                        batch=moved,
+                        pred_translation_scale=(
+                            camera_scale
+                            if eval_args.camera_depth_scale_alignment
+                            and eval_args.depth_scale_alignment != "none"
+                            else None
+                        ),
+                        stride=eval_args.global_point_stride,
+                    )
+                else:
+                    global_point_metrics = {
+                        "loss_global_point": loss_depth.new_zeros(()),
+                        "global_point_valid_ratio": loss_depth.new_zeros(()),
+                    }
                 loss = (
                     loss_depth
                     + float(eval_args.overlap_consistency_weight) * loss_overlap
+                    + float(eval_args.global_point_loss_weight)
+                    * global_point_metrics["loss_global_point"]
                     + float(eval_args.camera_loss_weight) * camera_losses["loss_camera"]
                 )
 
@@ -400,10 +423,15 @@ def evaluate_run(
                 "loss": float(loss.detach().cpu()),
                 "loss_depth": float(loss_depth.detach().cpu()),
                 "loss_overlap": float(loss_overlap.detach().cpu()),
+                "loss_global_point": float(global_point_metrics["loss_global_point"].detach().cpu()),
+                "global_point_valid_ratio": float(
+                    global_point_metrics["global_point_valid_ratio"].detach().cpu()
+                ),
                 "loss_camera": float(camera_losses["loss_camera"].detach().cpu()),
                 "loss_camera_t": float(camera_losses["loss_camera_t"].detach().cpu()),
                 "loss_camera_r": float(camera_losses["loss_camera_r"].detach().cpu()),
                 "camera_rotation_deg": float(camera_losses["camera_rotation_deg"].detach().cpu()),
+                "camera_translation_deg": float(camera_losses["camera_translation_deg"].detach().cpu()),
                 "camera_translation_valid_count": float(
                     camera_losses["camera_translation_valid_count"].detach().cpu()
                 ),
@@ -454,8 +482,12 @@ def evaluate_run(
         "summary": summarize_values([row["loss"] for row in rows]),
         "depth_summary": summarize_values([row["loss_depth"] for row in rows]),
         "overlap_summary": summarize_values([row["loss_overlap"] for row in rows]),
+        "global_point_summary": summarize_values([row["loss_global_point"] for row in rows]),
         "camera_summary": summarize_values([row["loss_camera"] for row in rows]),
         "camera_translation_summary": summarize_values([row["loss_camera_t"] for row in rows]),
+        "camera_translation_deg_summary": summarize_values(
+            [row["camera_translation_deg"] for row in rows if row["camera_translation_valid_count"] > 0]
+        ),
         "camera_rotation_rad_summary": summarize_values([row["loss_camera_r"] for row in rows]),
         "camera_rotation_deg_summary": summarize_values(
             [row["camera_rotation_deg"] for row in rows if row["camera_rotation_valid_count"] > 0]

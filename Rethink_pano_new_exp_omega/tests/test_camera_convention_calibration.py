@@ -1,5 +1,7 @@
 import unittest
+import json
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +22,85 @@ from scripts.calibrate_camera_conventions import (
     score_candidate,
     search_coarse,
 )
+from training.data.pano_minimal import _index_matterport3d, _item, _read_stanford_pose
+
+
 class CameraConventionCalibrationTest(unittest.TestCase):
+    def test_training_rotation_target_preserves_converted_erp_heading(self):
+        rotation_y_90 = [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]]
+        item = _item(
+            "PanoCity",
+            "scene_pano",
+            Path("rgb.jpg"),
+            Path("depth.png"),
+            [0.0, 0.0, 0.0],
+            1.0,
+            rotation_c2w=rotation_y_90,
+            rotation_valid=True,
+        )
+        np.testing.assert_allclose(item["pano_rotation_c2w"], rotation_y_90, atol=1e-6)
+        np.testing.assert_allclose(item["pano_rotation_raw_c2w"], rotation_y_90, atol=1e-6)
+        self.assertTrue(item["pano_rotation_valid"])
+        self.assertTrue(item["pano_rotation_raw_valid"])
+
+    def test_stanford_pose_position_and_rotation_share_opencv_c2w_path(self):
+        with tempfile.TemporaryDirectory(prefix="stanford_pose_") as tmpdir:
+            pose_path = Path(tmpdir) / "pose.json"
+            pose_path.write_text(
+                json.dumps(
+                    {
+                        "camera_rt_matrix": [
+                            [1.0, 0.0, 0.0, -1.0],
+                            [0.0, 1.0, 0.0, -2.0],
+                            [0.0, 0.0, 1.0, -3.0],
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            position, position_valid, rotation, rotation_valid = _read_stanford_pose(pose_path)
+
+        self.assertTrue(position_valid)
+        self.assertTrue(rotation_valid)
+        np.testing.assert_allclose(position, [1.0, -3.0, 2.0], atol=1e-6)
+        np.testing.assert_allclose(np.asarray(rotation).T @ np.asarray(rotation), np.eye(3), atol=1e-6)
+
+    def test_matterport_cache_all_is_regrouped_by_parsed_room(self):
+        with tempfile.TemporaryDirectory(prefix="matterport_rooms_") as tmpdir:
+            root = Path(tmpdir)
+            cache_dir = root / "cache"
+            parsed_dir = root / "parsed_json"
+            cache_dir.mkdir(parents=True)
+            parsed_dir.mkdir(parents=True)
+            (cache_dir / "matterport3d_train_index.json").write_text(
+                json.dumps(
+                    [
+                        [
+                            "scan_a",
+                            "all",
+                            "all",
+                            ["pano_room_1", "pano_room_2"],
+                            [1024, 2048],
+                        ]
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (parsed_dir / "scan_a.json").write_text(
+                json.dumps(
+                    {
+                        "1": {"room_name": "room one", "panoramas": ["pano_room_1"]},
+                        "2": {"room_name": "room two", "panoramas": ["pano_room_2"]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            items = _index_matterport3d(root, "train", 4000.0)
+
+        self.assertEqual([item["scene_group_key"] for item in items], ["Matterport3D:scan_a:1", "Matterport3D:scan_a:2"])
+        self.assertEqual([item["scene_name"] for item in items], ["scan_a_1_pano_room_1", "scan_a_2_pano_room_2"])
+
     def test_official_dataset_pose_conversions_are_proper_and_round_trip(self):
         expected_rotations = {
             "panocity": np.eye(3),

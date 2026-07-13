@@ -265,8 +265,11 @@ def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
     weighted_loss = 0.0
     weighted_depth_loss = 0.0
     weighted_overlap_loss = 0.0
+    weighted_global_point_loss = 0.0
     weighted_camera_loss = 0.0
+    weighted_camera_translation_deg = 0.0
     weighted_camera_rotation_deg = 0.0
+    camera_translation_samples = 0
     camera_rotation_samples = 0
     total_samples = 0
     for run in runs:
@@ -277,7 +280,14 @@ def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
         weighted_loss += float(run.get("summary", {}).get("mean", 0.0)) * n
         weighted_depth_loss += float(run.get("depth_summary", {}).get("mean", 0.0)) * n
         weighted_overlap_loss += float(run.get("overlap_summary", {}).get("mean", 0.0)) * n
+        weighted_global_point_loss += float(run.get("global_point_summary", {}).get("mean", 0.0)) * n
         weighted_camera_loss += float(run.get("camera_summary", {}).get("mean", 0.0)) * n
+        translation_n = int(run.get("camera_translation_deg_summary", {}).get("n", 0))
+        if translation_n > 0:
+            weighted_camera_translation_deg += (
+                float(run["camera_translation_deg_summary"]["mean"]) * translation_n
+            )
+            camera_translation_samples += translation_n
         rotation_n = int(run.get("camera_rotation_deg_summary", {}).get("n", 0))
         if rotation_n > 0:
             weighted_camera_rotation_deg += (
@@ -290,11 +300,16 @@ def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "weighted_loss_mean": weighted_loss / denom if total_samples else None,
         "weighted_depth_loss_mean": weighted_depth_loss / denom if total_samples else None,
         "weighted_overlap_loss_mean": weighted_overlap_loss / denom if total_samples else None,
+        "weighted_global_point_loss_mean": weighted_global_point_loss / denom if total_samples else None,
         "weighted_camera_loss_mean": weighted_camera_loss / denom if total_samples else None,
+        "weighted_camera_translation_deg_mean": (
+            weighted_camera_translation_deg / camera_translation_samples if camera_translation_samples else None
+        ),
         "weighted_camera_rotation_deg_mean": (
             weighted_camera_rotation_deg / camera_rotation_samples if camera_rotation_samples else None
         ),
         "camera_rotation_samples": camera_rotation_samples,
+        "camera_translation_samples": camera_translation_samples,
     }
 
 
@@ -377,9 +392,12 @@ def write_per_sample_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "loss",
         "loss_depth",
         "loss_overlap",
+        "loss_global_point",
+        "global_point_valid_ratio",
         "loss_camera",
         "loss_camera_t",
         "loss_camera_r",
+        "camera_translation_deg",
         "camera_rotation_deg",
         "camera_translation_valid_count",
         "camera_rotation_valid_count",

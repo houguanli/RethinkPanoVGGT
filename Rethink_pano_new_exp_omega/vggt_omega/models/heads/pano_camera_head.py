@@ -8,12 +8,12 @@ import torch.nn.functional as F
 
 
 class PanoCameraHead(nn.Module):
-    """Pool virtual-window camera tokens into one relative pose per panorama.
+    """Pool virtual-window camera tokens into one relative pose residual per panorama.
 
     The released Omega camera head predicts one pinhole pose per input frame.
     This head has different semantics: known virtual-view metadata is injected
-    before within-pano pooling, and cross-pano attention then predicts camera
-    centers and rotations relative to pano 0.
+    before within-pano pooling, and cross-pano attention then predicts a
+    residual on top of the pretrained Omega window-pose initialization.
     """
 
     def __init__(
@@ -138,8 +138,8 @@ class PanoCameraHead(nn.Module):
             eps=1e-6,
         )
         return {
-            "pano_camera_center": centers,
-            "pano_rotation_quat_w2c": quaternions,
+            "pano_camera_center_residual": centers,
+            "pano_rotation_quat_w2c_residual": quaternions,
         }
 
 

@@ -34,12 +34,17 @@ from training.data.pano_minimal import PanoMinimalDataset, _scene_group_key  # n
 
 DATASET_NAMES = ("panocity", "matterport3d", "stanford2d3ds", "structured3d")
 RAY_CONVENTIONS = ("training_y_up", "official_y_down")
+TILE_GAP_PX = 8
+ROW_GAP_PX = 10
+DIRECTION_GAP_PX = 18
+GAP_COLOR = (52, 52, 52)
 
 
 @dataclass
 class LoaderRecord:
     scene: str
     name: str
+    rgb: np.ndarray
     depth: np.ndarray
     center: np.ndarray
     rotation_c2w: np.ndarray
@@ -116,16 +121,35 @@ def main() -> None:
                 "scene": pair.scene,
                 "first": pair.first.name,
                 "second": pair.second.name,
+                "first_rgb_path": pair.first.rgb_path,
+                "second_rgb_path": pair.second.rgb_path,
+                "first_depth_path": pair.first.depth_path,
+                "second_depth_path": pair.second.depth_path,
+                "first_center_m": pair.first.center.tolist(),
+                "second_center_m": pair.second.center.tolist(),
                 "baseline_m": float(np.linalg.norm(pair.first.center - pair.second.center)),
                 "first_rotation_valid": bool(pair.first.rotation_valid),
                 "second_rotation_valid": bool(pair.second.rotation_valid),
+                "identity_checks": {},
                 "directions": {},
             }
             panels: list[np.ndarray] = []
             for convention in conventions:
                 rays = erp_rays(args.height, args.width, convention)
+                pair_entry["identity_checks"][convention] = {
+                    label: reproject_record(
+                        source=record,
+                        target=record,
+                        rays=rays,
+                        convention=convention,
+                        max_depth_m=args.max_depth_m,
+                    )["metrics"]
+                    for label, record in (("first_to_self", pair.first), ("second_to_self", pair.second))
+                }
                 direction_entries = []
-                for source, target in ((pair.first, pair.second), (pair.second, pair.first)):
+                for direction_index, (source, target) in enumerate(
+                    ((pair.first, pair.second), (pair.second, pair.first))
+                ):
                     result = reproject_record(
                         source=source,
                         target=target,
@@ -135,8 +159,13 @@ def main() -> None:
                     )
                     direction_entries.append(
                         {
+                            "direction": "A_to_B" if direction_index == 0 else "B_to_A",
                             "source": source.name,
                             "target": target.name,
+                            "source_rgb_path": source.rgb_path,
+                            "target_rgb_path": target.rgb_path,
+                            "source_depth_path": source.depth_path,
+                            "target_depth_path": target.depth_path,
                             "metrics": result["metrics"],
                         }
                     )
@@ -149,6 +178,7 @@ def main() -> None:
                                 source=source,
                                 target=target,
                                 result=result,
+                                direction="A -> B" if direction_index == 0 else "B -> A",
                             )
                         )
                 pair_entry["directions"][convention] = direction_entries
@@ -266,12 +296,15 @@ def select_pairs(
 
 
 def record_from_sample(sample: dict[str, Any], scene: str) -> LoaderRecord:
+    rgb = sample["pano_image"].detach().cpu().permute(1, 2, 0).numpy()
+    rgb = np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)[..., ::-1].copy()
     depth = sample["pano_depth"][0].detach().cpu().numpy().astype(np.float32)
     depth[(~np.isfinite(depth)) | (depth <= 0.0)] = np.nan
     rotation = sample["pano_rotation_c2w"].detach().cpu().numpy().astype(np.float64)
     return LoaderRecord(
         scene=scene,
-        name=str(sample["sequence_name"]),
+        name=str(sample["scene_name"]),
+        rgb=rgb,
         depth=depth,
         center=sample["pano_position_m"].detach().cpu().numpy().astype(np.float64),
         rotation_c2w=orthonormalize(rotation),
@@ -381,9 +414,15 @@ def reproject_record(
         1e-6,
     )
     inlier20 = comparable & (abs_rel <= 0.20)
+    target_on_comparable = np.full((height, width), np.nan, dtype=np.float32)
+    target_on_comparable[comparable] = target.depth[comparable]
+    consistent_projected = np.full((height, width), np.nan, dtype=np.float32)
+    consistent_projected[inlier20] = projected[inlier20]
     metrics = build_metrics(valid_source, projected, target_valid, comparable, abs_log, abs_rel)
     return {
         "projected_depth": projected,
+        "target_on_comparable": target_on_comparable,
+        "consistent_projected_depth": consistent_projected,
         "comparable_mask": comparable,
         "abs_log_error": abs_log,
         "inlier20_mask": inlier20,
@@ -455,27 +494,48 @@ def make_direction_panel(
     source: LoaderRecord,
     target: LoaderRecord,
     result: dict[str, Any],
+    direction: str,
 ) -> np.ndarray:
     metrics = result["metrics"]
     finite_depth = np.concatenate(
         [source.depth[np.isfinite(source.depth)], target.depth[np.isfinite(target.depth)]]
     )
     depth_max = float(np.quantile(finite_depth, 0.98)) if finite_depth.size else 10.0
-    tiles = [
-        depth_tile(source.depth, depth_max, "Source loader GT depth"),
-        depth_tile(target.depth, depth_max, "Target loader GT depth"),
-        depth_tile(result["projected_depth"], depth_max, f"Reprojected {convention}"),
-        error_tile(result["abs_log_error"], result["comparable_mask"], "Abs-log error where both valid"),
-        mask_tile(result["inlier20_mask"], "Relative depth error <= 20%"),
+    top_tiles = [
+        rgb_tile(source.rgb, f"Source RGB: {source.name}"),
+        rgb_tile(target.rgb, f"Target RGB: {target.name}"),
+        depth_tile(source.depth, depth_max, f"Source GT depth: {source.name}"),
+        depth_tile(target.depth, depth_max, f"Target GT depth: {target.name}"),
     ]
-    panel = np.concatenate(tiles, axis=1)
+    bottom_tiles = [
+        depth_tile(result["projected_depth"], depth_max, "Raw source splat in target ERP"),
+        depth_tile(result["target_on_comparable"], depth_max, "Target GT at raw-splat pixels"),
+        depth_tile(
+            result["consistent_projected_depth"],
+            depth_max,
+            "GT-consistent reprojection (relative error <= 20%)",
+        ),
+        error_tile(result["abs_log_error"], result["comparable_mask"], "Abs-log error at raw-splat pixels"),
+    ]
+    panel = join_images(
+        [
+            join_images(top_tiles, axis=1, gap=TILE_GAP_PX),
+            join_images(bottom_tiles, axis=1, gap=TILE_GAP_PX),
+        ],
+        axis=0,
+        gap=ROW_GAP_PX,
+    )
     title = (
-        f"{dataset_name} {convention} | {source.name} -> {target.name} | "
+        f"{dataset_name} {convention} | direction {direction} | {source.name} -> {target.name} | "
         f"coverage={metrics['target_coverage']:.3f} "
         f"med_log={metrics['median_abs_log_error']:.3f} "
         f"in10={metrics['inlier_10pct']:.3f} in20={metrics['inlier_20pct']:.3f}"
     )
     return add_header(panel, title)
+
+
+def rgb_tile(rgb: np.ndarray, label: str) -> np.ndarray:
+    return add_label(rgb.copy(), label)
 
 
 def depth_tile(depth: np.ndarray, maximum: float, label: str) -> np.ndarray:
@@ -525,7 +585,27 @@ def stack_panels(panels: list[np.ndarray]) -> np.ndarray:
             pad = np.full((panel.shape[0], max_width - panel.shape[1], 3), 18, dtype=np.uint8)
             panel = np.concatenate([panel, pad], axis=1)
         padded.append(panel)
-    return np.concatenate(padded, axis=0)
+    return join_images(padded, axis=0, gap=DIRECTION_GAP_PX)
+
+
+def join_images(images: list[np.ndarray], axis: int, gap: int) -> np.ndarray:
+    if not images:
+        raise ValueError("At least one image is required.")
+    if len(images) == 1 or gap <= 0:
+        return images[0].copy() if len(images) == 1 else np.concatenate(images, axis=axis)
+    joined: list[np.ndarray] = []
+    for index, image in enumerate(images):
+        if index:
+            if axis == 0:
+                separator_shape = (gap, image.shape[1], image.shape[2])
+            elif axis == 1:
+                separator_shape = (image.shape[0], gap, image.shape[2])
+            else:
+                raise ValueError(f"Unsupported axis: {axis}")
+            separator = np.full(separator_shape, GAP_COLOR, dtype=np.uint8)
+            joined.append(separator)
+        joined.append(image)
+    return np.concatenate(joined, axis=axis)
 
 
 if __name__ == "__main__":
