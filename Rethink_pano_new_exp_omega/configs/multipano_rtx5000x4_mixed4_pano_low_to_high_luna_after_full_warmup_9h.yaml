@@ -84,7 +84,7 @@ supervision:
   camera_translation_normalization: target_rms
   camera_translation_normalization_eps: 1.0
   camera_translation_min_baseline_m: 0.05
-  camera_depth_scale_alignment: false
+  camera_depth_scale_alignment: true
   camera_position_mode: relative_anchor
 
 optimization:
