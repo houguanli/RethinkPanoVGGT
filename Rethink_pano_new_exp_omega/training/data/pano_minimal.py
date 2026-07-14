@@ -59,6 +59,7 @@ _MP3D_WORLD_TO_OPENCV = np.asarray(
 )
 _S3D_WORLD_TO_OPENCV = _MP3D_WORLD_TO_OPENCV
 _STANFORD_WORLD_TO_OPENCV = _MP3D_WORLD_TO_OPENCV
+_CAMERA_SUPERVISED_DATASETS = {"Panocity", "PanoCity", "Stanford2D3DS"}
 
 
 class MixedPanoDataset(Dataset):
@@ -801,6 +802,7 @@ def _item(
         raw_rotation,
         bool(rotation_valid and rotation_c2w is not None),
     )
+    camera_supervision_enabled = sequence_name in _CAMERA_SUPERVISED_DATASETS
     return {
         "dataset": sequence_name,
         "sequence_name": sequence_name,
@@ -810,9 +812,11 @@ def _item(
         "depth_path": depth_path,
         "pano_position_m": position,
         "pano_position_valid": bool(position_valid),
-        "pano_translation_valid": bool(position_valid if translation_valid is None else translation_valid),
+        "pano_translation_valid": bool(
+            camera_supervision_enabled and (position_valid if translation_valid is None else translation_valid)
+        ),
         "pano_rotation_c2w": erp_rotation,
-        "pano_rotation_valid": erp_rotation_valid,
+        "pano_rotation_valid": bool(camera_supervision_enabled and erp_rotation_valid),
         "pano_rotation_raw_c2w": raw_rotation,
         "pano_rotation_raw_valid": bool(rotation_valid and rotation_c2w is not None),
         "output_depth_scale": scale,

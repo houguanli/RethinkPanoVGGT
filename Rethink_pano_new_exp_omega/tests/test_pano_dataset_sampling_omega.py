@@ -13,7 +13,7 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(THIS_DIR))
 
 from training.data import PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E402
-from training.data.pano_minimal import _read_pose_position_rotation, _read_structured3d_position  # noqa: E402
+from training.data.pano_minimal import _item, _read_pose_position_rotation, _read_structured3d_position  # noqa: E402
 from training.train_pano_omega import write_smoke_dataset  # noqa: E402
 
 
@@ -171,6 +171,27 @@ def test_structured3d_keeps_positions_but_disables_translation_supervision():
         sample = dataset[0]
         assert sample["pano_position_valid"].all()
         assert not sample["pano_translation_valid"].any()
+
+
+def test_camera_supervision_dataset_allowlist():
+    allowed = {"Panocity", "Stanford2D3DS"}
+    for dataset_name in ("Panocity", "Stanford2D3DS", "Matterport3D", "Structured3D"):
+        item = _item(
+            dataset_name,
+            f"{dataset_name}_sample",
+            Path("rgb.png"),
+            Path("depth.png"),
+            [1.0, 2.0, 3.0],
+            1000.0,
+            position_valid=True,
+            translation_valid=True,
+            rotation_c2w=np.eye(3, dtype=np.float32).tolist(),
+            rotation_valid=True,
+        )
+        expected = dataset_name in allowed
+        assert bool(item["pano_translation_valid"]) is expected
+        assert bool(item["pano_rotation_valid"]) is expected
+        assert bool(item["pano_rotation_raw_valid"])
 
 
 def _scene_key(dataset: PanoMinimalDataset, item_index: int) -> str:
