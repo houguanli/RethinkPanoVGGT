@@ -572,8 +572,14 @@ def _index_matterport3d(root: Path, split: str, scale: float) -> List[Dict]:
                     position,
                     scale,
                     position_valid=position_valid,
+                    # The processed Matterport ERP images are built from remapped
+                    # skybox/depth faces, while pano_poses stores a raw Matterport
+                    # camera frame. Until the fixed image-to-camera transform is
+                    # verified, keep Matterport in depth training but exclude it
+                    # from pano-level camera supervision.
+                    translation_valid=False,
                     rotation_c2w=rotation,
-                    rotation_valid=rotation_valid,
+                    rotation_valid=False,
                     scene_group_key=_join_scene_key("Matterport3D", scan, actual_room_id),
                 )
             )

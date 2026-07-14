@@ -108,6 +108,8 @@ def test_minimal_matterport_groups_use_official_room_membership():
         }
         for group in dataset.groups:
             assert len({_scene_key(dataset, item_index) for item_index in group}) == 1
+        assert all(not bool(item["pano_translation_valid"]) for item in dataset.items)
+        assert all(not bool(item["pano_rotation_valid"]) for item in dataset.items)
 
 
 def test_minimal_matterport_pose_is_converted_to_opencv():
