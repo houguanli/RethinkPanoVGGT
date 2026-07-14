@@ -260,6 +260,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum translation normalization scale in meters.",
     )
     parser.add_argument(
+        "--camera-translation-min-baseline-m",
+        type=float,
+        default=0.05,
+        help="Ignore pano camera translation pairs whose GT baseline is shorter than this many meters.",
+    )
+    parser.add_argument(
         "--camera-supervision-mode",
         choices=["auto", "none", "window_pose", "pano_relative"],
         default="window_pose",
@@ -402,13 +408,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-camera-depth-scale-alignment",
         dest="camera_depth_scale_alignment",
         action="store_false",
-        default=True,
-        help="Do not apply the same per-sample depth scale to camera translation predictions.",
+        default=False,
+        help="Do not apply the per-sample depth alignment scale to camera translation predictions.",
     )
     parser.add_argument(
         "--camera-depth-scale-alignment",
         dest="camera_depth_scale_alignment",
         action="store_true",
+        help=(
+            "Apply the per-sample depth alignment scale to camera translation predictions. "
+            "Off by default because Omega pano pose is already supervised in the GT pose metric."
+        ),
     )
     parser.add_argument("--loss-sample-weighting", dest="loss_sample_weighting", action="store_true", default=True)
     parser.add_argument("--no-loss-sample-weighting", dest="loss_sample_weighting", action="store_false")
@@ -638,7 +648,8 @@ def train(args: argparse.Namespace) -> None:
             "[INFO] camera_supervision = "
             f"{args.camera_supervision_mode} position={args.camera_position_mode} "
             f"weight={args.camera_loss_weight} "
-            f"translation_norm={args.camera_translation_normalization}",
+            f"translation_norm={args.camera_translation_normalization} "
+            f"translation_min_baseline_m={args.camera_translation_min_baseline_m}",
             dist_state,
         )
         if args.camera_supervision_mode == "pano_relative":
@@ -1340,6 +1351,7 @@ LOSS_STAGE_OVERRIDE_KEYS = (
     "pano_translation_consistency_weight",
     "camera_translation_normalization",
     "camera_translation_normalization_eps",
+    "camera_translation_min_baseline_m",
     "global_point_loss_weight",
 )
 
@@ -1846,6 +1858,7 @@ def train_step(
             pano_consistency_weight=args.pano_translation_consistency_weight,
             translation_normalization=args.camera_translation_normalization,
             translation_normalization_eps=args.camera_translation_normalization_eps,
+            translation_min_baseline_m=args.camera_translation_min_baseline_m,
             pred_translation_scale=(
                 (base_depth_scale.detach() * sample_depth_scale)
                 if args.camera_depth_scale_alignment and args.depth_scale_alignment != "none"
@@ -3138,6 +3151,7 @@ def camera_alignment_loss(
     pano_consistency_weight: float = 0.1,
     translation_normalization: str = "none",
     translation_normalization_eps: float = 1.0,
+    translation_min_baseline_m: float = 0.05,
     pred_translation_scale: torch.Tensor | None = None,
 ) -> Dict[str, torch.Tensor]:
     pred_pose = predictions.get("pose_enc")
@@ -3183,6 +3197,7 @@ def camera_alignment_loss(
             position_mode=position_mode,
             translation_normalization=translation_normalization,
             translation_normalization_eps=translation_normalization_eps,
+            translation_min_baseline_m=translation_min_baseline_m,
         )
         zero = pred_center.new_zeros(())
         return {
@@ -3269,6 +3284,7 @@ def pano_relative_pose_loss(
     position_mode: str,
     translation_normalization: str,
     translation_normalization_eps: float,
+    translation_min_baseline_m: float,
 ) -> Dict[str, torch.Tensor]:
     """Supervise one predicted camera center and rotation per panorama."""
     targets = build_relative_pano_pose_targets(
@@ -3312,6 +3328,7 @@ def pano_relative_pose_loss(
         position_valid=position_valid,
         translation_normalization=translation_normalization,
         translation_normalization_eps=translation_normalization_eps,
+        translation_min_baseline_m=translation_min_baseline_m,
     )
     _anchor_loss_r, _anchor_rotation_deg, rotation_deg_map, rotation_valid_mask = pano_rotation_geodesic_loss(
         pred_quat=pred_quat,
@@ -3327,6 +3344,7 @@ def pano_relative_pose_loss(
         rotation_valid=rotation_valid,
         translation_normalization=translation_normalization,
         translation_normalization_eps=translation_normalization_eps,
+        translation_min_baseline_m=translation_min_baseline_m,
     )
     loss_t = distributed_masked_mean(
         pair_errors["translation_loss"],
@@ -3349,7 +3367,7 @@ def pano_relative_pose_loss(
         "loss_camera_r": loss_r,
         "camera_rotation_deg": rotation_deg.detach(),
         "camera_translation_deg": translation_deg.detach(),
-        "camera_translation_valid_count": pair_errors["translation_angle_valid"].sum().to(dtype=pred_center.dtype),
+        "camera_translation_valid_count": pair_errors["translation_valid"].sum().to(dtype=pred_center.dtype),
         "camera_rotation_valid_count": pair_errors["rotation_valid"].sum().to(dtype=pred_center.dtype),
         "_camera_diag_translation_loss": translation_loss_map.detach(),
         "_camera_diag_translation_l2_m": translation_l2_m.detach(),
@@ -3369,6 +3387,7 @@ def pano_pairwise_pose_error_maps(
     rotation_valid: torch.Tensor,
     translation_normalization: str,
     translation_normalization_eps: float,
+    translation_min_baseline_m: float,
 ) -> Dict[str, torch.Tensor]:
     """Return PanoVGGT-style errors for every ordered relative camera pair."""
     if pred_center.ndim != 3 or pred_center.shape[1] < 2:
@@ -3390,6 +3409,7 @@ def pano_pairwise_pose_error_maps(
     target_delta = target_center[:, None, :, :] - target_center[:, :, None, :]
     pred_translation = torch.matmul(pred_w2c[:, :, None], pred_delta[..., None])[..., 0]
     target_translation = torch.matmul(target_w2c[:, :, None], target_delta[..., None])[..., 0]
+    target_norm = torch.linalg.vector_norm(target_translation, dim=-1)
 
     pred_relative_rotation = pred_w2c[:, :, None] @ pred_w2c.transpose(-1, -2)[:, None, :]
     target_relative_rotation = target_w2c[:, :, None] @ target_w2c.transpose(-1, -2)[:, None, :]
@@ -3400,6 +3420,7 @@ def pano_pairwise_pose_error_maps(
         position_valid.to(device=pred_center.device).bool()[:, :, None]
         & position_valid.to(device=pred_center.device).bool()[:, None, :]
         & off_diagonal
+        & (target_norm >= max(float(translation_min_baseline_m), 0.0))
     )
     rotation_pair_valid = (
         rotation_valid.to(device=pred_center.device).bool()[:, :, None]
@@ -3421,13 +3442,12 @@ def pano_pairwise_pose_error_maps(
         reduction="none",
     ).mean(dim=-1)
 
-    target_norm = torch.linalg.vector_norm(target_translation, dim=-1)
     pred_norm = torch.linalg.vector_norm(pred_translation, dim=-1)
     cosine = (pred_translation * target_translation).sum(dim=-1) / (
         pred_norm.clamp_min(1e-8) * target_norm.clamp_min(1e-8)
     )
     translation_deg = torch.acos(cosine.clamp(-1.0, 1.0)) * (180.0 / math.pi)
-    translation_angle_valid = translation_valid & (target_norm > 1e-8)
+    translation_angle_valid = translation_valid
 
     rotation_delta = pred_relative_rotation.transpose(-1, -2) @ target_relative_rotation
     trace = torch.diagonal(rotation_delta, dim1=-2, dim2=-1).sum(dim=-1)
@@ -3451,6 +3471,7 @@ def pano_center_error_maps(
     position_valid: torch.Tensor,
     translation_normalization: str,
     translation_normalization_eps: float,
+    translation_min_baseline_m: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     zero_map = pred_center[..., 0] * 0.0
     false_valid = torch.zeros(pred_center.shape[:2], device=pred_center.device, dtype=torch.bool)
@@ -3461,6 +3482,8 @@ def pano_center_error_maps(
         return zero_map, zero_map.detach(), zero_map.detach(), false_valid
     valid = valid.clone()
     valid[:, 0] = False
+    target_norm = torch.linalg.vector_norm(target_center, dim=-1)
+    valid = valid & (target_norm >= max(float(translation_min_baseline_m), 0.0))
     scale = camera_translation_normalization_scale(
         target_center,
         mode=translation_normalization,
@@ -3486,6 +3509,7 @@ def pano_center_loss(
     position_valid: torch.Tensor,
     translation_normalization: str,
     translation_normalization_eps: float,
+    translation_min_baseline_m: float = 0.05,
 ) -> torch.Tensor:
     per_pano, _, _, valid = pano_center_error_maps(
         pred_center=pred_center,
@@ -3493,6 +3517,7 @@ def pano_center_loss(
         position_valid=position_valid,
         translation_normalization=translation_normalization,
         translation_normalization_eps=translation_normalization_eps,
+        translation_min_baseline_m=translation_min_baseline_m,
     )
     return distributed_masked_mean(per_pano, valid)
 
