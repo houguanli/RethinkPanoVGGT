@@ -138,9 +138,9 @@ else
     --checkpoint "$BASE_CHECKPOINT" \
     --pred-depth-scale "$PRED_DEPTH_SCALE" \
     --depth-loss-mode log_huber \
-    --depth-scale-alignment sample_lstsq \
+    --depth-scale-alignment sample_l1_depth_weighted \
     --depth-scale-alignment-min 0.05 \
-    --depth-scale-alignment-max 50.0 \
+    --depth-scale-alignment-max 1000000.0 \
     --no-inherit-checkpoint-training-defaults \
     "${EXTRA_TRAIN_ARGS_ARRAY[@]}" \
     2>&1 | tee -a "$WARMUP_OUT/train_3h.log"
@@ -182,9 +182,9 @@ PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   --checkpoint "$WARMUP_CKPT" \
   --pred-depth-scale "$PRED_DEPTH_SCALE" \
   --depth-loss-mode log_huber \
-  --depth-scale-alignment sample_lstsq \
+  --depth-scale-alignment sample_l1_depth_weighted \
   --depth-scale-alignment-min 0.05 \
-  --depth-scale-alignment-max 50.0 \
+  --depth-scale-alignment-max 1000000.0 \
   --no-inherit-checkpoint-training-defaults \
   "${EXTRA_TRAIN_ARGS_ARRAY[@]}" \
   2>&1 | tee -a "$LUNA_OUT/train_luna.log"

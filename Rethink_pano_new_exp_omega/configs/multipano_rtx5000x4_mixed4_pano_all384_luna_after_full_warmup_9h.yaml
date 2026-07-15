@@ -50,9 +50,9 @@ supervision:
   depth_loss_mode: log_huber
   depth_log_error_clip: 0.5
   depth_log_huber_delta: 0.2
-  depth_scale_alignment: sample_lstsq
+  depth_scale_alignment: sample_l1_depth_weighted
   depth_scale_alignment_min: 0.05
-  depth_scale_alignment_max: 50.0
+  depth_scale_alignment_max: 1000000.0
   loss_sample_weighting: true
   min_window_valid_ratio: 0.05
   valid_ratio_loss_power: 0.5

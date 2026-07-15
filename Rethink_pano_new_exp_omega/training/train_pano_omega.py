@@ -404,16 +404,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--depth-scale-alignment",
-        choices=["none", "sample_lstsq", "sample_log_median"],
+        choices=["none", "sample_lstsq", "sample_log_median", "sample_l1", "sample_l1_depth_weighted"],
         default="none",
         help=(
-            "Per-sample scale alignment for depth supervision. sample_lstsq follows the "
-            "PanoVGGT/VGGT scale-normalized geometry protocol by fitting one optimal "
-            "stop-gradient scale per training sample before computing depth loss."
+            "Per-sample scale alignment for depth supervision. sample_l1_depth_weighted "
+            "uses a PanoVGGT-like robust L1 scale solve with inverse-depth weighting."
         ),
     )
     parser.add_argument("--depth-scale-alignment-min", type=float, default=0.05)
-    parser.add_argument("--depth-scale-alignment-max", type=float, default=50.0)
+    parser.add_argument("--depth-scale-alignment-max", type=float, default=1e6)
     parser.add_argument("--depth-scale-alignment-eps", type=float, default=1e-6)
     parser.add_argument(
         "--no-camera-depth-scale-alignment",
@@ -478,6 +477,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-stats-every", type=int, default=50)
     parser.add_argument("--camera-error-thresholds-deg", type=str, default="5,10,15,30,45,60,90")
     parser.add_argument("--camera-error-example-limit", type=int, default=64)
+    parser.add_argument("--depth-scale-diagnostics", dest="depth_scale_diagnostics", action="store_true", default=True)
+    parser.add_argument("--no-depth-scale-diagnostics", dest="depth_scale_diagnostics", action="store_false")
+    parser.add_argument("--depth-scale-diagnostics-csv", type=Path, default=None)
+    parser.add_argument(
+        "--depth-scale-diagnostics-scale-threshold",
+        type=float,
+        default=None,
+        help="Write depth-scale diagnostic rows whose per-sample alignment scale reaches this value. Defaults near max.",
+    )
+    parser.add_argument(
+        "--depth-scale-diagnostics-loss-threshold",
+        type=float,
+        default=1.0,
+        help="Write depth-scale diagnostic rows whose per-sample depth loss reaches this value.",
+    )
     parser.add_argument("--loss-plot", type=Path, default=None)
     parser.add_argument("--tensorboard-dir", type=Path, default=None)
     parser.add_argument("--tensorboard", dest="tensorboard", action="store_true", default=True)
@@ -753,6 +767,7 @@ def train(args: argparse.Namespace) -> None:
         barrier(dist_state)
         log_csv = args.log_csv or (args.output_dir / "loss.csv")
         camera_stats_json = args.camera_stats_json or (args.output_dir / "camera_error_stats.json")
+        depth_scale_diag_csv = args.depth_scale_diagnostics_csv or (args.output_dir / "depth_scale_outliers.csv")
         camera_stats = CameraErrorStats(
             thresholds_deg=parse_float_list(args.camera_error_thresholds_deg),
             example_limit=args.camera_error_example_limit,
@@ -761,6 +776,8 @@ def train(args: argparse.Namespace) -> None:
         tensorboard_dir = args.tensorboard_dir or (args.output_dir / "tensorboard")
         tensorboard_writer = create_tensorboard_writer(tensorboard_dir, dist_state, enabled=args.tensorboard)
         rank0_print(f"[INFO] camera_stats_json = {camera_stats_json}", dist_state)
+        if args.depth_scale_diagnostics:
+            rank0_print(f"[INFO] depth_scale_diagnostics_csv = {depth_scale_diag_csv}", dist_state)
         max_duration_seconds = args.max_duration_minutes * 60.0 if args.max_duration_minutes > 0 else None
         started_at = time.time()
         metrics_history = []
@@ -837,8 +854,16 @@ def train(args: argparse.Namespace) -> None:
                     stage_name=active_stage_name,
                     dist_state=dist_state,
                 )
-                camera_records = gather_camera_diag_records(local_camera_records, dist_state)
-                loss_dict = strip_camera_diag_tensors(loss_dict)
+                local_depth_scale_records = depth_scale_diag_records_from_batch(
+                    loss_dict=loss_dict,
+                    batch=batch,
+                    global_step=global_step,
+                    stage_name=active_stage_name,
+                    args=args,
+                )
+                camera_records = gather_diag_records(local_camera_records, dist_state)
+                depth_scale_records = gather_diag_records(local_depth_scale_records, dist_state)
+                loss_dict = strip_diag_tensors(loss_dict)
                 loss_dict = reduce_loss_dict(loss_dict, dist_state)
                 elapsed_seconds = time.time() - started_at
                 sampler_status = current_sampler_status(unwrap_model(model), args)
@@ -925,6 +950,8 @@ def train(args: argparse.Namespace) -> None:
                         and camera_stats.total_records > 0
                     ):
                         camera_stats.write(camera_stats_json)
+                    if args.depth_scale_diagnostics and depth_scale_records:
+                        append_records_csv(depth_scale_diag_csv, depth_scale_records)
                     metrics_history.append(metrics)
                     append_loss_csv(log_csv, metrics)
                     write_tensorboard_metrics(tensorboard_writer, metrics)
@@ -1862,6 +1889,20 @@ def train_step(
             sample_weight_min=args.sample_weight_min,
             sample_weight_max=args.sample_weight_max,
         )
+        depth_diag_loss_per_sample = masked_depth_loss_per_sample(
+            pred_depth,
+            target_depth,
+            target_valid,
+            mode=args.depth_loss_mode,
+            huber_delta=args.depth_log_huber_delta,
+            error_clip=args.depth_log_error_clip,
+            sample_weight=batch.get("sample_weight") if args.loss_sample_weighting else None,
+            min_window_valid_ratio=args.min_window_valid_ratio,
+            valid_ratio_power=args.valid_ratio_loss_power,
+            sample_weight_min=args.sample_weight_min,
+            sample_weight_max=args.sample_weight_max,
+        )
+        depth_diag_valid_ratio = depth_valid_ratio_per_sample(pred_depth, target_depth, target_valid)
         loss_depth_unfiltered = masked_depth_loss(
             pred_depth,
             target_depth,
@@ -1987,6 +2028,9 @@ def train_step(
         "depth_sample_scale_median": sample_depth_scale.detach().float().median(),
         "depth_sample_scale_min": sample_depth_scale.detach().float().min(),
         "depth_sample_scale_max": sample_depth_scale.detach().float().max(),
+        "_depth_diag_sample_scale": sample_depth_scale.detach().float(),
+        "_depth_diag_loss_depth": depth_diag_loss_per_sample.detach().float(),
+        "_depth_diag_valid_ratio": depth_diag_valid_ratio.detach().float(),
         "pred_depth_scale": logged_pred_depth_scale,
         **{key: value.detach() for key, value in global_point_dict.items() if key != "loss_global_point"},
         **{key: value.detach() for key, value in loss_camera_dict.items() if key != "loss_camera"},
@@ -2308,6 +2352,19 @@ def append_loss_csv(path: Path, metrics: Dict[str, float]) -> None:
         writer.writerow(metrics)
 
 
+def append_records_csv(path: Path, records: Sequence[Dict[str, Any]]) -> None:
+    if not records:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(records[0].keys())
+    write_header = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(records)
+
+
 def parse_float_list(value: str | Sequence[float]) -> Tuple[float, ...]:
     if isinstance(value, str):
         items = [item.strip() for item in value.split(",") if item.strip()]
@@ -2318,11 +2375,15 @@ def parse_float_list(value: str | Sequence[float]) -> Tuple[float, ...]:
     return tuple(sorted(set(parsed))) or (5.0, 10.0, 15.0, 30.0, 45.0, 60.0, 90.0)
 
 
-def strip_camera_diag_tensors(loss_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    return {key: value for key, value in loss_dict.items() if not key.startswith("_camera_diag_")}
+def strip_diag_tensors(loss_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {
+        key: value
+        for key, value in loss_dict.items()
+        if not (key.startswith("_camera_diag_") or key.startswith("_depth_diag_"))
+    }
 
 
-def gather_camera_diag_records(
+def gather_diag_records(
     records: list[Dict[str, Any]],
     dist_state: Dict[str, int | bool],
 ) -> list[Dict[str, Any]]:
@@ -2335,6 +2396,114 @@ def gather_camera_diag_records(
         if item:
             merged.extend(item)
     return merged
+
+
+def depth_scale_diag_records_from_batch(
+    loss_dict: Dict[str, torch.Tensor],
+    batch: Dict[str, Any],
+    global_step: int,
+    stage_name: str,
+    args: argparse.Namespace,
+) -> list[Dict[str, Any]]:
+    if not bool(getattr(args, "depth_scale_diagnostics", True)):
+        return []
+    sample_scale = _diag_1d(loss_dict.get("_depth_diag_sample_scale"))
+    sample_loss = _diag_1d(loss_dict.get("_depth_diag_loss_depth"))
+    sample_valid_ratio = _diag_1d(loss_dict.get("_depth_diag_valid_ratio"))
+    if sample_scale is None:
+        return []
+    batch_size = len(sample_scale)
+    pano_count = _infer_pano_count(batch)
+    scale_threshold = getattr(args, "depth_scale_diagnostics_scale_threshold", None)
+    if scale_threshold is None:
+        scale_threshold = max(float(args.depth_scale_alignment_max) - 1e-3, float(args.depth_scale_alignment_max) * 0.999)
+    loss_threshold = float(getattr(args, "depth_scale_diagnostics_loss_threshold", 1.0))
+
+    sample_loss = _ensure_1d(sample_loss, batch_size, fill=0.0)
+    sample_valid_ratio = _ensure_1d(sample_valid_ratio, batch_size, fill=0.0)
+    sequence_names = normalize_collated_string_matrix(batch.get("sequence_name"), batch_size, pano_count)
+    scene_names = normalize_collated_string_matrix(batch.get("scene_name"), batch_size, pano_count, split_pipe=True)
+    rgb_paths = normalize_collated_string_matrix(batch.get("rgb_path"), batch_size, pano_count)
+    depth_paths = normalize_collated_string_matrix(batch.get("depth_path"), batch_size, pano_count)
+
+    records: list[Dict[str, Any]] = []
+    for batch_index in range(batch_size):
+        scale = sample_scale[batch_index]
+        loss_depth = sample_loss[batch_index]
+        if scale < scale_threshold and loss_depth < loss_threshold:
+            continue
+        sequence_row = sequence_names[batch_index]
+        scene_row = scene_names[batch_index]
+        rgb_row = rgb_paths[batch_index]
+        depth_row = depth_paths[batch_index]
+        datasets = [canonical_dataset_name(value) for value in sequence_row]
+        if all(dataset == "unknown" for dataset in datasets):
+            datasets = [canonical_dataset_name(value) for value in scene_row]
+        dataset = "|".join(_unique_ordered(datasets))
+        records.append(
+            {
+                "step": int(global_step),
+                "stage": str(stage_name),
+                "batch_index": int(batch_index),
+                "pano_count": int(pano_count),
+                "dataset": dataset,
+                "sequence_name": "|".join(sequence_row),
+                "scene_name": "|".join(scene_row),
+                "rgb_path": "|".join(rgb_row),
+                "depth_path": "|".join(depth_row),
+                "depth_sample_scale": scale,
+                "loss_depth_sample": loss_depth,
+                "depth_valid_ratio_sample": sample_valid_ratio[batch_index],
+                "depth_scale_alignment_mode": str(args.depth_scale_alignment),
+                "depth_scale_alignment_max": float(args.depth_scale_alignment_max),
+                "pred_depth_scale": _loss_scalar(loss_dict, "pred_depth_scale"),
+                "loss_depth_batch": _loss_scalar(loss_dict, "loss_depth"),
+                "loss_camera_t_batch": _loss_scalar(loss_dict, "loss_camera_t"),
+                "camera_translation_deg_batch": _loss_scalar(loss_dict, "camera_translation_deg"),
+                "camera_translation_valid_count": _loss_scalar(loss_dict, "camera_translation_valid_count"),
+                "camera_rotation_valid_count": _loss_scalar(loss_dict, "camera_rotation_valid_count"),
+            }
+        )
+    return records
+
+
+def _diag_1d(value: torch.Tensor | None) -> list[float] | None:
+    if value is None or not torch.is_tensor(value):
+        return None
+    item = value.detach().float().cpu().reshape(-1)
+    return [_finite_or_none(float(cell)) or 0.0 for cell in item.tolist()]
+
+
+def _ensure_1d(value: list[float] | None, size: int, fill: float) -> list[float]:
+    result = [float(fill) for _ in range(size)]
+    if value is None:
+        return result
+    for idx in range(min(size, len(value))):
+        result[idx] = float(value[idx])
+    return result
+
+
+def _infer_pano_count(batch: Dict[str, Any]) -> int:
+    images = batch.get("pano_image")
+    if torch.is_tensor(images) and images.ndim >= 5:
+        return int(images.shape[1])
+    raw = batch.get("sequence_name")
+    if isinstance(raw, (list, tuple)) and raw:
+        if isinstance(raw[0], (list, tuple)):
+            return len(raw)
+        return len(raw)
+    return 1
+
+
+def _unique_ordered(values: Iterable[Any]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = stringify_nested(value)
+        if text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
 
 
 def camera_diag_records_from_batch(
@@ -2839,13 +3008,13 @@ def estimate_sample_depth_alignment_scale(
     valid_mask: torch.Tensor | None = None,
     mode: str = "none",
     min_scale: float = 0.05,
-    max_scale: float = 50.0,
+    max_scale: float = 1e6,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     batch_size = pred_depth.shape[0]
     if mode == "none":
         return pred_depth.new_ones(batch_size)
-    if mode not in {"sample_lstsq", "sample_log_median"}:
+    if mode not in {"sample_lstsq", "sample_log_median", "sample_l1", "sample_l1_depth_weighted"}:
         raise ValueError(f"Unknown depth-scale-alignment mode: {mode}")
 
     pred = pred_depth.detach().float()
@@ -2868,7 +3037,7 @@ def estimate_sample_depth_alignment_scale(
         scale = numerator / denominator
         has_valid = valid_flat.any(dim=1)
         scale = torch.where(has_valid, scale, torch.ones_like(scale))
-    else:
+    elif mode == "sample_log_median":
         scales = []
         for item_pred, item_target, item_valid in zip(pred_flat, target_flat, valid_flat):
             if bool(item_valid.any()):
@@ -2877,9 +3046,60 @@ def estimate_sample_depth_alignment_scale(
             else:
                 scales.append(item_pred.new_tensor(1.0))
         scale = torch.stack(scales, dim=0)
+    else:
+        depth_weighted = mode == "sample_l1_depth_weighted"
+        scales = []
+        for item_pred, item_target, item_valid in zip(pred_flat, target_flat, valid_flat):
+            scales.append(
+                robust_l1_depth_scale(
+                    item_pred,
+                    item_target,
+                    item_valid,
+                    depth_weighted=depth_weighted,
+                    eps=eps,
+                )
+            )
+        scale = torch.stack(scales, dim=0)
 
     scale = torch.nan_to_num(scale, nan=1.0, posinf=max_scale, neginf=min_scale)
     return scale.clamp(min=min_scale, max=max_scale).to(device=pred_depth.device, dtype=pred_depth.dtype)
+
+
+def robust_l1_depth_scale(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    depth_weighted: bool = True,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Solve min_s sum_i w_i |s * pred_i - target_i| with a weighted median.
+
+    PanoVGGT aligns local 3D points with an L1 scale solve before computing point
+    loss. For depth-only supervision the equivalent scale-only L1 objective has a
+    closed-form weighted median over target/pred ratios, with effective weights
+    pred_i * w_i.
+    """
+    if not bool(valid.any()):
+        return pred.new_tensor(1.0)
+    pred_valid = pred[valid].float().clamp_min(eps)
+    target_valid = target[valid].float().clamp_min(eps)
+    ratio = (target_valid / pred_valid).clamp_min(eps)
+    effective_weight = pred_valid
+    if depth_weighted:
+        radial = target_valid.sqrt()
+        mean_radial = radial.mean().clamp_min(eps)
+        radial = radial.clamp_min(0.1 * mean_radial)
+        effective_weight = effective_weight / radial.clamp_min(eps)
+    order = torch.argsort(ratio)
+    sorted_ratio = ratio[order]
+    sorted_weight = effective_weight[order].clamp_min(0.0)
+    total_weight = sorted_weight.sum()
+    if not torch.isfinite(total_weight) or float(total_weight.item()) <= eps:
+        return pred.new_tensor(1.0)
+    cutoff = 0.5 * total_weight
+    cdf = sorted_weight.cumsum(dim=0)
+    median_index = torch.searchsorted(cdf, cutoff).clamp_max(sorted_ratio.numel() - 1)
+    return sorted_ratio[median_index]
 
 
 def expand_sample_scale_like(scale: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -2978,6 +3198,93 @@ def masked_depth_loss(
     if not bool((window_weight > 0).any()):
         return (0.0 * pred_depth).sum()
     return (per_window_loss * window_weight).sum() / window_weight.sum().clamp_min(1e-6)
+
+
+def masked_depth_loss_per_sample(
+    pred_depth: torch.Tensor,
+    target_depth: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    mode: str = "log_l1",
+    huber_delta: float = 0.2,
+    error_clip: float = 0.5,
+    sample_weight: torch.Tensor | None = None,
+    min_window_valid_ratio: float = 0.0,
+    valid_ratio_power: float = 0.0,
+    sample_weight_min: float = 0.0,
+    sample_weight_max: float = 10.0,
+) -> torch.Tensor:
+    pred_depth = pred_depth.float()
+    target_depth = target_depth.to(device=pred_depth.device, dtype=torch.float32)
+    batch_size = int(pred_depth.shape[0]) if pred_depth.ndim > 0 else 1
+    valid = torch.isfinite(pred_depth) & torch.isfinite(target_depth) & (target_depth > 0)
+    if valid_mask is not None:
+        valid = valid & valid_mask.to(device=target_depth.device, dtype=torch.bool)
+    if not bool(valid.any()):
+        return pred_depth.new_zeros(batch_size, dtype=torch.float32)
+
+    log_abs_error = torch.zeros_like(pred_depth, dtype=torch.float32)
+    log_abs_error[valid] = (
+        torch.log(pred_depth[valid].clamp_min(1e-4))
+        - torch.log(target_depth[valid].clamp_min(1e-4))
+    ).abs()
+    if mode == "log_l1":
+        per_pixel_loss = log_abs_error
+    elif mode == "log_huber":
+        delta = max(float(huber_delta), 1e-6)
+        per_pixel_loss = torch.where(
+            log_abs_error < delta,
+            0.5 * log_abs_error.square() / delta,
+            log_abs_error - 0.5 * delta,
+        )
+    elif mode == "clipped_log_l1":
+        clip_value = max(float(error_clip), 1e-6)
+        per_pixel_loss = log_abs_error.clamp_max(clip_value)
+    else:
+        raise ValueError(f"Unknown depth loss mode: {mode}")
+
+    valid_float = valid.to(dtype=torch.float32)
+    reduce_dims = tuple(range(2, per_pixel_loss.ndim))
+    per_window_loss = per_pixel_loss.sum(dim=reduce_dims) / valid_float.sum(dim=reduce_dims).clamp_min(1.0)
+    window_valid_ratio = valid_float.mean(dim=reduce_dims)
+    window_weight = torch.ones_like(per_window_loss)
+    min_ratio = max(float(min_window_valid_ratio), 0.0)
+    if min_ratio > 0:
+        window_weight = window_weight * (window_valid_ratio >= min_ratio).to(dtype=window_weight.dtype)
+    power = max(float(valid_ratio_power), 0.0)
+    if power > 0:
+        window_weight = window_weight * window_valid_ratio.clamp_min(1e-6).pow(power)
+    if sample_weight is not None:
+        window_weight = window_weight * _expand_sample_weight(
+            sample_weight,
+            per_window_loss,
+            sample_weight_min=sample_weight_min,
+            sample_weight_max=sample_weight_max,
+        )
+
+    if per_window_loss.ndim == 1:
+        per_window_loss = per_window_loss.reshape(batch_size, -1)
+        window_weight = window_weight.reshape(batch_size, -1)
+    elif per_window_loss.ndim > 2:
+        per_window_loss = per_window_loss.reshape(batch_size, -1)
+        window_weight = window_weight.reshape(batch_size, -1)
+    weighted = per_window_loss * window_weight
+    denom = window_weight.sum(dim=1).clamp_min(1e-6)
+    return weighted.sum(dim=1) / denom
+
+
+def depth_valid_ratio_per_sample(
+    pred_depth: torch.Tensor,
+    target_depth: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    pred_depth = pred_depth.float()
+    target_depth = target_depth.to(device=pred_depth.device, dtype=torch.float32)
+    batch_size = int(pred_depth.shape[0]) if pred_depth.ndim > 0 else 1
+    valid = torch.isfinite(pred_depth) & torch.isfinite(target_depth) & (target_depth > 0)
+    if valid_mask is not None:
+        valid = valid & valid_mask.to(device=target_depth.device, dtype=torch.bool)
+    valid_float = valid.to(dtype=torch.float32).reshape(batch_size, -1)
+    return valid_float.mean(dim=1)
 
 
 def _expand_sample_weight(
