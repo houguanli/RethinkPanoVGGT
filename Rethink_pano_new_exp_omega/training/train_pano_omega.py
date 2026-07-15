@@ -193,6 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
             "luna",
             "dense",
             "camera",
+            "pano_camera_head",
             "heads",
             "luna_dense",
             "luna_heads",
@@ -430,6 +431,27 @@ def build_parser() -> argparse.ArgumentParser:
             "Off by default because Omega pano pose is already supervised in the GT pose metric."
         ),
     )
+    parser.add_argument(
+        "--camera-center-residual-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional hinge regularizer for pano_camera_center_residual. "
+            "Keeps the residual from cancelling Omega's detached base pano pose."
+        ),
+    )
+    parser.add_argument(
+        "--camera-center-residual-max-ratio",
+        type=float,
+        default=0.25,
+        help="Allowed residual center norm as a fraction of the detached base center norm before penalty.",
+    )
+    parser.add_argument(
+        "--camera-center-residual-max-abs",
+        type=float,
+        default=0.02,
+        help="Absolute residual center allowance in Omega pose units before penalty.",
+    )
     parser.add_argument("--loss-sample-weighting", dest="loss_sample_weighting", action="store_true", default=True)
     parser.add_argument("--no-loss-sample-weighting", dest="loss_sample_weighting", action="store_false")
     parser.add_argument("--min-window-valid-ratio", type=float, default=0.05)
@@ -660,7 +682,10 @@ def train(args: argparse.Namespace) -> None:
             f"weight={args.camera_loss_weight} "
             f"translation_norm={args.camera_translation_normalization} "
             f"translation_loss={args.camera_translation_loss_mode} "
-            f"translation_min_baseline_m={args.camera_translation_min_baseline_m}",
+            f"translation_min_baseline_m={args.camera_translation_min_baseline_m} "
+            f"center_residual_weight={args.camera_center_residual_weight} "
+            f"center_residual_max_ratio={args.camera_center_residual_max_ratio} "
+            f"center_residual_max_abs={args.camera_center_residual_max_abs}",
             dist_state,
         )
         if args.camera_supervision_mode == "pano_relative":
@@ -839,6 +864,9 @@ def train(args: argparse.Namespace) -> None:
                         loss_dict.get("loss_camera_weighted", torch.tensor(0.0)).item()
                     ),
                     "loss_camera_t": float(loss_dict.get("loss_camera_t", torch.tensor(0.0)).item()),
+                    "loss_camera_center_residual": float(
+                        loss_dict.get("loss_camera_center_residual", torch.tensor(0.0)).item()
+                    ),
                     "loss_camera_r": float(loss_dict.get("loss_camera_r", torch.tensor(0.0)).item()),
                     "loss_camera_fov": float(loss_dict.get("loss_camera_fov", torch.tensor(0.0)).item()),
                     "loss_camera_consistency": float(
@@ -1364,6 +1392,9 @@ LOSS_STAGE_OVERRIDE_KEYS = (
     "camera_translation_normalization_eps",
     "camera_translation_min_baseline_m",
     "camera_translation_loss_mode",
+    "camera_center_residual_weight",
+    "camera_center_residual_max_ratio",
+    "camera_center_residual_max_abs",
     "global_point_loss_weight",
 )
 
@@ -1875,6 +1906,9 @@ def train_step(
                 translation_normalization_eps=args.camera_translation_normalization_eps,
                 translation_loss_mode=args.camera_translation_loss_mode,
                 translation_min_baseline_m=args.camera_translation_min_baseline_m,
+                center_residual_weight=args.camera_center_residual_weight,
+                center_residual_max_ratio=args.camera_center_residual_max_ratio,
+                center_residual_max_abs=args.camera_center_residual_max_abs,
                 pred_translation_scale=(
                     (base_depth_scale.detach().float() * sample_depth_scale.float())
                     if args.camera_depth_scale_alignment and args.depth_scale_alignment != "none"
@@ -3169,6 +3203,9 @@ def camera_alignment_loss(
     translation_normalization_eps: float = 1.0,
     translation_loss_mode: str = "angular",
     translation_min_baseline_m: float = 0.05,
+    center_residual_weight: float = 0.0,
+    center_residual_max_ratio: float = 0.25,
+    center_residual_max_abs: float = 0.02,
     pred_translation_scale: torch.Tensor | None = None,
 ) -> Dict[str, torch.Tensor]:
     pred_pose = predictions.get("pose_enc")
@@ -3178,6 +3215,7 @@ def camera_alignment_loss(
         return {
             "loss_camera": zero,
             "loss_camera_t": zero,
+            "loss_camera_center_residual": zero,
             "loss_camera_r": zero,
             "loss_camera_fov": zero,
             "loss_camera_consistency": zero,
@@ -3217,14 +3255,21 @@ def camera_alignment_loss(
             translation_loss_mode=translation_loss_mode,
             translation_min_baseline_m=translation_min_baseline_m,
         )
+        loss_center_residual = pano_center_residual_regularizer(
+            predictions=predictions,
+            max_ratio=center_residual_max_ratio,
+            max_abs=center_residual_max_abs,
+        )
         zero = pred_center.new_zeros(())
         return {
             "loss_camera": (
                 translation_weight * pano_losses["loss_camera_t"]
                 + rotation_weight * pano_losses["loss_camera_r"]
+                + float(center_residual_weight) * loss_center_residual
             ),
             "loss_camera_fov": zero,
             "loss_camera_consistency": zero,
+            "loss_camera_center_residual": loss_center_residual,
             **pano_losses,
         }
     if supervision_mode != "window_pose":
@@ -3234,6 +3279,7 @@ def camera_alignment_loss(
         return {
             "loss_camera": zero,
             "loss_camera_t": zero,
+            "loss_camera_center_residual": zero,
             "loss_camera_r": zero,
             "loss_camera_fov": zero,
             "loss_camera_consistency": zero,
@@ -3285,6 +3331,7 @@ def camera_alignment_loss(
     return {
         "loss_camera": loss_camera,
         "loss_camera_t": loss_t,
+        "loss_camera_center_residual": pred_translation.new_zeros(()),
         "loss_camera_r": loss_r,
         "loss_camera_fov": loss_fov,
         "loss_camera_consistency": pred_translation.new_zeros(()),
@@ -3293,6 +3340,41 @@ def camera_alignment_loss(
         "camera_translation_valid_count": pred_translation.new_tensor(float(pred_translation.shape[1])),
         "camera_rotation_valid_count": pred_translation.new_tensor(float(pred_translation.shape[1])),
     }
+
+
+def pano_center_residual_regularizer(
+    predictions: Dict,
+    max_ratio: float,
+    max_abs: float,
+) -> torch.Tensor:
+    """Prevent the residual pano camera head from cancelling Omega's base pose.
+
+    The angular translation objective intentionally ignores distance scale, but
+    that makes a near-zero residual-cancelled center an attractive failure mode.
+    This hinge only activates when the residual grows too large relative to the
+    detached base-center magnitude, so small residual corrections stay free.
+    """
+    residual = predictions.get("pano_camera_center_residual")
+    base_center = predictions.get("pano_camera_center_init")
+    if residual is None or base_center is None:
+        depth = predictions.get("depth")
+        if torch.is_tensor(depth):
+            return depth.new_zeros(())
+        raise ValueError("Missing depth tensor for zero-valued residual regularizer.")
+
+    residual = torch.nan_to_num(residual.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    base_center = torch.nan_to_num(base_center.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    residual_norm = torch.linalg.vector_norm(residual, dim=-1)
+    base_norm = torch.linalg.vector_norm(base_center, dim=-1)
+    if residual_norm.ndim != 2:
+        return residual_norm.sum() * 0.0
+
+    valid = torch.isfinite(residual_norm) & torch.isfinite(base_norm) & (base_norm > 1e-6)
+    valid[:, 0] = False
+    allowance = float(max_abs) + max(float(max_ratio), 0.0) * base_norm
+    excess = (residual_norm - allowance).clamp_min(0.0)
+    normalized_excess = excess / base_norm.clamp_min(max(float(max_abs), 1e-3))
+    return distributed_masked_mean(normalized_excess, valid)
 
 
 def pano_relative_pose_loss(
@@ -3881,7 +3963,21 @@ def configure_trainable(model: torch.nn.Module, mode: str) -> Tuple[int, int]:
         }
         train_dense = mode in {"dense", "heads", "luna_dense", "luna_heads", "luna_residual_dense", "luna_residual_heads"}
         train_dense_tail = mode in {"luna_dense_tail", "luna_residual_dense_tail", "luna_residual_tail_heads"}
-        train_camera = mode in {"camera", "heads", "luna_heads", "luna_residual_heads", "luna_residual_tail_heads"}
+        train_window_camera = mode in {
+            "camera",
+            "heads",
+            "luna_heads",
+            "luna_residual_heads",
+            "luna_residual_tail_heads",
+        }
+        train_pano_camera = mode in {
+            "pano_camera_head",
+            "camera",
+            "heads",
+            "luna_heads",
+            "luna_residual_heads",
+            "luna_residual_tail_heads",
+        }
         for name, param in model.named_parameters():
             if train_luna and (
                 "luna_" in name or "pano_global" in name or "pano_geometry" in name
@@ -3891,7 +3987,9 @@ def configure_trainable(model: torch.nn.Module, mode: str) -> Tuple[int, int]:
                 param.requires_grad_(True)
             if train_dense_tail and is_dense_tail_parameter(name):
                 param.requires_grad_(True)
-            if train_camera and "camera_head" in name:
+            if train_window_camera and "camera_head" in name and "pano_camera_head" not in name:
+                param.requires_grad_(True)
+            if train_pano_camera and "pano_camera_head" in name:
                 param.requires_grad_(True)
 
     trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)

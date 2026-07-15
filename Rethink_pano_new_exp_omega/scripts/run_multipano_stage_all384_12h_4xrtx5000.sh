@@ -31,6 +31,11 @@ NUM_YAW="${NUM_YAW:-4}"
 LUNA_CONFIG="${LUNA_CONFIG:-configs/multipano_rtx5000x4_mixed4_pano_all384_luna_after_full_warmup_9h.yaml}"
 LUNA_OUT="${LUNA_OUT:-$LUNA/logs/mixed4_pano_all384_4xrtx5000_multipano_after_full_warmup_9h}"
 SEQ_LOG="${SEQ_LOG:-$LUNA/logs/mixed4_pano_all384_4xrtx5000_multipano_stage_12h_sequence.log}"
+EXTRA_TRAIN_ARGS_ARRAY=()
+if [[ -n "${EXTRA_TRAIN_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  EXTRA_TRAIN_ARGS_ARRAY=($EXTRA_TRAIN_ARGS)
+fi
 
 mkdir -p "$(dirname "$SEQ_LOG")"
 if [[ "${CLEAN_OUTPUT:-0}" == "1" ]]; then
@@ -51,6 +56,7 @@ mkdir -p "$WARMUP_OUT" "$LUNA_OUT"
   echo "[sequence] base_checkpoint=$BASE_CHECKPOINT"
   echo "[sequence] calibration_samples_per_dataset=$CALIB_SAMPLES_PER_DATASET"
   echo "[sequence] num_yaw=$NUM_YAW"
+  echo "[sequence] extra_train_args=${EXTRA_TRAIN_ARGS:-}"
 } | tee -a "$SEQ_LOG"
 
 if [[ "${SKIP_INDEX_BUILD:-0}" != "1" ]]; then
@@ -136,6 +142,7 @@ else
     --depth-scale-alignment-min 0.05 \
     --depth-scale-alignment-max 50.0 \
     --no-inherit-checkpoint-training-defaults \
+    "${EXTRA_TRAIN_ARGS_ARRAY[@]}" \
     2>&1 | tee -a "$WARMUP_OUT/train_3h.log"
   echo "[sequence] stage1 multi-pano Omega warmup low384 finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 fi
@@ -179,6 +186,7 @@ PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   --depth-scale-alignment-min 0.05 \
   --depth-scale-alignment-max 50.0 \
   --no-inherit-checkpoint-training-defaults \
+  "${EXTRA_TRAIN_ARGS_ARRAY[@]}" \
   2>&1 | tee -a "$LUNA_OUT/train_luna.log"
 echo "[sequence] stage2/3 multi-pano LUNA all384 finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 

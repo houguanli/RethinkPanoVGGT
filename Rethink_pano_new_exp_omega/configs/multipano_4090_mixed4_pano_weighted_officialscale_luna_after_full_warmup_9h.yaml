@@ -81,6 +81,9 @@ supervision:
   camera_translation_normalization_eps: 1.0
   camera_translation_min_baseline_m: 0.05
   camera_translation_loss_mode: angular
+  camera_center_residual_weight: 0.5
+  camera_center_residual_max_ratio: 0.25
+  camera_center_residual_max_abs: 0.02
   camera_depth_scale_alignment: true
   camera_position_mode: relative_anchor
 
@@ -101,9 +104,11 @@ optimization:
       weight_decay: 0.05
       optimizer_type: adamw
       camera_loss_weight: 0.25
+      camera_center_residual_weight: 0.5
+      global_point_loss_weight: 0.0
       enable_luna_forward: true
       enable_depth_residual: true
-      train_depth_residual: true
+      train_depth_residual: false
       learn_pred_depth_scale: false
     - name: multipano_residual_low_lr_officialscale_low384
       window_size: 384
@@ -113,6 +118,8 @@ optimization:
       weight_decay: 0.05
       optimizer_type: adamw
       camera_loss_weight: 0.5
+      camera_center_residual_weight: 0.5
+      global_point_loss_weight: 0.05
       enable_luna_forward: true
       enable_depth_residual: true
       train_depth_residual: true
@@ -129,7 +136,7 @@ runtime:
   num_workers: 4
   seed: 45
   max_duration_minutes: 540.0
-  save_every_steps: 5000
+  save_every_steps: 1000
   save_last: true
   checkpoint_format: trainable_delta
   debug_depth_dump: false
