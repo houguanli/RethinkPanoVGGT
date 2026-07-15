@@ -80,7 +80,7 @@ supervision:
   camera_translation_normalization: target_rms
   camera_translation_normalization_eps: 1.0
   camera_translation_min_baseline_m: 0.05
-  camera_translation_loss_mode: angular
+  camera_translation_loss_mode: vector_smooth_l1
   camera_center_residual_weight: 0.5
   camera_center_residual_max_ratio: 0.25
   camera_center_residual_max_abs: 0.02

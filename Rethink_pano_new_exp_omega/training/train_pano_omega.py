@@ -3556,9 +3556,9 @@ def pano_pairwise_pose_error_maps(
     cosine = (pred_translation * target_translation).sum(dim=-1) / (
         pred_norm.clamp_min(1e-8) * target_norm.clamp_min(1e-8)
     )
-    # PanoVGGT/VGGT evaluate translation by baseline direction, not distance.
-    # The metric is sign-invariant, so the angular training loss uses |cos|.
-    # Keep vector_smooth_l1 diagnostics to expose scale/length mistakes.
+    # PanoVGGT evaluates translation by baseline direction, but trains with a
+    # vector loss. Keep the angular branch only for evaluation-style ablations;
+    # the default training objective should be vector_smooth_l1.
     translation_angle_rad = torch.acos(cosine.clamp(-1.0, 1.0).abs())
     translation_deg = translation_angle_rad * (180.0 / math.pi)
     translation_angle_valid = translation_valid
