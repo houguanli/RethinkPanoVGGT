@@ -266,6 +266,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ignore pano camera translation pairs whose GT baseline is shorter than this many meters.",
     )
     parser.add_argument(
+        "--camera-translation-loss-mode",
+        choices=["angular", "vector_smooth_l1"],
+        default="angular",
+        help=(
+            "Translation supervision for pano_relative camera loss. 'angular' matches "
+            "PanoVGGT/VGGT pose evaluation by supervising only relative translation "
+            "direction; 'vector_smooth_l1' also penalizes scale-aligned baseline length."
+        ),
+    )
+    parser.add_argument(
         "--camera-supervision-mode",
         choices=["auto", "none", "window_pose", "pano_relative"],
         default="window_pose",
@@ -649,6 +659,7 @@ def train(args: argparse.Namespace) -> None:
             f"{args.camera_supervision_mode} position={args.camera_position_mode} "
             f"weight={args.camera_loss_weight} "
             f"translation_norm={args.camera_translation_normalization} "
+            f"translation_loss={args.camera_translation_loss_mode} "
             f"translation_min_baseline_m={args.camera_translation_min_baseline_m}",
             dist_state,
         )
@@ -1352,6 +1363,7 @@ LOSS_STAGE_OVERRIDE_KEYS = (
     "camera_translation_normalization",
     "camera_translation_normalization_eps",
     "camera_translation_min_baseline_m",
+    "camera_translation_loss_mode",
     "global_point_loss_weight",
 )
 
@@ -1847,24 +1859,28 @@ def train_step(
                 global_step=global_step,
                 batch=batch,
             )
-        loss_camera_dict = camera_alignment_loss(
-            predictions=predictions,
-            batch=batch,
-            translation_weight=args.camera_translation_weight,
-            rotation_weight=args.camera_rotation_weight,
-            fov_weight=args.camera_fov_weight,
-            position_mode=args.camera_position_mode,
-            supervision_mode=args.camera_supervision_mode,
-            pano_consistency_weight=args.pano_translation_consistency_weight,
-            translation_normalization=args.camera_translation_normalization,
-            translation_normalization_eps=args.camera_translation_normalization_eps,
-            translation_min_baseline_m=args.camera_translation_min_baseline_m,
-            pred_translation_scale=(
-                (base_depth_scale.detach() * sample_depth_scale)
-                if args.camera_depth_scale_alignment and args.depth_scale_alignment != "none"
-                else None
-            ),
-        )
+        # Camera geometry uses small relative vectors and angle masks; keep it
+        # in FP32 even when the model/depth path runs under AMP.
+        with torch.autocast(device_type=pano_images.device.type, enabled=False):
+            loss_camera_dict = camera_alignment_loss(
+                predictions=predictions,
+                batch=batch,
+                translation_weight=args.camera_translation_weight,
+                rotation_weight=args.camera_rotation_weight,
+                fov_weight=args.camera_fov_weight,
+                position_mode=args.camera_position_mode,
+                supervision_mode=args.camera_supervision_mode,
+                pano_consistency_weight=args.pano_translation_consistency_weight,
+                translation_normalization=args.camera_translation_normalization,
+                translation_normalization_eps=args.camera_translation_normalization_eps,
+                translation_loss_mode=args.camera_translation_loss_mode,
+                translation_min_baseline_m=args.camera_translation_min_baseline_m,
+                pred_translation_scale=(
+                    (base_depth_scale.detach().float() * sample_depth_scale.float())
+                    if args.camera_depth_scale_alignment and args.depth_scale_alignment != "none"
+                    else None
+                ),
+            )
         loss_camera = loss_camera_dict["loss_camera"]
         if float(args.global_point_loss_weight) > 0:
             global_point_dict = shared_frame_point_loss(
@@ -3151,6 +3167,7 @@ def camera_alignment_loss(
     pano_consistency_weight: float = 0.1,
     translation_normalization: str = "none",
     translation_normalization_eps: float = 1.0,
+    translation_loss_mode: str = "angular",
     translation_min_baseline_m: float = 0.05,
     pred_translation_scale: torch.Tensor | None = None,
 ) -> Dict[str, torch.Tensor]:
@@ -3197,6 +3214,7 @@ def camera_alignment_loss(
             position_mode=position_mode,
             translation_normalization=translation_normalization,
             translation_normalization_eps=translation_normalization_eps,
+            translation_loss_mode=translation_loss_mode,
             translation_min_baseline_m=translation_min_baseline_m,
         )
         zero = pred_center.new_zeros(())
@@ -3284,6 +3302,7 @@ def pano_relative_pose_loss(
     position_mode: str,
     translation_normalization: str,
     translation_normalization_eps: float,
+    translation_loss_mode: str,
     translation_min_baseline_m: float,
 ) -> Dict[str, torch.Tensor]:
     """Supervise one predicted camera center and rotation per panorama."""
@@ -3346,10 +3365,18 @@ def pano_relative_pose_loss(
         translation_normalization_eps=translation_normalization_eps,
         translation_min_baseline_m=translation_min_baseline_m,
     )
-    loss_t = distributed_masked_mean(
-        pair_errors["translation_loss"],
-        pair_errors["translation_valid"],
-    )
+    if translation_loss_mode == "angular":
+        loss_t = distributed_masked_mean(
+            pair_errors["translation_angle_rad"],
+            pair_errors["translation_angle_valid"],
+        )
+    elif translation_loss_mode == "vector_smooth_l1":
+        loss_t = distributed_masked_mean(
+            pair_errors["translation_loss"],
+            pair_errors["translation_valid"],
+        )
+    else:
+        raise ValueError(f"Unknown camera translation loss mode: {translation_loss_mode}")
     loss_r = distributed_masked_mean(
         pair_errors["rotation_rad"],
         pair_errors["rotation_valid"],
@@ -3396,6 +3423,7 @@ def pano_pairwise_pose_error_maps(
         valid = torch.zeros(shape, device=pred_center.device, dtype=torch.bool)
         return {
             "translation_loss": zero,
+            "translation_angle_rad": zero,
             "translation_deg": zero,
             "translation_valid": valid,
             "translation_angle_valid": valid,
@@ -3446,7 +3474,11 @@ def pano_pairwise_pose_error_maps(
     cosine = (pred_translation * target_translation).sum(dim=-1) / (
         pred_norm.clamp_min(1e-8) * target_norm.clamp_min(1e-8)
     )
-    translation_deg = torch.acos(cosine.clamp(-1.0, 1.0)) * (180.0 / math.pi)
+    # PanoVGGT/VGGT evaluate translation by baseline direction, not distance.
+    # The metric is sign-invariant, so the angular training loss uses |cos|.
+    # Keep vector_smooth_l1 diagnostics to expose scale/length mistakes.
+    translation_angle_rad = torch.acos(cosine.clamp(-1.0, 1.0).abs())
+    translation_deg = translation_angle_rad * (180.0 / math.pi)
     translation_angle_valid = translation_valid
 
     rotation_delta = pred_relative_rotation.transpose(-1, -2) @ target_relative_rotation
@@ -3457,6 +3489,7 @@ def pano_pairwise_pose_error_maps(
     rotation_rad = torch.where(rotation_pair_valid, rotation_rad, torch.zeros_like(rotation_rad))
     return {
         "translation_loss": translation_loss,
+        "translation_angle_rad": translation_angle_rad,
         "translation_deg": translation_deg,
         "translation_valid": translation_valid,
         "translation_angle_valid": translation_angle_valid,

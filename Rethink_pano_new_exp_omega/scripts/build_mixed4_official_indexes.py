@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -34,6 +35,26 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PANOCITY_SPLIT_DIR = REPO_ROOT / "training" / "data" / "splits" / "panocity"
+
+
+def panocity_part_id_from_name(name: object, group_size: int = 24) -> int | None:
+    if name in (None, ""):
+        return None
+    try:
+        return int(name) if not isinstance(name, str) else int(name)
+    except (TypeError, ValueError):
+        pass
+    matches = re.findall(r"\d+", Path(str(name)).stem)
+    if not matches:
+        return None
+    return int(matches[-1]) // int(group_size)
+
+
+def panocity_group_key(city: object, block: object, part_id: object) -> str:
+    values = ["Panocity", str(city), str(block)]
+    if part_id not in (None, ""):
+        values.append(str(part_id))
+    return ":".join(values)
 
 
 def parse_args() -> argparse.Namespace:
@@ -227,6 +248,7 @@ def expand_panocity_official_split_rows(root: Path, split_rows: list[dict[str, A
             continue
         scene = str(split_row.get("scene") or "")
         block = str(split_row.get("block") or "")
+        part_id = split_row.get("part_id")
         rgb_paths = split_row.get("pano_images") or []
         depth_paths = split_row.get("panodepth_images") or []
         pose_path = root / str(split_row.get("poses_file") or "")
@@ -257,8 +279,9 @@ def expand_panocity_official_split_rows(root: Path, split_rows: list[dict[str, A
                     "dataset": "Panocity",
                     "city": scene,
                     "block": block,
+                    "part_id": part_id,
                     "scene_name": f"{scene}_{block}_{rgb_rel.stem}",
-                    "scene_group_key": f"Panocity:{scene}:{block}",
+                    "scene_group_key": panocity_group_key(scene, block, part_id),
                     "rgb_path": str(rgb_rel),
                     "depth_path": str(depth_rel),
                     "pano_position_m": position,
@@ -344,13 +367,15 @@ def build_panocity_rows(root: Path) -> list[dict[str, Any]]:
             if rgb_name not in rgb_names or depth_name not in depth_names:
                 continue
             rotation = rotation_from_matrix_c2w(frame.get("transformation_matrix") or [])
+            part_id = panocity_part_id_from_name(rgb_name)
             rows.append(
                 {
                     "dataset": "Panocity",
                     "city": city,
                     "block": block,
+                    "part_id": part_id,
                     "scene_name": f"{city}_{block}_{Path(rgb_name).stem}",
-                    "scene_group_key": f"Panocity:{city}:{block}",
+                    "scene_group_key": panocity_group_key(city, block, part_id),
                     "rgb_path": str(Path(city) / block / "pano_images" / rgb_name),
                     "depth_path": str(Path(city) / block / "panodepth_images" / depth_name),
                     "pano_position_m": translation_from_matrix(frame.get("transformation_matrix") or []),

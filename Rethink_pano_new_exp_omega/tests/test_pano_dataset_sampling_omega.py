@@ -129,6 +129,31 @@ def test_minimal_matterport_pose_is_converted_to_opencv():
         )
 
 
+def test_minimal_panocity_groups_use_official_part_id_from_legacy_cache():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "minimal"
+        _write_panocity_legacy_cache_bundle(root)
+        dataset = PanoMinimalDataset(
+            root=root,
+            datasets="panocity",
+            pano_size=(16, 32),
+            pano_sample_mode="fixed_neighborhood",
+            pano_min_count=2,
+            pano_max_count=2,
+            grouping="nearest",
+        )
+        keys = [str(item["scene_group_key"]) for item in dataset.items]
+        assert keys == [
+            "Panocity:city_a:block_a:0",
+            "Panocity:city_a:block_a:0",
+            "Panocity:city_a:block_a:1",
+            "Panocity:city_a:block_a:1",
+        ]
+        for group in dataset.groups:
+            group_keys = {_scene_key(dataset, item_index) for item_index in group}
+            assert len(group_keys) == 1
+
+
 def test_minimal_structured3d_position_is_converted_to_opencv():
     with tempfile.TemporaryDirectory() as tmp:
         position_path = Path(tmp) / "camera_xyz.txt"
@@ -234,6 +259,40 @@ def _write_matterport_minimal_bundle(root: Path) -> None:
             np.savetxt(root / "Matterport3D" / scan / "pano_poses" / f"{pano_id}.txt", pose)
 
 
+def _write_panocity_legacy_cache_bundle(root: Path) -> None:
+    dataset_root = root / "Panocity"
+    cache_dir = dataset_root / "cache"
+    image_dir = dataset_root / "city_a" / "block_a" / "pano_images"
+    depth_dir = dataset_root / "city_a" / "block_a" / "panodepth_images"
+    cache_dir.mkdir(parents=True)
+    image_dir.mkdir(parents=True)
+    depth_dir.mkdir(parents=True)
+    rows = []
+    # Positions make a cross-part pano closer than the same-part pano. The
+    # loader must still keep groups inside official 24-frame trajectory parts.
+    for frame_index, x in ((0, 0.0), (1, 100.0), (24, 1.0), (25, 2.0)):
+        rgb_name = f"pano_{frame_index:07d}.png"
+        depth_name = f"pano_depth_{frame_index:07d}.png"
+        Image.new("RGB", (64, 32), (80 + frame_index % 30, 100, 160)).save(image_dir / rgb_name)
+        Image.fromarray(np.full((32, 64), 4000, dtype=np.uint16)).save(depth_dir / depth_name)
+        rows.append(
+            {
+                "dataset": "Panocity",
+                "city": "city_a",
+                "block": "block_a",
+                "scene_name": f"city_a_block_a_pano_{frame_index:07d}",
+                "scene_group_key": "Panocity:city_a:block_a",
+                "rgb_path": str(Path("city_a") / "block_a" / "pano_images" / rgb_name),
+                "depth_path": str(Path("city_a") / "block_a" / "panodepth_images" / depth_name),
+                "pano_position_m": [x, 0.0, 0.0],
+                "pano_position_valid": True,
+                "pano_rotation_c2w": np.eye(3, dtype=np.float32).tolist(),
+                "pano_rotation_valid": True,
+            }
+        )
+    (cache_dir / "panocity_train_index.json").write_text(json.dumps(rows), encoding="utf-8")
+
+
 if __name__ == "__main__":
     test_single_pano_sampling_returns_one_erp()
     test_variable_neighborhood_sampling_returns_anchor_first_sequence()
@@ -241,6 +300,7 @@ if __name__ == "__main__":
     test_minimal_multipano_fallback_stays_inside_scene()
     test_minimal_matterport_groups_use_official_room_membership()
     test_minimal_matterport_pose_is_converted_to_opencv()
+    test_minimal_panocity_groups_use_official_part_id_from_legacy_cache()
     test_minimal_structured3d_position_is_converted_to_opencv()
     test_structured3d_keeps_positions_but_disables_translation_supervision()
     print("pano dataset sampling (omega) ok")

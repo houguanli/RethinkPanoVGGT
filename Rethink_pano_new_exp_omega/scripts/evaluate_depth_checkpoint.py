@@ -365,26 +365,27 @@ def evaluate_run(
                 )
                 depth_metrics = compute_depth_metrics(pred_depth_base, target_depth, target_valid)
                 camera_scale = base_depth_scale.detach() * sample_depth_scale
-                camera_losses = camera_alignment_loss(
-                    predictions=predictions,
-                    batch=moved,
-                    translation_weight=eval_args.camera_translation_weight,
-                    rotation_weight=eval_args.camera_rotation_weight,
-                    fov_weight=eval_args.camera_fov_weight,
-                    position_mode=eval_args.camera_position_mode,
-                    supervision_mode=eval_args.camera_supervision_mode,
-                    pano_consistency_weight=eval_args.pano_translation_consistency_weight,
-                    translation_normalization=eval_args.camera_translation_normalization,
-                    translation_normalization_eps=eval_args.camera_translation_normalization_eps,
-                    pred_translation_scale=(
-                        (
-                            camera_scale
-                            if eval_args.camera_depth_scale_alignment
-                            and eval_args.depth_scale_alignment != "none"
-                            else None
-                        )
-                    ),
-                )
+                with torch.autocast(device_type=device.type, enabled=False):
+                    camera_losses = camera_alignment_loss(
+                        predictions=predictions,
+                        batch=moved,
+                        translation_weight=eval_args.camera_translation_weight,
+                        rotation_weight=eval_args.camera_rotation_weight,
+                        fov_weight=eval_args.camera_fov_weight,
+                        position_mode=eval_args.camera_position_mode,
+                        supervision_mode=eval_args.camera_supervision_mode,
+                        pano_consistency_weight=eval_args.pano_translation_consistency_weight,
+                        translation_normalization=eval_args.camera_translation_normalization,
+                        translation_normalization_eps=eval_args.camera_translation_normalization_eps,
+                        pred_translation_scale=(
+                            (
+                                camera_scale.float()
+                                if eval_args.camera_depth_scale_alignment
+                                and eval_args.depth_scale_alignment != "none"
+                                else None
+                            )
+                        ),
+                    )
                 if float(eval_args.global_point_loss_weight) > 0:
                     global_point_metrics = shared_frame_point_loss(
                         pred_depth=pred_depth,

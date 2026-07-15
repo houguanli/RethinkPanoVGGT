@@ -414,6 +414,44 @@ def _join_scene_key(dataset: object, *parts: object) -> str:
     return ":".join(values)
 
 
+def _panocity_part_id_from_value(value: object, group_size: int = 24) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value) if not isinstance(value, str) else int(value)
+    except (TypeError, ValueError):
+        pass
+    stem = Path(str(value)).stem
+    matches = re.findall(r"\d+", stem)
+    if not matches:
+        return None
+    return int(matches[-1]) // int(group_size)
+
+
+def _panocity_scene_group_key(row: Dict, city: str, block: str, rgb_path: Path, depth_path: Path) -> str:
+    explicit = row.get("scene_group_key")
+    if explicit not in (None, "") and len(str(explicit).split(":")) >= 4:
+        return str(explicit)
+    part_id = None
+    for value in (
+        row.get("part_id"),
+        row.get("part"),
+        row.get("rgb_path"),
+        row.get("depth_path"),
+        row.get("scene_name"),
+        rgb_path,
+        depth_path,
+    ):
+        part_id = _panocity_part_id_from_value(value)
+        if part_id is not None:
+            break
+    if part_id is not None:
+        return _join_scene_key("Panocity", city, block, part_id)
+    if explicit not in (None, ""):
+        return str(explicit)
+    return _join_scene_key("Panocity", city, block)
+
+
 def _position_distance_sq(anchor: Dict, candidate: Dict) -> float:
     try:
         a = anchor.get("pano_position_m", [0.0, 0.0, 0.0])
@@ -731,7 +769,7 @@ def _index_panocity_official(root: Path, split: str, scale: float) -> List[Dict]
                 position_valid=position_valid,
                 rotation_c2w=rotation,
                 rotation_valid=rotation_valid,
-                scene_group_key=str(row.get("scene_group_key") or _join_scene_key("Panocity", city, block)),
+                scene_group_key=_panocity_scene_group_key(row, city, block, rgb_path, depth_path),
             )
         )
     return items
@@ -765,13 +803,15 @@ def build_panocity_official_rows(root: Path) -> List[Dict]:
             matrix = frame.get("transformation_matrix") or []
             rotation = _rotation_from_matrix_c2w(matrix)
             position = _translation_from_matrix(matrix)
+            part_id = _panocity_part_id_from_value(rgb_name)
             rows.append(
                 {
                     "dataset": "Panocity",
                     "city": city,
                     "block": block,
+                    "part_id": part_id,
                     "scene_name": f"{city}_{block}_{Path(str(rgb_name)).stem}",
-                    "scene_group_key": _join_scene_key("Panocity", city, block),
+                    "scene_group_key": _join_scene_key("Panocity", city, block, part_id),
                     "rgb_path": str(rgb_path.relative_to(root)),
                     "depth_path": str(depth_path.relative_to(root)),
                     "pano_position_m": position,
