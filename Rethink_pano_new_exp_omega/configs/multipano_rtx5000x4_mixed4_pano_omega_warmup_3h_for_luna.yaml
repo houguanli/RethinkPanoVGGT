@@ -51,7 +51,8 @@ supervision:
   depth_loss_mode: log_huber
   depth_log_error_clip: 0.5
   depth_log_huber_delta: 0.2
-  depth_scale_alignment: sample_l1_depth_weighted
+  depth_scale_alignment: none
+  depth_scale_diagnostics_alignment: sample_l1_depth_weighted
   depth_scale_alignment_min: 0.05
   depth_scale_alignment_max: 1000000.0
   loss_sample_weighting: true
@@ -65,9 +66,12 @@ supervision:
   global_point_loss_weight: 0.0
   global_point_stride: 16
   overlap_band_fraction: 0.20
-  pred_depth_scale: 2.7437050342559814
-  learn_pred_depth_scale: false
+  pred_depth_scale: 2.827019691467285
+  learn_pred_depth_scale: true
   pred_depth_scale_lr: 5.0e-5
+  dataset_depth_scale_mode: learnable
+  dataset_depth_scales: "panocity=44.41180992126465,matterport3d=2.293140411376953,stanford2d3ds=3.1574957966804504,structured3d=1.5153944492340088"
+  dataset_depth_scale_lr: 5.0e-5
   depth_residual_mode: none
   depth_residual_hidden: 32
   depth_residual_max_log: 0.5
@@ -93,7 +97,7 @@ supervision:
   camera_position_mode: relative_anchor
 
 optimization:
-  trainable: pano_camera_head
+  trainable: all
   lr: 1.0e-5
   weight_decay: 0.0
   grad_clip: 1.0
@@ -105,9 +109,10 @@ optimization:
       window_size: 384
       num_yaw: 4
       dense_head_frames_chunk_size: 1
-      trainable: pano_camera_head
+      trainable: all
       lr: 1.0e-5
       pred_depth_scale_lr: 5.0e-5
+      dataset_depth_scale_lr: 5.0e-5
       weight_decay: 0.0
       optimizer_type: adamw
       camera_loss_weight: 0.05
@@ -117,7 +122,8 @@ optimization:
       freeze_luna_parameters: true
       enable_depth_residual: false
       train_depth_residual: false
-      learn_pred_depth_scale: false
+      learn_pred_depth_scale: true
+      learn_dataset_depth_scale: true
 
 runtime:
   device: cuda

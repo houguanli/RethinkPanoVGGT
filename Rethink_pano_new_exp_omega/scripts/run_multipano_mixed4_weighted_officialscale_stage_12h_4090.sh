@@ -130,7 +130,8 @@ LOCAL_RANK=0 RANK=0 WORLD_SIZE=1 MASTER_ADDR="$MASTER_ADDR" MASTER_PORT="$LUNA_P
     --checkpoint "$BASE_CKPT" \
     --pred-depth-scale "$PRED_DEPTH_SCALE" \
     --depth-loss-mode log_huber \
-    --depth-scale-alignment sample_l1_depth_weighted \
+    --depth-scale-alignment none \
+    --depth-scale-diagnostics-alignment sample_l1_depth_weighted \
     --depth-scale-alignment-min 0.05 \
     --depth-scale-alignment-max 1000000.0 \
   2>&1 | tee -a "$LUNA_OUT/train_9h.log"

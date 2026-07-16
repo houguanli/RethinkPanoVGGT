@@ -18,6 +18,12 @@ if [[ -z "${PANOVGGT_ROOT:-}" ]]; then
   fi
 fi
 BASE_CHECKPOINT="${BASE_CHECKPOINT:-/home/aoki/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt}"
+WARMUP_INIT_CHECKPOINT="${WARMUP_INIT_CHECKPOINT:-$BASE_CHECKPOINT}"
+if [[ ! -s "$WARMUP_INIT_CHECKPOINT" ]]; then
+  WARMUP_INIT_CHECKPOINT="$BASE_CHECKPOINT"
+fi
+USE_SINGLE_DEPTH_SCALE_INIT="${USE_SINGLE_DEPTH_SCALE_INIT:-1}"
+SINGLE_WEIGHTED_PRED_DEPTH_SCALE="${SINGLE_WEIGHTED_PRED_DEPTH_SCALE:-2.827019691467285}"
 
 WARMUP_CONFIG="${WARMUP_CONFIG:-configs/multipano_rtx5000x4_mixed4_pano_omega_warmup_3h_for_luna.yaml}"
 WARMUP_OUT="${WARMUP_OUT:-$LUNA/logs/mixed4_pano_omega_multipano_warmup_3h_for_luna}"
@@ -54,6 +60,8 @@ mkdir -p "$WARMUP_OUT" "$LUNA_OUT"
   echo "[sequence] pytorch_cuda_alloc_conf=$PYTORCH_CUDA_ALLOC_CONF"
   echo "[sequence] panovggt_root=$PANOVGGT_ROOT"
   echo "[sequence] base_checkpoint=$BASE_CHECKPOINT"
+  echo "[sequence] warmup_init_checkpoint=$WARMUP_INIT_CHECKPOINT"
+  echo "[sequence] use_single_depth_scale_init=$USE_SINGLE_DEPTH_SCALE_INIT"
   echo "[sequence] calibration_samples_per_dataset=$CALIB_SAMPLES_PER_DATASET"
   echo "[sequence] num_yaw=$NUM_YAW"
   echo "[sequence] extra_train_args=${EXTRA_TRAIN_ARGS:-}"
@@ -72,6 +80,10 @@ else
 fi
 
 PRED_DEPTH_SCALE="${PRED_DEPTH_SCALE:-}"
+if [[ "$USE_SINGLE_DEPTH_SCALE_INIT" == "1" ]]; then
+  PRED_DEPTH_SCALE="${PRED_DEPTH_SCALE:-$SINGLE_WEIGHTED_PRED_DEPTH_SCALE}"
+  SKIP_CALIBRATION="${SKIP_CALIBRATION:-1}"
+fi
 if [[ "${SKIP_CALIBRATION:-0}" != "1" ]]; then
   echo "[sequence] calibrating unified pred_depth_scale $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
   cd "$BASELINE"
@@ -135,10 +147,11 @@ else
     --tensorboard-dir "$WARMUP_OUT/tensorboard" \
     --debug-dir "$WARMUP_OUT/debug" \
     --dataset-root "$PANOVGGT_ROOT" \
-    --checkpoint "$BASE_CHECKPOINT" \
+    --checkpoint "$WARMUP_INIT_CHECKPOINT" \
     --pred-depth-scale "$PRED_DEPTH_SCALE" \
     --depth-loss-mode log_huber \
-    --depth-scale-alignment sample_l1_depth_weighted \
+    --depth-scale-alignment none \
+    --depth-scale-diagnostics-alignment sample_l1_depth_weighted \
     --depth-scale-alignment-min 0.05 \
     --depth-scale-alignment-max 1000000.0 \
     --no-inherit-checkpoint-training-defaults \
@@ -174,7 +187,7 @@ PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   --nproc_per_node="$NPROC_PER_NODE" \
   training/train_pano_omega.py --config "$LUNA_CONFIG" \
   "${LUNA_DURATION_ARGS[@]}" \
-  --base-checkpoint "$BASE_CHECKPOINT" \
+  --base-checkpoint "$WARMUP_INIT_CHECKPOINT" \
   --output-dir "$LUNA_OUT" \
   --tensorboard-dir "$LUNA_OUT/tensorboard" \
   --debug-dir "$LUNA_OUT/debug" \
@@ -182,7 +195,8 @@ PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   --checkpoint "$WARMUP_CKPT" \
   --pred-depth-scale "$PRED_DEPTH_SCALE" \
   --depth-loss-mode log_huber \
-  --depth-scale-alignment sample_l1_depth_weighted \
+  --depth-scale-alignment none \
+  --depth-scale-diagnostics-alignment sample_l1_depth_weighted \
   --depth-scale-alignment-min 0.05 \
   --depth-scale-alignment-max 1000000.0 \
   --no-inherit-checkpoint-training-defaults \

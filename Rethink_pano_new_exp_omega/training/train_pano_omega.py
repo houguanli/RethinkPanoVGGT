@@ -303,6 +303,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fixed metric calibration applied to predicted Z-depth before loss/export.",
     )
     parser.add_argument(
+        "--dataset-depth-scale-mode",
+        choices=["none", "fixed", "learnable"],
+        default="none",
+        help="Use one calibrated predicted-depth scale per dataset instead of the global --pred-depth-scale.",
+    )
+    parser.add_argument(
+        "--dataset-depth-scales",
+        type=str,
+        default="",
+        help="Comma-separated dataset scales, e.g. panocity=70.18,matterport3d=2.72.",
+    )
+    parser.add_argument(
+        "--dataset-depth-scale-lr",
+        type=float,
+        default=None,
+        help="Optional learning rate for learnable dataset depth scales; defaults to --pred-depth-scale-lr or --lr.",
+    )
+    parser.add_argument(
         "--learn-pred-depth-scale",
         action="store_true",
         help="Learn a positive scalar multiplier on predicted depth during training.",
@@ -415,19 +433,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--depth-scale-alignment-max", type=float, default=1e6)
     parser.add_argument("--depth-scale-alignment-eps", type=float, default=1e-6)
     parser.add_argument(
+        "--depth-scale-diagnostics-alignment",
+        choices=["same", "none", "sample_lstsq", "sample_log_median", "sample_l1", "sample_l1_depth_weighted"],
+        default="same",
+        help="Optional per-sample scale solve used only for diagnostics, not for formal depth/camera loss.",
+    )
+    parser.add_argument(
         "--no-camera-depth-scale-alignment",
         dest="camera_depth_scale_alignment",
         action="store_false",
         default=False,
-        help="Do not apply the per-sample depth alignment scale to camera translation predictions.",
+        help="Do not apply the formal predicted-depth scale to camera translation predictions.",
     )
     parser.add_argument(
         "--camera-depth-scale-alignment",
         dest="camera_depth_scale_alignment",
         action="store_true",
         help=(
-            "Apply the per-sample depth alignment scale to camera translation predictions. "
-            "Off by default because Omega pano pose is already supervised in the GT pose metric."
+            "Apply the same formal predicted-depth scale used by depth loss to camera "
+            "translation predictions. Diagnostic sample-scale estimates are never used here."
         ),
     )
     parser.add_argument(
@@ -615,11 +639,16 @@ def train(args: argparse.Namespace) -> None:
         if args.checkpoint is not None:
             load_checkpoint(model, args.checkpoint, strict=args.strict_checkpoint)
 
-        if args.learn_pred_depth_scale or args.depth_residual_mode != "none":
+        dataset_depth_scales = parse_dataset_depth_scales(args.dataset_depth_scales)
+        if args.dataset_depth_scale_mode != "none" and not dataset_depth_scales:
+            raise ValueError("--dataset-depth-scale-mode requires non-empty --dataset-depth-scales.")
+        if args.learn_pred_depth_scale or args.depth_residual_mode != "none" or args.dataset_depth_scale_mode != "none":
             model = DepthPredictionAdapter(
                 model,
                 initial_scale=args.pred_depth_scale,
                 learn_scale=args.learn_pred_depth_scale,
+                dataset_scale_mode=args.dataset_depth_scale_mode,
+                dataset_scales=dataset_depth_scales,
                 residual_mode=args.depth_residual_mode,
                 residual_hidden=args.depth_residual_hidden,
                 residual_max_log=args.depth_residual_max_log,
@@ -649,6 +678,8 @@ def train(args: argparse.Namespace) -> None:
                 configure_trainable(model.model, args.trainable)
                 if isinstance(model.pred_depth_log_scale, torch.nn.Parameter):
                     model.pred_depth_log_scale.requires_grad_(bool(args.learn_pred_depth_scale))
+                if isinstance(model.dataset_depth_log_scales, torch.nn.Parameter):
+                    model.dataset_depth_log_scales.requires_grad_(args.dataset_depth_scale_mode == "learnable")
                 if model.depth_residual_head is not None:
                     for param in model.depth_residual_head.parameters():
                         param.requires_grad_(True)
@@ -934,6 +965,20 @@ def train(args: argparse.Namespace) -> None:
                     ),
                     "depth_sample_scale_min": float(loss_dict.get("depth_sample_scale_min", torch.tensor(1.0)).item()),
                     "depth_sample_scale_max": float(loss_dict.get("depth_sample_scale_max", torch.tensor(1.0)).item()),
+                    "depth_loss_scale_median": float(
+                        loss_dict.get("depth_loss_scale_median", torch.tensor(1.0)).item()
+                    ),
+                    "depth_loss_scale_min": float(loss_dict.get("depth_loss_scale_min", torch.tensor(1.0)).item()),
+                    "depth_loss_scale_max": float(loss_dict.get("depth_loss_scale_max", torch.tensor(1.0)).item()),
+                    "dataset_depth_scale_median": float(
+                        loss_dict.get("dataset_depth_scale_median", torch.tensor(1.0)).item()
+                    ),
+                    "dataset_depth_scale_min": float(
+                        loss_dict.get("dataset_depth_scale_min", torch.tensor(1.0)).item()
+                    ),
+                    "dataset_depth_scale_max": float(
+                        loss_dict.get("dataset_depth_scale_max", torch.tensor(1.0)).item()
+                    ),
                     "pred_depth_scale": float(loss_dict["pred_depth_scale"].item()),
                     "stage": active_stage_name,
                     "stage_index": int(active_stage_index + 1) if active_stage_index is not None else 0,
@@ -1136,6 +1181,8 @@ class DepthPredictionAdapter(torch.nn.Module):
         model: VGGTOmega_LUNA,
         initial_scale: float,
         learn_scale: bool = False,
+        dataset_scale_mode: str = "none",
+        dataset_scales: Dict[str, float] | None = None,
         residual_mode: str = "none",
         residual_hidden: int = 32,
         residual_max_log: float = 0.5,
@@ -1163,6 +1210,24 @@ class DepthPredictionAdapter(torch.nn.Module):
             self.pred_depth_log_scale = torch.nn.Parameter(log_scale)
         else:
             self.register_buffer("pred_depth_log_scale", log_scale)
+
+        dataset_scale_mode = str(dataset_scale_mode or "none")
+        if dataset_scale_mode not in {"none", "fixed", "learnable"}:
+            raise ValueError(f"Unknown dataset depth scale mode: {dataset_scale_mode}")
+        dataset_scales = dataset_scales or {}
+        self.dataset_depth_scale_mode = dataset_scale_mode if dataset_scales else "none"
+        self.dataset_depth_scale_names = tuple(sorted(dataset_scales))
+        if self.dataset_depth_scale_names:
+            dataset_log_scales = torch.tensor(
+                [math.log(float(dataset_scales[name])) for name in self.dataset_depth_scale_names],
+                dtype=torch.float32,
+            )
+        else:
+            dataset_log_scales = torch.empty(0, dtype=torch.float32)
+        if self.dataset_depth_scale_mode == "learnable":
+            self.dataset_depth_log_scales = torch.nn.Parameter(dataset_log_scales)
+        else:
+            self.register_buffer("dataset_depth_log_scales", dataset_log_scales)
 
         if residual_mode == "none":
             self.depth_residual_head = None
@@ -1256,12 +1321,49 @@ class DepthPredictionAdapter(torch.nn.Module):
         ).clamp(min=-8.0, max=8.0)
         return log_scale.exp()
 
+    def dataset_depth_scale(
+        self,
+        dataset_names: Sequence[str],
+        device: torch.device,
+        dtype: torch.dtype,
+        fallback: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.dataset_depth_scale_mode == "none" or not self.dataset_depth_scale_names:
+            fallback = fallback.to(device=device, dtype=dtype)
+            return fallback.reshape(1).expand(len(dataset_names))
+        log_scales = torch.nan_to_num(
+            self.dataset_depth_log_scales.float(),
+            nan=0.0,
+            posinf=8.0,
+            neginf=-8.0,
+        ).clamp(min=-8.0, max=8.0)
+        scales = log_scales.exp().to(device=device)
+        scale_by_name = {name: scales[index] for index, name in enumerate(self.dataset_depth_scale_names)}
+        fallback_scalar = fallback.to(device=device, dtype=torch.float32).reshape(())
+        values = [
+            scale_by_name.get(canonical_dataset_name(name), fallback_scalar)
+            for name in dataset_names
+        ]
+        return torch.stack(values, dim=0).to(dtype=dtype)
+
+    def dataset_depth_scales_dict(self) -> Dict[str, float]:
+        if not self.dataset_depth_scale_names:
+            return {}
+        scales = self.dataset_depth_log_scales.detach().float().clamp(min=-8.0, max=8.0).exp().cpu()
+        return {
+            name: float(scales[index])
+            for index, name in enumerate(self.dataset_depth_scale_names)
+        }
+
     @torch.no_grad()
     def sanitize_parameters(self) -> None:
         if isinstance(self.pred_depth_log_scale, torch.nn.Parameter):
             data = self.pred_depth_log_scale.data
             fallback = self.initial_pred_depth_log_scale.to(device=data.device, dtype=data.dtype)
             data.copy_(torch.where(torch.isfinite(data), data, fallback).clamp(min=-8.0, max=8.0))
+        if isinstance(self.dataset_depth_log_scales, torch.nn.Parameter):
+            data = self.dataset_depth_log_scales.data
+            data.copy_(torch.where(torch.isfinite(data), data, torch.zeros_like(data)).clamp(min=-8.0, max=8.0))
 
     def sample_pano_windows(self, *args, **kwargs):
         return self.model.sample_pano_windows(*args, **kwargs)
@@ -1323,12 +1425,17 @@ def build_optimizer_for_stage(
         if stage is not None and stage.get("pred_depth_scale_lr") is not None
         else args.pred_depth_scale_lr
     )
+    dataset_depth_scale_lr = (
+        float(stage["dataset_depth_scale_lr"])
+        if stage is not None and stage.get("dataset_depth_scale_lr") is not None
+        else args.dataset_depth_scale_lr
+    )
     return build_optimizer(
         model,
         args,
         lr=lr,
         weight_decay=weight_decay,
-        pred_depth_scale_lr=pred_depth_scale_lr,
+        pred_depth_scale_lr=dataset_depth_scale_lr if dataset_depth_scale_lr is not None else pred_depth_scale_lr,
         optimizer_type=optimizer_type,
     )
 
@@ -1348,7 +1455,7 @@ def transition_optimizer_for_stage(
         return build_optimizer_for_stage(model, args, stage), False
 
     regular_lr = float(stage.get("lr", args.lr))
-    scale_lr_value = stage.get("pred_depth_scale_lr", regular_lr)
+    scale_lr_value = stage.get("dataset_depth_scale_lr", stage.get("pred_depth_scale_lr", regular_lr))
     scale_lr = regular_lr if scale_lr_value is None else float(scale_lr_value)
     weight_decay = float(stage.get("weight_decay", args.weight_decay))
     for group in optimizer.param_groups:
@@ -1377,7 +1484,7 @@ def build_optimizer(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if name.endswith("pred_depth_log_scale"):
+        if name.endswith("pred_depth_log_scale") or name.endswith("dataset_depth_log_scales"):
             scale_params.append(param)
         else:
             regular_params.append(param)
@@ -1721,9 +1828,14 @@ def configure_trainable_for_stage(
         adapter.depth_residual_enabled = enable_depth_residual
         train_depth_residual = bool(stage.get("train_depth_residual", enable_depth_residual))
         train_scale = bool(stage.get("learn_pred_depth_scale", args.learn_pred_depth_scale))
+        train_dataset_scale = bool(
+            stage.get("learn_dataset_depth_scale", args.dataset_depth_scale_mode == "learnable")
+        )
 
         if isinstance(adapter.pred_depth_log_scale, torch.nn.Parameter):
             adapter.pred_depth_log_scale.requires_grad_(train_scale)
+        if isinstance(adapter.dataset_depth_log_scales, torch.nn.Parameter):
+            adapter.dataset_depth_log_scales.requires_grad_(train_dataset_scale)
         if adapter.depth_residual_head is not None:
             for param in adapter.depth_residual_head.parameters():
                 param.requires_grad_(enable_depth_residual and train_depth_residual)
@@ -1858,9 +1970,22 @@ def train_step(
             "_pred_depth_scale",
             predictions["depth"].new_tensor(float(args.pred_depth_scale)),
         )
-        base_depth_scale = pred_depth_scale.detach() if args.depth_scale_alignment != "none" else pred_depth_scale
-        pred_depth_base = predictions["depth"] * base_depth_scale
-        sample_depth_scale = estimate_sample_depth_alignment_scale(
+        batch_size = int(predictions["depth"].shape[0])
+        pano_count = int(pano_images.shape[1] if pano_images.ndim == 5 else 1)
+        dataset_depth_scale = None
+        effective_depth_scale = pred_depth_scale
+        if isinstance(sampler_model, DepthPredictionAdapter) and sampler_model.dataset_depth_scale_mode != "none":
+            names = batch_dataset_names(batch, batch_size=batch_size, pano_count=pano_count)
+            dataset_depth_scale = sampler_model.dataset_depth_scale(
+                names,
+                device=predictions["depth"].device,
+                dtype=predictions["depth"].dtype,
+                fallback=pred_depth_scale,
+            )
+            effective_depth_scale = dataset_depth_scale
+        base_depth_scale = effective_depth_scale.detach() if args.depth_scale_alignment != "none" else effective_depth_scale
+        pred_depth_base = predictions["depth"] * expand_sample_scale_like(base_depth_scale, predictions["depth"])
+        formal_depth_scale = estimate_sample_depth_alignment_scale(
             pred_depth_base,
             target_depth,
             target_valid,
@@ -1869,7 +1994,22 @@ def train_step(
             max_scale=args.depth_scale_alignment_max,
             eps=args.depth_scale_alignment_eps,
         )
-        pred_depth = pred_depth_base * expand_sample_scale_like(sample_depth_scale, pred_depth_base)
+        diag_alignment = str(args.depth_scale_diagnostics_alignment)
+        if diag_alignment == "same":
+            diag_alignment = str(args.depth_scale_alignment)
+        if diag_alignment == str(args.depth_scale_alignment):
+            sample_depth_scale = formal_depth_scale
+        else:
+            sample_depth_scale = estimate_sample_depth_alignment_scale(
+                pred_depth_base,
+                target_depth,
+                target_valid,
+                mode=diag_alignment,
+                min_scale=args.depth_scale_alignment_min,
+                max_scale=args.depth_scale_alignment_max,
+                eps=args.depth_scale_alignment_eps,
+            )
+        pred_depth = pred_depth_base * expand_sample_scale_like(formal_depth_scale, pred_depth_base)
         depth_loss_valid, depth_loss_window_keep_ratio, pred_depth_finite_ratio = depth_loss_validity_stats(
             pred_depth,
             target_depth,
@@ -1951,8 +2091,8 @@ def train_step(
                 center_residual_max_ratio=args.camera_center_residual_max_ratio,
                 center_residual_max_abs=args.camera_center_residual_max_abs,
                 pred_translation_scale=(
-                    (base_depth_scale.detach().float() * sample_depth_scale.float())
-                    if args.camera_depth_scale_alignment and args.depth_scale_alignment != "none"
+                    (base_depth_scale.detach().float() * formal_depth_scale.float())
+                    if args.camera_depth_scale_alignment
                     else None
                 ),
             )
@@ -1965,8 +2105,8 @@ def train_step(
                 predictions=predictions,
                 batch=batch,
                 pred_translation_scale=(
-                    (base_depth_scale.detach() * sample_depth_scale)
-                    if args.camera_depth_scale_alignment and args.depth_scale_alignment != "none"
+                    (base_depth_scale.detach() * formal_depth_scale)
+                    if args.camera_depth_scale_alignment
                     else None
                 ),
                 stride=args.global_point_stride,
@@ -2006,6 +2146,11 @@ def train_step(
         logged_pred_depth_scale = unwrapped_model.pred_depth_scale().detach()
     else:
         logged_pred_depth_scale = pred_depth_scale.detach()
+    dataset_scale_log = (
+        dataset_depth_scale.detach().float().reshape(-1)
+        if dataset_depth_scale is not None
+        else logged_pred_depth_scale.detach().float().reshape(1)
+    )
     return {
         "loss": loss.detach(),
         "loss_comparable": loss_comparable.detach(),
@@ -2028,6 +2173,12 @@ def train_step(
         "depth_sample_scale_median": sample_depth_scale.detach().float().median(),
         "depth_sample_scale_min": sample_depth_scale.detach().float().min(),
         "depth_sample_scale_max": sample_depth_scale.detach().float().max(),
+        "depth_loss_scale_median": formal_depth_scale.detach().float().median(),
+        "depth_loss_scale_min": formal_depth_scale.detach().float().min(),
+        "depth_loss_scale_max": formal_depth_scale.detach().float().max(),
+        "dataset_depth_scale_median": dataset_scale_log.median(),
+        "dataset_depth_scale_min": dataset_scale_log.min(),
+        "dataset_depth_scale_max": dataset_scale_log.max(),
         "_depth_diag_sample_scale": sample_depth_scale.detach().float(),
         "_depth_diag_loss_depth": depth_diag_loss_per_sample.detach().float(),
         "_depth_diag_valid_ratio": depth_diag_valid_ratio.detach().float(),
@@ -2375,6 +2526,48 @@ def parse_float_list(value: str | Sequence[float]) -> Tuple[float, ...]:
     return tuple(sorted(set(parsed))) or (5.0, 10.0, 15.0, 30.0, 45.0, 60.0, 90.0)
 
 
+def parse_dataset_depth_scales(value: str | Dict[str, float] | None) -> Dict[str, float]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        items = value.items()
+    else:
+        text = str(value).strip()
+        if not text:
+            return {}
+        pairs = [item.strip() for item in text.split(",") if item.strip()]
+        parsed_items = []
+        for pair in pairs:
+            if "=" not in pair:
+                raise ValueError(f"Invalid dataset depth scale entry {pair!r}; expected dataset=value.")
+            name, scale = pair.split("=", 1)
+            parsed_items.append((name.strip(), scale.strip()))
+        items = parsed_items
+    result: Dict[str, float] = {}
+    for name, scale in items:
+        dataset = canonical_dataset_name(name)
+        scale_value = float(scale)
+        if dataset == "unknown":
+            raise ValueError(f"Invalid dataset name for depth scale: {name!r}")
+        if not math.isfinite(scale_value) or scale_value <= 0:
+            raise ValueError(f"Dataset depth scale for {dataset} must be positive, got {scale_value}")
+        result[dataset] = scale_value
+    return result
+
+
+def batch_dataset_names(batch: Dict[str, Any], batch_size: int, pano_count: int) -> list[str]:
+    sequence_names = normalize_collated_string_matrix(batch.get("sequence_name"), batch_size, pano_count)
+    scene_names = normalize_collated_string_matrix(batch.get("scene_name"), batch_size, pano_count, split_pipe=True)
+    result: list[str] = []
+    for batch_index in range(batch_size):
+        candidates = [canonical_dataset_name(value) for value in sequence_names[batch_index]]
+        if all(candidate == "unknown" for candidate in candidates):
+            candidates = [canonical_dataset_name(value) for value in scene_names[batch_index]]
+        unique = [name for name in _unique_ordered(candidates) if name != "unknown"]
+        result.append(unique[0] if len(unique) == 1 else "unknown")
+    return result
+
+
 def strip_diag_tensors(loss_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {
         key: value
@@ -2454,7 +2647,8 @@ def depth_scale_diag_records_from_batch(
                 "depth_sample_scale": scale,
                 "loss_depth_sample": loss_depth,
                 "depth_valid_ratio_sample": sample_valid_ratio[batch_index],
-                "depth_scale_alignment_mode": str(args.depth_scale_alignment),
+                "depth_scale_alignment_mode": str(args.depth_scale_diagnostics_alignment),
+                "formal_depth_scale_alignment_mode": str(args.depth_scale_alignment),
                 "depth_scale_alignment_max": float(args.depth_scale_alignment_max),
                 "pred_depth_scale": _loss_scalar(loss_dict, "pred_depth_scale"),
                 "loss_depth_batch": _loss_scalar(loss_dict, "loss_depth"),
@@ -2932,6 +3126,7 @@ def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace
     pred_depth_scale = current_pred_depth_scale(model, args)
     args_payload = vars(args).copy()
     args_payload["pred_depth_scale"] = pred_depth_scale
+    args_payload["dataset_depth_scales_current"] = current_dataset_depth_scales(model)
     args_payload.update(current_sampler_status(model, args))
     adapter_state = None
     checkpoint_model = model
@@ -2992,6 +3187,12 @@ def current_pred_depth_scale(model: torch.nn.Module, args: argparse.Namespace) -
     if isinstance(model, DepthPredictionAdapter):
         return float(model.pred_depth_scale().detach().cpu())
     return float(args.pred_depth_scale)
+
+
+def current_dataset_depth_scales(model: torch.nn.Module) -> Dict[str, float]:
+    if isinstance(model, DepthPredictionAdapter):
+        return model.dataset_depth_scales_dict()
+    return {}
 
 
 def masked_log_l1_depth(
