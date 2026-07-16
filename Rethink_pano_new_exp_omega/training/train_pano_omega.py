@@ -1247,8 +1247,10 @@ class DepthPredictionAdapter(torch.nn.Module):
             raise ValueError(f"Unknown depth residual mode: {residual_mode}")
 
     def forward(self, *args, **kwargs) -> Dict:
+        dataset_names = kwargs.pop("dataset_names", None)
         predictions = dict(self.model(*args, **kwargs))
-        predictions["_pred_depth_scale"] = self.pred_depth_scale()
+        pred_depth_scale = self.pred_depth_scale()
+        predictions["_pred_depth_scale"] = pred_depth_scale
         raw_depth = torch.nan_to_num(
             predictions["depth"].float(),
             nan=1e-4,
@@ -1256,6 +1258,13 @@ class DepthPredictionAdapter(torch.nn.Module):
             neginf=1e-4,
         ).clamp_min(1e-4)
         predictions["depth"] = raw_depth
+        if dataset_names is not None and self.dataset_depth_scale_mode != "none":
+            predictions["_dataset_depth_scale"] = self.dataset_depth_scale(
+                dataset_names,
+                device=raw_depth.device,
+                dtype=raw_depth.dtype,
+                fallback=pred_depth_scale,
+            )
         if self.depth_residual_head is None:
             return predictions
         if not self.depth_residual_enabled:
@@ -1960,12 +1969,24 @@ def train_step(
     ).to(dtype=torch.float32).mean()
     amp_enabled = pano_images.device.type == "cuda" and args.amp_dtype != "none"
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float32
-    with torch.autocast(device_type=pano_images.device.type, dtype=amp_dtype, enabled=amp_enabled):
-        predictions = model(
-            pano_images=pano_images,
-            return_sampler_output=True,
-            return_window_pose=args.camera_supervision_mode != "pano_relative",
+    batch_size_for_scale = int(pano_images.shape[0])
+    pano_count_for_scale = int(pano_images.shape[1] if pano_images.ndim == 5 else 1)
+    dataset_names_for_scale = None
+    if isinstance(sampler_model, DepthPredictionAdapter) and sampler_model.dataset_depth_scale_mode != "none":
+        dataset_names_for_scale = batch_dataset_names(
+            batch,
+            batch_size=batch_size_for_scale,
+            pano_count=pano_count_for_scale,
         )
+    with torch.autocast(device_type=pano_images.device.type, dtype=amp_dtype, enabled=amp_enabled):
+        model_kwargs = {
+            "pano_images": pano_images,
+            "return_sampler_output": True,
+            "return_window_pose": args.camera_supervision_mode != "pano_relative",
+        }
+        if dataset_names_for_scale is not None:
+            model_kwargs["dataset_names"] = dataset_names_for_scale
+        predictions = model(**model_kwargs)
         pred_depth_scale = predictions.get(
             "_pred_depth_scale",
             predictions["depth"].new_tensor(float(args.pred_depth_scale)),
@@ -1975,13 +1996,19 @@ def train_step(
         dataset_depth_scale = None
         effective_depth_scale = pred_depth_scale
         if isinstance(sampler_model, DepthPredictionAdapter) and sampler_model.dataset_depth_scale_mode != "none":
-            names = batch_dataset_names(batch, batch_size=batch_size, pano_count=pano_count)
-            dataset_depth_scale = sampler_model.dataset_depth_scale(
-                names,
-                device=predictions["depth"].device,
-                dtype=predictions["depth"].dtype,
-                fallback=pred_depth_scale,
-            )
+            dataset_depth_scale = predictions.get("_dataset_depth_scale")
+            if dataset_depth_scale is None:
+                names = dataset_names_for_scale or batch_dataset_names(
+                    batch,
+                    batch_size=batch_size,
+                    pano_count=pano_count,
+                )
+                dataset_depth_scale = sampler_model.dataset_depth_scale(
+                    names,
+                    device=predictions["depth"].device,
+                    dtype=predictions["depth"].dtype,
+                    fallback=pred_depth_scale,
+                )
             effective_depth_scale = dataset_depth_scale
         base_depth_scale = effective_depth_scale.detach() if args.depth_scale_alignment != "none" else effective_depth_scale
         pred_depth_base = predictions["depth"] * expand_sample_scale_like(base_depth_scale, predictions["depth"])
