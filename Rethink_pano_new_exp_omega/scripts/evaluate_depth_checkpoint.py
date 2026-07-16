@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
@@ -28,6 +29,7 @@ from training.train_pano_omega import (  # noqa: E402
     adjacent_edge_overlap_loss,
     build_dataset,
     build_model,
+    build_relative_pano_pose_targets,
     camera_alignment_loss,
     estimate_sample_depth_alignment_scale,
     expand_sample_scale_like,
@@ -45,8 +47,10 @@ from training.train_pano_omega import (  # noqa: E402
     sample_depth_targets,
     set_seed,
     shared_frame_point_loss,
+    omega_y_up_pose_to_official_y_down,
     unwrap_model,
 )
+from vggt_omega.utils.rotation import mat_to_quat, quat_to_mat  # noqa: E402
 
 
 DEPTH_METRIC_KEYS = [
@@ -90,6 +94,70 @@ PANOVGGT_PRIMARY_METRICS = [
     "depth_rmse",
 ]
 
+CAMERA_POSE_SAMPLE_KEYS = [
+    "camera_pose_pair_count",
+    "camera_pose_auc3",
+    "camera_pose_auc5",
+    "camera_pose_auc15",
+    "camera_pose_auc30",
+    "camera_pose_rotation_deg_mean",
+    "camera_pose_rotation_deg_median",
+    "camera_pose_translation_deg_mean",
+    "camera_pose_translation_deg_median",
+    "camera_pose_max_error_deg_mean",
+    "camera_pose_max_error_deg_median",
+    "camera_pose_gt_translation_norm_mean",
+    "camera_pose_gt_translation_norm_median",
+]
+
+PER_SAMPLE_CSV_FIELDS = [
+    "dataset",
+    "split",
+    "run",
+    "dataset_index",
+    "seq_name",
+    "rgb_path",
+    "depth_path",
+    "quality_bin",
+    "loss",
+    "loss_depth",
+    "loss_overlap",
+    "loss_global_point",
+    "global_point_valid_ratio",
+    "loss_camera",
+    "loss_camera_t",
+    "loss_camera_r",
+    "camera_translation_deg",
+    "camera_rotation_deg",
+    "camera_translation_valid_count",
+    "camera_rotation_valid_count",
+    *CAMERA_POSE_SAMPLE_KEYS,
+    "valid_fraction",
+    "pred_depth_scale",
+    "metadata_valid_ratio",
+    "metadata_structure_score",
+    "sample_weight",
+    *DEPTH_METRIC_KEYS,
+    *DEPTH_ACCUMULATOR_KEYS,
+]
+
+CAMERA_PAIR_CSV_FIELDS = [
+    "dataset",
+    "split",
+    "run",
+    "dataset_index",
+    "seq_name",
+    "rgb_path",
+    "depth_path",
+    "batch_index",
+    "pair_i",
+    "pair_j",
+    "camera_pose_rotation_deg",
+    "camera_pose_translation_deg",
+    "camera_pose_max_error_deg",
+    "camera_pose_gt_translation_norm",
+]
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -102,8 +170,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", choices=["train", "val", "test"], default="val")
     parser.add_argument("--curriculum-bins", default="all", help="Bins for the main validation run. Use all/clean,normal/hard.")
     parser.add_argument("--limit", type=int, default=100, help="Number of samples for the main validation run.")
+    parser.add_argument("--limit-fraction", type=float, default=0.0, help="Fraction of scene groups/samples to evaluate when --limit <= 0.")
     parser.add_argument("--hard-limit", type=int, default=100, help="Extra hard-bin val samples. Use 0 to disable.")
     parser.add_argument("--seed", type=int, default=123, help="Deterministic sample seed.")
+    parser.add_argument(
+        "--sample-policy",
+        choices=["scene_neighborhood", "anchor"],
+        default="scene_neighborhood",
+        help=(
+            "How to choose held-out multi-pano samples. scene_neighborhood selects one "
+            "nearest-neighborhood group per scene/room/trajectory, matching PanoVGGT's "
+            "sequence-level evaluation. anchor preserves the older random-anchor behavior."
+        ),
+    )
+    parser.add_argument("--camera-pair-csv", type=Path, default=None, help="Optional streaming PanoVGGT-style camera pair CSV path.")
+    parser.add_argument("--camera-pose-trans-norm-thresh", type=float, default=1e-2, help="GT baseline threshold for PanoVGGT-style camera translation-angle eval.")
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default=None)
@@ -132,8 +213,17 @@ def main() -> None:
     model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
     model.eval()
 
+    camera_pair_csv = args.camera_pair_csv
+    if camera_pair_csv is None and args.per_sample_csv is not None:
+        camera_pair_csv = args.per_sample_csv.with_name(f"{args.per_sample_csv.stem}_camera_pairs.csv")
+    if args.per_sample_csv is not None:
+        initialize_csv(args.per_sample_csv, PER_SAMPLE_CSV_FIELDS)
+    if camera_pair_csv is not None:
+        initialize_csv(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS)
+
     runs: list[dict[str, Any]] = []
     per_sample_rows: list[dict[str, Any]] = []
+    camera_pair_rows: list[dict[str, Any]] = []
     runs.append(
         evaluate_run(
             name=f"{args.split}_{normalize_bins_label(args.curriculum_bins)}_{args.limit}",
@@ -143,10 +233,17 @@ def main() -> None:
             split=args.split,
             curriculum_bins=args.curriculum_bins,
             limit=args.limit,
+            limit_fraction=args.limit_fraction,
             seed=args.seed,
+            sample_policy=args.sample_policy,
             num_workers=args.num_workers,
             progress=args.progress,
             per_sample_rows=per_sample_rows,
+            per_sample_csv=args.per_sample_csv,
+            camera_pair_rows=camera_pair_rows,
+            camera_pair_csv=camera_pair_csv,
+            row_context={"split": args.split},
+            camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
         )
     )
     if args.hard_limit > 0:
@@ -159,10 +256,17 @@ def main() -> None:
                 split=args.split,
                 curriculum_bins="hard",
                 limit=args.hard_limit,
+                limit_fraction=0.0,
                 seed=args.seed + 17,
+                sample_policy=args.sample_policy,
                 num_workers=args.num_workers,
                 progress=args.progress,
                 per_sample_rows=per_sample_rows,
+                per_sample_csv=args.per_sample_csv,
+                camera_pair_rows=camera_pair_rows,
+                camera_pair_csv=camera_pair_csv,
+                row_context={"split": args.split},
+                camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
             )
         )
 
@@ -182,6 +286,7 @@ def main() -> None:
         },
         "train_loss_reference": read_train_loss_reference(args.train_loss_csv),
         "runs": runs,
+        "panovggt_camera_pose_summary": summarize_camera_pose_pairs(camera_pair_rows),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -268,15 +373,22 @@ def evaluate_run(
     split: str,
     curriculum_bins: str | None,
     limit: int,
+    limit_fraction: float,
     seed: int,
+    sample_policy: str,
     num_workers: int,
     progress: bool,
     per_sample_rows: list[dict[str, Any]],
+    per_sample_csv: Path | None = None,
+    camera_pair_rows: list[dict[str, Any]] | None = None,
+    camera_pair_csv: Path | None = None,
+    row_context: dict[str, Any] | None = None,
     shard_rank: int = 0,
     num_shards: int = 1,
     progress_file: Path | None = None,
     progress_every: int = 25,
     progress_context: dict[str, Any] | None = None,
+    camera_pose_trans_norm_thresh: float = 1e-2,
 ) -> dict[str, Any]:
     if int(num_shards) < 1:
         raise ValueError(f"num_shards must be >= 1, got {num_shards}")
@@ -289,7 +401,7 @@ def evaluate_run(
     eval_args.dataset_max_samples = None
     pano_size = (eval_args.pano_height, eval_args.pano_width) if eval_args.pano_height > 0 and eval_args.pano_width > 0 else None
     dataset = build_dataset(eval_args, pano_size)
-    indices = sample_indices(len(dataset), limit, seed)
+    indices, sampling_info = select_eval_indices(dataset, limit, seed, sample_policy, limit_fraction=limit_fraction)
     selected_indices = indices[int(shard_rank) :: int(num_shards)]
     write_eval_progress(
         progress_file,
@@ -300,6 +412,7 @@ def evaluate_run(
             "split": split,
             "dataset_size": len(dataset),
             "candidate_samples": len(indices),
+            "sample_policy": sampling_info,
             "shard_samples": len(selected_indices),
             "processed_samples": 0,
             "shard_rank": int(shard_rank),
@@ -318,6 +431,7 @@ def evaluate_run(
     )
 
     rows: list[dict[str, Any]] = []
+    camera_pair_start = len(camera_pair_rows) if camera_pair_rows is not None else 0
     amp_enabled = device.type == "cuda" and eval_args.amp_dtype != "none"
     amp_dtype = torch.bfloat16 if eval_args.amp_dtype == "bfloat16" else torch.float32
     iterator = tqdm(loader, desc=f"validate {name}", dynamic_ncols=True) if progress else loader
@@ -402,6 +516,20 @@ def evaluate_run(
                             )
                         ),
                     )
+                    pose_metrics, pose_pair_rows = compute_panovggt_camera_pose_metrics(
+                        predictions=predictions,
+                        batch=moved,
+                        position_mode=eval_args.camera_position_mode,
+                        pred_translation_scale=(
+                            (
+                                camera_scale.float()
+                                if eval_args.camera_depth_scale_alignment
+                                and eval_args.depth_scale_alignment != "none"
+                                else None
+                            )
+                        ),
+                        trans_norm_thresh=float(camera_pose_trans_norm_thresh),
+                    )
                 if float(eval_args.global_point_loss_weight) > 0:
                     global_point_metrics = shared_frame_point_loss(
                         pred_depth=pred_depth,
@@ -431,6 +559,7 @@ def evaluate_run(
                 )
 
             row = {
+                **(row_context or {}),
                 "run": name,
                 "dataset_index": int(selected_indices[local_index]),
                 "seq_name": scalar_string(batch.get("scene_name") or batch.get("sequence_name")),
@@ -460,12 +589,31 @@ def evaluate_run(
                 "metadata_valid_ratio": scalar_float(batch.get("metadata_valid_ratio")),
                 "metadata_structure_score": scalar_float(batch.get("metadata_structure_score")),
                 "sample_weight": scalar_float(batch.get("sample_weight"), default=1.0),
+                **pose_metrics,
                 **depth_metrics,
             }
+            for pair_row in pose_pair_rows:
+                pair_row.update(
+                    {
+                        **(row_context or {}),
+                        "run": name,
+                        "dataset_index": int(selected_indices[local_index]),
+                        "seq_name": row["seq_name"],
+                        "rgb_path": row["rgb_path"],
+                        "depth_path": row["depth_path"],
+                    }
+                )
             rows.append(row)
             per_sample_rows.append(row)
+            if per_sample_csv is not None:
+                append_csv_row(per_sample_csv, PER_SAMPLE_CSV_FIELDS, row)
+            if camera_pair_rows is not None:
+                camera_pair_rows.extend(pose_pair_rows)
+            if camera_pair_csv is not None:
+                append_csv_rows(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS, pose_pair_rows)
             processed = local_index + 1
             if progress_file is not None and (processed == 1 or processed == len(selected_indices) or processed % max(int(progress_every), 1) == 0):
+                partial_camera_pose_summary = summarize_camera_pose_pairs(camera_pair_rows or [])
                 write_eval_progress(
                     progress_file,
                     {
@@ -480,12 +628,20 @@ def evaluate_run(
                         "last_dataset_index": int(selected_indices[local_index]),
                         "last_loss": row["loss"],
                         "last_depth_irls_abs_rel": row["depth_irls_abs_rel"],
+                        "last_camera_pose_pair_count": row["camera_pose_pair_count"],
+                        "last_camera_pose_translation_deg_median": row["camera_pose_translation_deg_median"],
+                        "last_camera_pose_rotation_deg_median": row["camera_pose_rotation_deg_median"],
+                        "camera_pose_pair_count": partial_camera_pose_summary.get("pair_count", 0),
+                        "camera_pose_auc30": partial_camera_pose_summary.get("auc@30"),
                         "shard_rank": int(shard_rank),
                         "num_shards": int(num_shards),
                         "updated_at": time.time(),
                     },
                 )
 
+    run_camera_pair_rows = (
+        camera_pair_rows[camera_pair_start:] if camera_pair_rows is not None else []
+    )
     result = {
         "name": name,
         "split": split,
@@ -494,6 +650,7 @@ def evaluate_run(
         "requested_samples": int(limit),
         "candidate_samples": len(indices),
         "evaluated_samples": len(rows),
+        "sample_policy": sampling_info,
         "shard_rank": int(shard_rank),
         "num_shards": int(num_shards),
         "summary": summarize_values([row["loss"] for row in rows]),
@@ -512,6 +669,7 @@ def evaluate_run(
         "valid_fraction_summary": summarize_values([row["valid_fraction"] for row in rows]),
         "depth_metric_summary": summarize_metric_rows(rows, DEPTH_METRIC_KEYS),
         "panovggt_metric_summary": summarize_panovggt_rows(rows),
+        "panovggt_camera_pose_summary": summarize_camera_pose_pairs(run_camera_pair_rows),
         "by_quality_bin": summarize_by_key(rows, "quality_bin", "loss"),
         "best_samples": {
             "by_loss": rank_samples(rows, "loss", reverse=False),
@@ -596,6 +754,212 @@ def compute_depth_metrics(pred_depth: torch.Tensor, target_depth: torch.Tensor, 
     }
 
 
+def compute_panovggt_camera_pose_metrics(
+    predictions: dict[str, Any],
+    batch: dict[str, Any],
+    position_mode: str,
+    pred_translation_scale: torch.Tensor | None,
+    trans_norm_thresh: float = 1e-2,
+) -> tuple[dict[str, float], list[dict[str, Any]]]:
+    """PanoVGGT-style pairwise relative-pose metrics for pano-level camera heads."""
+    empty = empty_camera_pose_sample_metrics()
+    pred_center = predictions.get("pano_camera_center")
+    pred_quat = predictions.get("pano_rotation_quat_w2c")
+    if pred_center is None or pred_quat is None:
+        return empty, []
+
+    targets = build_relative_pano_pose_targets(
+        batch=batch,
+        position_mode=position_mode,
+        device=pred_center.device,
+        dtype=torch.float32,
+    )
+    if targets is None:
+        return empty, []
+    target_center, target_quat, position_valid, rotation_valid = targets
+    if pred_center.shape != target_center.shape or pred_quat.shape != target_quat.shape:
+        return empty, []
+
+    pred_center = torch.nan_to_num(pred_center.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    pred_quat = F.normalize(
+        torch.nan_to_num(pred_quat.float(), nan=0.0, posinf=0.0, neginf=0.0),
+        dim=-1,
+        eps=1e-6,
+    )
+    pred_center, pred_quat = omega_y_up_pose_to_official_y_down(pred_center, pred_quat)
+    if pred_translation_scale is not None:
+        pred_center = pred_center * expand_sample_scale_like(pred_translation_scale, pred_center)
+
+    target_center = torch.nan_to_num(target_center.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    target_quat = F.normalize(
+        torch.nan_to_num(target_quat.float(), nan=0.0, posinf=0.0, neginf=0.0),
+        dim=-1,
+        eps=1e-6,
+    )
+    pred_w2c = camera_w2c_from_center_quat(pred_center, pred_quat)
+    target_w2c = camera_w2c_from_center_quat(target_center, target_quat)
+
+    batch_size, pano_count = pred_center.shape[:2]
+    if pano_count < 2:
+        return empty, []
+
+    pair_index = torch.combinations(
+        torch.arange(pano_count, device=pred_center.device),
+        r=2,
+        with_replacement=False,
+    )
+    if pair_index.numel() == 0:
+        return empty, []
+    pair_i = pair_index[:, 0]
+    pair_j = pair_index[:, 1]
+
+    all_r_err: list[torch.Tensor] = []
+    all_t_err: list[torch.Tensor] = []
+    all_gt_norm: list[torch.Tensor] = []
+    pair_rows: list[dict[str, Any]] = []
+    valid_pano = position_valid.bool() & rotation_valid.bool()
+    finite_pred = torch.isfinite(pred_w2c).all(dim=(-1, -2))
+    finite_target = torch.isfinite(target_w2c).all(dim=(-1, -2))
+    valid_pano = valid_pano & finite_pred & finite_target
+
+    for batch_index in range(batch_size):
+        pair_valid = valid_pano[batch_index, pair_i] & valid_pano[batch_index, pair_j]
+        if not bool(pair_valid.any()):
+            continue
+        pi = pair_i[pair_valid]
+        pj = pair_j[pair_valid]
+        rel_gt = target_w2c[batch_index, pj].bmm(invert_se3(target_w2c[batch_index, pi]))
+        rel_pred = pred_w2c[batch_index, pj].bmm(invert_se3(pred_w2c[batch_index, pi]))
+        gt_translation = rel_gt[:, :3, 3]
+        gt_translation_norm = torch.linalg.vector_norm(gt_translation, dim=-1)
+        baseline_valid = (
+            gt_translation_norm > float(trans_norm_thresh)
+        ) & torch.isfinite(gt_translation_norm) & torch.isfinite(rel_pred[:, :3, 3]).all(dim=-1)
+        if not bool(baseline_valid.any()):
+            continue
+
+        rel_gt = rel_gt[baseline_valid]
+        rel_pred = rel_pred[baseline_valid]
+        pi = pi[baseline_valid]
+        pj = pj[baseline_valid]
+        gt_translation_norm = gt_translation_norm[baseline_valid]
+        r_err = rotation_angle_degrees(rel_gt[:, :3, :3], rel_pred[:, :3, :3])
+        t_err = translation_angle_degrees(rel_gt[:, :3, 3], rel_pred[:, :3, 3])
+        finite_pair = torch.isfinite(r_err) & torch.isfinite(t_err)
+        if not bool(finite_pair.any()):
+            continue
+        r_err = r_err[finite_pair]
+        t_err = t_err[finite_pair]
+        pi = pi[finite_pair]
+        pj = pj[finite_pair]
+        gt_translation_norm = gt_translation_norm[finite_pair]
+        all_r_err.append(r_err)
+        all_t_err.append(t_err)
+        all_gt_norm.append(gt_translation_norm)
+        for idx in range(int(r_err.numel())):
+            r_value = float(r_err[idx].detach().cpu())
+            t_value = float(t_err[idx].detach().cpu())
+            pair_rows.append(
+                {
+                    "batch_index": int(batch_index),
+                    "pair_i": int(pi[idx].detach().cpu()),
+                    "pair_j": int(pj[idx].detach().cpu()),
+                    "camera_pose_rotation_deg": r_value,
+                    "camera_pose_translation_deg": t_value,
+                    "camera_pose_max_error_deg": max(r_value, t_value),
+                    "camera_pose_gt_translation_norm": float(gt_translation_norm[idx].detach().cpu()),
+                }
+            )
+
+    if not all_r_err:
+        return empty, []
+    r_all = torch.cat(all_r_err).detach().float().cpu()
+    t_all = torch.cat(all_t_err).detach().float().cpu()
+    gt_norm_all = torch.cat(all_gt_norm).detach().float().cpu()
+    return camera_pose_sample_metrics(r_all, t_all, gt_norm_all), pair_rows
+
+
+def empty_camera_pose_sample_metrics() -> dict[str, float]:
+    return {key: 0.0 for key in CAMERA_POSE_SAMPLE_KEYS}
+
+
+def camera_w2c_from_center_quat(center: torch.Tensor, quat_w2c: torch.Tensor) -> torch.Tensor:
+    rotations_w2c = quat_to_mat(F.normalize(quat_w2c.float(), dim=-1, eps=1e-6))
+    translation = -(rotations_w2c @ center.float()[..., None])[..., 0]
+    eye = torch.eye(4, device=center.device, dtype=torch.float32)
+    pose = eye.reshape(*((1,) * (rotations_w2c.ndim - 2)), 4, 4).repeat(*rotations_w2c.shape[:-2], 1, 1)
+    pose[..., :3, :3] = rotations_w2c
+    pose[..., :3, 3] = translation
+    return pose
+
+
+def invert_se3(pose: torch.Tensor) -> torch.Tensor:
+    rotation = pose[..., :3, :3]
+    translation = pose[..., :3, 3]
+    inv_rotation = rotation.transpose(-1, -2).contiguous()
+    inv_translation = -(inv_rotation @ translation[..., None])[..., 0]
+    inv_pose = torch.zeros_like(pose)
+    inv_pose[..., :3, :3] = inv_rotation
+    inv_pose[..., :3, 3] = inv_translation
+    inv_pose[..., 3, 3] = 1.0
+    return inv_pose
+
+
+def rotation_angle_degrees(rot_gt: torch.Tensor, rot_pred: torch.Tensor, eps: float = 1e-15) -> torch.Tensor:
+    q_gt = mat_to_quat(rot_gt.float())
+    q_pred = mat_to_quat(rot_pred.float())
+    dot = (q_pred * q_gt).sum(dim=-1)
+    loss = (1.0 - dot.square()).clamp(min=eps, max=1.0)
+    return torch.arccos((1.0 - 2.0 * loss).clamp(-1.0, 1.0)) * (180.0 / math.pi)
+
+
+def translation_angle_degrees(
+    t_gt: torch.Tensor,
+    t_pred: torch.Tensor,
+    eps: float = 1e-15,
+    default_err: float = 1e6,
+) -> torch.Tensor:
+    t_gt = t_gt.float() / (torch.linalg.vector_norm(t_gt.float(), dim=-1, keepdim=True) + eps)
+    t_pred = t_pred.float() / (torch.linalg.vector_norm(t_pred.float(), dim=-1, keepdim=True) + eps)
+    dot2 = (t_gt * t_pred).sum(dim=-1).square()
+    err = torch.arccos(torch.sqrt(1.0 - (1.0 - dot2).clamp(min=eps)))
+    err = torch.where(torch.isfinite(err), err, err.new_full(err.shape, float(default_err)))
+    deg = err * (180.0 / math.pi)
+    return torch.minimum(deg, (180.0 - deg).abs())
+
+
+def camera_pose_sample_metrics(
+    r_error: torch.Tensor,
+    t_error: torch.Tensor,
+    gt_translation_norm: torch.Tensor,
+) -> dict[str, float]:
+    max_error = torch.maximum(r_error, t_error)
+    return {
+        "camera_pose_pair_count": float(r_error.numel()),
+        "camera_pose_auc3": pose_auc(r_error, t_error, 3),
+        "camera_pose_auc5": pose_auc(r_error, t_error, 5),
+        "camera_pose_auc15": pose_auc(r_error, t_error, 15),
+        "camera_pose_auc30": pose_auc(r_error, t_error, 30),
+        "camera_pose_rotation_deg_mean": float(r_error.mean()),
+        "camera_pose_rotation_deg_median": float(r_error.median()),
+        "camera_pose_translation_deg_mean": float(t_error.mean()),
+        "camera_pose_translation_deg_median": float(t_error.median()),
+        "camera_pose_max_error_deg_mean": float(max_error.mean()),
+        "camera_pose_max_error_deg_median": float(max_error.median()),
+        "camera_pose_gt_translation_norm_mean": float(gt_translation_norm.mean()),
+        "camera_pose_gt_translation_norm_median": float(gt_translation_norm.median()),
+    }
+
+
+def pose_auc(r_error: torch.Tensor, t_error: torch.Tensor, max_threshold: int) -> float:
+    if r_error.numel() == 0 or t_error.numel() == 0:
+        return 0.0
+    errs = torch.maximum(r_error.float(), t_error.float()).detach().cpu().numpy()
+    hist, _ = np.histogram(errs, bins=np.arange(int(max_threshold) + 1))
+    norm = hist.astype(np.float64) / max(len(errs), 1)
+    return float(np.mean(np.cumsum(norm)))
+
+
 def depth_metrics_from_values(pred_values: torch.Tensor, target_values: torch.Tensor, prefix: str) -> dict[str, float]:
     diff = pred_values - target_values
     abs_diff = diff.abs()
@@ -645,6 +1009,101 @@ def sample_indices(length: int, limit: int, seed: int) -> list[int]:
     return indices[:limit]
 
 
+def resolve_eval_limit(total: int, limit: int, limit_fraction: float) -> int:
+    if total <= 0:
+        return 0
+    if int(limit) > 0:
+        return min(int(limit), total)
+    fraction = float(limit_fraction or 0.0)
+    if fraction > 0.0:
+        return max(1, min(total, int(math.ceil(total * min(fraction, 1.0)))))
+    return total
+
+
+def select_eval_indices(
+    dataset: Any,
+    limit: int,
+    seed: int,
+    sample_policy: str,
+    limit_fraction: float = 0.0,
+) -> tuple[list[int], dict[str, Any]]:
+    policy = str(sample_policy or "scene_neighborhood")
+    if policy == "anchor":
+        resolved_limit = resolve_eval_limit(len(dataset), limit, limit_fraction)
+        indices = sample_indices(len(dataset), resolved_limit, seed)
+        return indices, {
+            "policy": "anchor",
+            "dataset_size": len(dataset),
+            "limit": int(limit),
+            "limit_fraction": float(limit_fraction or 0.0),
+            "selected_samples": len(indices),
+            "scene_group_count": None,
+        }
+    if policy != "scene_neighborhood":
+        raise ValueError(f"Unknown eval sample policy: {sample_policy}")
+
+    scene_to_indices = scene_neighborhood_indices(dataset)
+    if not scene_to_indices:
+        resolved_limit = resolve_eval_limit(len(dataset), limit, limit_fraction)
+        indices = sample_indices(len(dataset), resolved_limit, seed)
+        return indices, {
+            "policy": "anchor_fallback",
+            "requested_policy": policy,
+            "dataset_size": len(dataset),
+            "limit": int(limit),
+            "limit_fraction": float(limit_fraction or 0.0),
+            "selected_samples": len(indices),
+            "scene_group_count": None,
+        }
+
+    rng = random.Random(int(seed))
+    scene_keys = sorted(scene_to_indices)
+    rng.shuffle(scene_keys)
+    resolved_limit = resolve_eval_limit(len(scene_keys), limit, limit_fraction)
+    scene_keys = scene_keys[:resolved_limit]
+
+    selected = [rng.choice(scene_to_indices[scene_key]) for scene_key in scene_keys]
+    return selected, {
+        "policy": "scene_neighborhood",
+        "dataset_size": len(dataset),
+        "limit": int(limit),
+        "limit_fraction": float(limit_fraction or 0.0),
+        "scene_group_count": len(scene_to_indices),
+        "selected_scene_groups": len(scene_keys),
+        "selected_samples": len(selected),
+    }
+
+
+def scene_neighborhood_indices(dataset: Any) -> dict[str, list[int]]:
+    groups = getattr(dataset, "groups", None)
+    items = getattr(dataset, "items", None)
+    if groups is None or items is None:
+        return {}
+
+    scene_to_indices: dict[str, list[int]] = {}
+    for group_index, group in enumerate(groups):
+        if not group:
+            continue
+        scene_keys = {_item_scene_group_key(items[int(item_index)]) for item_index in group}
+        if len(scene_keys) != 1:
+            raise RuntimeError(f"Eval multi-pano group crosses scenes: group={group_index} scene_keys={sorted(scene_keys)}")
+        scene_key = next(iter(scene_keys))
+        scene_to_indices.setdefault(scene_key, []).append(group_index)
+    return scene_to_indices
+
+
+def _item_scene_group_key(item: Any) -> str:
+    if isinstance(item, dict):
+        for key in ("scene_group_key", "scene_name"):
+            value = item.get(key)
+            if value not in (None, ""):
+                return str(value)
+        dataset = str(item.get("dataset") or item.get("sequence_name") or "unknown")
+        rgb_path = str(item.get("rgb_path") or "")
+        return f"{dataset}:{rgb_path}"
+    return str(item)
+
+
 def summarize_values(values: list[float]) -> dict[str, Any]:
     finite = [float(value) for value in values if math.isfinite(float(value))]
     if not finite:
@@ -684,9 +1143,9 @@ def summarize_metric_rows(rows: list[dict[str, Any]], keys: list[str]) -> dict[s
 def summarize_panovggt_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "metric_meaning": {
-            "depth_irls_abs_rel": "Abs Rel after per-sample IRLS scale alignment; closest to PanoVGGT depth table protocol.",
-            "depth_irls_delta_1p25": "delta < 1.25 after per-sample IRLS scale alignment; closest to PanoVGGT depth table protocol.",
-            "depth_irls_rmse": "RMSE after per-sample IRLS scale alignment.",
+            "depth_irls_abs_rel": "Abs Rel after per-sample robust scale-only alignment; this is the primary PanoVGGT-style depth comparison.",
+            "depth_irls_delta_1p25": "delta < 1.25 after per-sample robust scale-only alignment; this is the primary PanoVGGT-style depth comparison.",
+            "depth_irls_rmse": "RMSE after per-sample robust scale-only alignment.",
             "depth_abs_rel": "Raw-scale Abs Rel using the model/checkpoint predicted depth scale.",
             "depth_delta_1p25": "Raw-scale delta < 1.25 using the model/checkpoint predicted depth scale.",
             "depth_rmse": "Raw-scale RMSE using the model/checkpoint predicted depth scale.",
@@ -694,6 +1153,56 @@ def summarize_panovggt_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "macro_by_sample": summarize_metric_rows(rows, PANOVGGT_PRIMARY_METRICS),
         "micro_by_valid_pixel": summarize_panovggt_micro(rows),
     }
+
+
+def summarize_camera_pose_pairs(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    r_values = finite_row_values(rows, "camera_pose_rotation_deg")
+    t_values = finite_row_values(rows, "camera_pose_translation_deg")
+    gt_norm_values = finite_row_values(rows, "camera_pose_gt_translation_norm")
+    if not r_values or not t_values:
+        return {
+            "metric_meaning": {
+                "translation_deg": "PanoVGGT-style relative translation direction error over unordered pano pairs.",
+                "rotation_deg": "PanoVGGT-style relative rotation geodesic error over unordered pano pairs.",
+                "auc@k": "Mean CDF of max(rotation_deg, translation_deg) over thresholds [0, k).",
+            },
+            "pair_count": 0,
+        }
+    r_arr = np.asarray(r_values, dtype=np.float64)
+    t_arr = np.asarray(t_values, dtype=np.float64)
+    max_arr = np.maximum(r_arr, t_arr)
+    summary = {
+        "metric_meaning": {
+            "translation_deg": "PanoVGGT-style relative translation direction error over unordered pano pairs.",
+            "rotation_deg": "PanoVGGT-style relative rotation geodesic error over unordered pano pairs.",
+            "auc@k": "Mean CDF of max(rotation_deg, translation_deg), matching PanoVGGT/VGGSfM pose AUC aggregation.",
+        },
+        "pair_count": int(len(r_values)),
+        "rotation_deg": summarize_values(r_values),
+        "translation_deg": summarize_values(t_values),
+        "max_error_deg": summarize_values(max_arr.tolist()),
+        "gt_translation_norm": summarize_values(gt_norm_values),
+    }
+    for threshold in (3, 5, 15, 30):
+        hist, _ = np.histogram(max_arr, bins=np.arange(threshold + 1))
+        norm = hist.astype(np.float64) / max(len(max_arr), 1)
+        summary[f"auc@{threshold}"] = float(np.mean(np.cumsum(norm)))
+    return summary
+
+
+def finite_row_values(rows: list[dict[str, Any]], key: str) -> list[float]:
+    values: list[float] = []
+    for row in rows:
+        raw = row.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    return values
 
 
 def summarize_panovggt_micro(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -727,7 +1236,13 @@ def rank_samples(rows: list[dict[str, Any]], key: str, reverse: bool, limit: int
         "depth_path",
         "loss",
         "loss_depth",
+        "loss_camera",
+        "loss_camera_t",
         "valid_fraction",
+        "camera_pose_pair_count",
+        "camera_pose_translation_deg_median",
+        "camera_pose_rotation_deg_median",
+        "camera_pose_auc30",
         "depth_irls_abs_rel",
         "depth_irls_delta_1p25",
         "depth_abs_rel",
@@ -764,27 +1279,32 @@ def read_train_loss_reference(path: Path | None) -> dict[str, Any] | None:
 
 def write_per_sample_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "run",
-        "dataset_index",
-        "seq_name",
-        "rgb_path",
-        "depth_path",
-        "quality_bin",
-        "loss",
-        "loss_depth",
-        "loss_overlap",
-        "valid_fraction",
-        "pred_depth_scale",
-        "metadata_valid_ratio",
-        "metadata_structure_score",
-        "sample_weight",
-        *DEPTH_METRIC_KEYS,
-        *DEPTH_ACCUMULATOR_KEYS,
-    ]
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=PER_SAMPLE_CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
+        writer.writerows(rows)
+
+
+def initialize_csv(path: Path, fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+
+
+def append_csv_row(path: Path, fieldnames: list[str], row: dict[str, Any]) -> None:
+    append_csv_rows(path, fieldnames, [row])
+
+
+def append_csv_rows(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
         writer.writerows(rows)
 
 

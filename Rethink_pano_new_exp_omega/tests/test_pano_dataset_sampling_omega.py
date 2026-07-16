@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(THIS_DIR))
 from training.data import PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E402
 from training.data.pano_minimal import _item, _read_pose_position_rotation, _read_structured3d_position  # noqa: E402
 from training.train_pano_omega import write_smoke_dataset  # noqa: E402
+from scripts.evaluate_depth_checkpoint import select_eval_indices  # noqa: E402
 
 
 def test_single_pano_sampling_returns_one_erp():
@@ -219,6 +220,74 @@ def test_camera_supervision_dataset_allowlist():
         assert bool(item["pano_rotation_raw_valid"])
 
 
+def test_eval_scene_neighborhood_selects_one_group_per_scene():
+    class DummyDataset:
+        items = [
+            {"scene_group_key": "scene_a"},
+            {"scene_group_key": "scene_a"},
+            {"scene_group_key": "scene_b"},
+            {"scene_group_key": "scene_b"},
+        ]
+        groups = [[0, 1], [1, 0], [2, 3], [3, 2]]
+
+        def __len__(self):
+            return len(self.groups)
+
+    indices, info = select_eval_indices(DummyDataset(), limit=0, seed=7, sample_policy="scene_neighborhood")
+    assert info["policy"] == "scene_neighborhood"
+    assert info["scene_group_count"] == 2
+    assert len(indices) == 2
+    assert {0, 1} & set(indices)
+    assert {2, 3} & set(indices)
+
+
+def test_eval_scene_neighborhood_limit_fraction_applies_to_scene_groups():
+    class DummyDataset:
+        items = [
+            {"scene_group_key": "scene_a"},
+            {"scene_group_key": "scene_a"},
+            {"scene_group_key": "scene_b"},
+            {"scene_group_key": "scene_b"},
+            {"scene_group_key": "scene_c"},
+            {"scene_group_key": "scene_c"},
+        ]
+        groups = [[0, 1], [1, 0], [2, 3], [3, 2], [4, 5], [5, 4]]
+
+        def __len__(self):
+            return len(self.groups)
+
+    indices, info = select_eval_indices(
+        DummyDataset(),
+        limit=0,
+        seed=7,
+        sample_policy="scene_neighborhood",
+        limit_fraction=0.5,
+    )
+    assert info["policy"] == "scene_neighborhood"
+    assert info["scene_group_count"] == 3
+    assert info["selected_scene_groups"] == 2
+    assert len(indices) == 2
+
+
+def test_eval_scene_neighborhood_rejects_cross_scene_group():
+    class DummyDataset:
+        items = [
+            {"scene_group_key": "scene_a"},
+            {"scene_group_key": "scene_b"},
+        ]
+        groups = [[0, 1]]
+
+        def __len__(self):
+            return len(self.groups)
+
+    try:
+        select_eval_indices(DummyDataset(), limit=0, seed=7, sample_policy="scene_neighborhood")
+    except RuntimeError as exc:
+        assert "crosses scenes" in str(exc)
+    else:
+        raise AssertionError("Expected cross-scene eval group to be rejected")
+
+
 def _scene_key(dataset: PanoMinimalDataset, item_index: int) -> str:
     return str(dataset.items[item_index].get("scene_group_key"))
 
@@ -303,4 +372,7 @@ if __name__ == "__main__":
     test_minimal_panocity_groups_use_official_part_id_from_legacy_cache()
     test_minimal_structured3d_position_is_converted_to_opencv()
     test_structured3d_keeps_positions_but_disables_translation_supervision()
+    test_eval_scene_neighborhood_selects_one_group_per_scene()
+    test_eval_scene_neighborhood_limit_fraction_applies_to_scene_groups()
+    test_eval_scene_neighborhood_rejects_cross_scene_group()
     print("pano dataset sampling (omega) ok")

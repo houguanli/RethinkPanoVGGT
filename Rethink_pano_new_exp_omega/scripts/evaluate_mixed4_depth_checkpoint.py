@@ -23,16 +23,20 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.evaluate_depth_checkpoint import (  # noqa: E402
+    CAMERA_PAIR_CSV_FIELDS,
     DEPTH_ACCUMULATOR_KEYS,
     DEPTH_METRIC_KEYS,
     PANOVGGT_PRIMARY_METRICS,
+    PER_SAMPLE_CSV_FIELDS,
     apply_checkpoint_eval_defaults,
     build_eval_model,
     evaluate_run,
+    initialize_csv,
     load_checkpoint_payload,
     normalize_args_for_eval,
     rank_samples,
     read_train_loss_reference,
+    summarize_camera_pose_pairs,
     summarize_metric_rows,
     summarize_panovggt_rows,
     write_eval_progress,
@@ -86,7 +90,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated dataset ids/names to evaluate: all, panocity, matterport3d, stanford2d3ds, structured3d.",
     )
     parser.add_argument("--limit-per-dataset", type=int, default=100, help="Held-out samples per dataset. Use 0 for the full split.")
+    parser.add_argument("--limit-fraction", type=float, default=0.0, help="Fraction of scene groups per dataset when --limit-per-dataset <= 0.")
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--sample-policy",
+        choices=["scene_neighborhood", "anchor"],
+        default="scene_neighborhood",
+        help=(
+            "scene_neighborhood evaluates one nearest-neighborhood group per "
+            "scene/room/trajectory; anchor preserves the older random-anchor behavior."
+        ),
+    )
+    parser.add_argument("--camera-pair-csv", type=Path, default=None, help="Optional streaming PanoVGGT-style camera pair CSV path.")
+    parser.add_argument("--camera-pose-trans-norm-thresh", type=float, default=1e-2, help="GT baseline threshold for PanoVGGT-style camera translation-angle eval.")
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default=None)
@@ -134,6 +150,14 @@ def main() -> None:
     model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
     model.eval()
 
+    camera_pair_csv = args.camera_pair_csv
+    if camera_pair_csv is None and args.per_sample_csv is not None:
+        camera_pair_csv = args.per_sample_csv.with_name(f"{args.per_sample_csv.stem}_camera_pairs.csv")
+    if args.per_sample_csv is not None:
+        initialize_csv(args.per_sample_csv, PER_SAMPLE_CSV_FIELDS)
+    if camera_pair_csv is not None:
+        initialize_csv(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS)
+
     selected_datasets = select_datasets(args.datasets)
     write_eval_progress(
         args.progress_file,
@@ -150,6 +174,7 @@ def main() -> None:
     )
     runs: list[dict[str, Any]] = []
     per_sample_rows: list[dict[str, Any]] = []
+    camera_pair_rows: list[dict[str, Any]] = []
     for dataset_index, (display_name, minimal_name, split) in enumerate(DATASETS):
         if minimal_name not in selected_datasets:
             continue
@@ -166,10 +191,16 @@ def main() -> None:
             split=split,
             curriculum_bins="all",
             limit=args.limit_per_dataset,
+            limit_fraction=args.limit_fraction,
             seed=args.seed + dataset_index * 1009,
+            sample_policy=args.sample_policy,
             num_workers=args.num_workers,
             progress=args.progress,
             per_sample_rows=per_sample_rows,
+            per_sample_csv=args.per_sample_csv,
+            camera_pair_rows=camera_pair_rows,
+            camera_pair_csv=camera_pair_csv,
+            row_context={"dataset": display_name, "split": split},
             shard_rank=args.shard_rank,
             num_shards=args.num_shards,
             progress_file=args.progress_file,
@@ -180,6 +211,7 @@ def main() -> None:
                 "torch_cuda_device_count": torch_cuda_device_count(),
                 "selected_datasets": sorted(selected_datasets),
             },
+            camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
         )
         run["dataset"] = display_name
         run["minimal_dataset"] = minimal_name
@@ -194,10 +226,12 @@ def main() -> None:
         "device": str(device),
         "seed": args.seed,
         "limit_per_dataset": int(args.limit_per_dataset),
+        "limit_fraction": float(args.limit_fraction or 0.0),
         "datasets": sorted(selected_datasets),
         "shard_rank": int(args.shard_rank),
         "num_shards": int(args.num_shards),
         "dataset_root": str(train_args.dataset_root),
+        "sample_policy": str(args.sample_policy),
         "split_policy": {
             "Panocity": "test (PanoVGGT official split when cache was built with official split JSONs)",
             "Matterport3D": "test",
@@ -208,6 +242,7 @@ def main() -> None:
         "runs": runs,
         "overall": summarize_runs(runs),
         "panovggt_depth_benchmark": summarize_panovggt_benchmark(runs, per_sample_rows),
+        "panovggt_camera_benchmark": summarize_panovggt_camera_benchmark(runs, camera_pair_rows),
         "case_rankings": {
             "best_by_depth_irls_abs_rel": rank_samples(per_sample_rows, "depth_irls_abs_rel", reverse=False, limit=20),
             "worst_by_depth_irls_abs_rel": rank_samples(per_sample_rows, "depth_irls_abs_rel", reverse=True, limit=20),
@@ -360,6 +395,27 @@ def summarize_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str
     }
 
 
+def summarize_panovggt_camera_benchmark(runs: list[dict[str, Any]], pair_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    per_dataset = {}
+    for run in runs:
+        dataset = str(run.get("dataset", "unknown"))
+        dataset_rows = [row for row in pair_rows if str(row.get("dataset", "unknown")) == dataset]
+        per_dataset[dataset] = {
+            "evaluated_samples": run.get("evaluated_samples", 0),
+            "split": run.get("split"),
+            "pose": summarize_camera_pose_pairs(dataset_rows),
+        }
+    return {
+        "protocol_note": (
+            "Camera pose metrics follow PanoVGGT's pairwise relative-pose evaluation: "
+            "unordered pano pairs, translation direction error in degrees, rotation geodesic error in degrees, "
+            "and AUC over max(R,T). Datasets without valid translation/rotation GT produce pair_count=0."
+        ),
+        "per_dataset": per_dataset,
+        "overall": summarize_camera_pose_pairs(pair_rows),
+    }
+
+
 def compare_to_reference(ours_abs_rel: Any, ours_delta: Any, reference: dict[str, float] | None) -> dict[str, Any] | None:
     if reference is None or ours_abs_rel is None or ours_delta is None:
         return None
@@ -380,37 +436,8 @@ def macro_reference(reference: dict[str, dict[str, float]]) -> dict[str, float]:
 
 def write_per_sample_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "dataset",
-        "split",
-        "run",
-        "dataset_index",
-        "seq_name",
-        "rgb_path",
-        "depth_path",
-        "quality_bin",
-        "loss",
-        "loss_depth",
-        "loss_overlap",
-        "loss_global_point",
-        "global_point_valid_ratio",
-        "loss_camera",
-        "loss_camera_t",
-        "loss_camera_r",
-        "camera_translation_deg",
-        "camera_rotation_deg",
-        "camera_translation_valid_count",
-        "camera_rotation_valid_count",
-        "valid_fraction",
-        "pred_depth_scale",
-        "metadata_valid_ratio",
-        "metadata_structure_score",
-        "sample_weight",
-        *DEPTH_METRIC_KEYS,
-        *DEPTH_ACCUMULATOR_KEYS,
-    ]
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(handle, fieldnames=PER_SAMPLE_CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
