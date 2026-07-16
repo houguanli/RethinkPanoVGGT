@@ -35,9 +35,11 @@ from training.train_pano_omega import (  # noqa: E402
     masked_depth_loss,
     move_batch_to_device,
     normalize_camera_supervision_args,
+    normalize_dense_head_frames_chunk_size,
     normalize_pano_sampling_args,
     normalize_pred_depth_scale_args,
     normalize_training_stages,
+    parse_dataset_depth_scales,
     parse_args as parse_training_args,
     resolve_device,
     sample_depth_targets,
@@ -224,7 +226,14 @@ def build_eval_model(
     load_checkpoint(base_model, checkpoint, strict=False)
 
     adapter_state = payload.get("adapter_state")
-    needs_adapter = bool(args.learn_pred_depth_scale) or args.depth_residual_mode != "none" or adapter_state is not None
+    dataset_depth_scales = parse_dataset_depth_scales(getattr(args, "dataset_depth_scales", None))
+    dataset_depth_scale_mode = str(getattr(args, "dataset_depth_scale_mode", "none") or "none")
+    needs_adapter = (
+        bool(args.learn_pred_depth_scale)
+        or args.depth_residual_mode != "none"
+        or dataset_depth_scale_mode != "none"
+        or adapter_state is not None
+    )
     if not needs_adapter:
         return base_model
 
@@ -232,9 +241,16 @@ def build_eval_model(
         base_model,
         initial_scale=float(args.pred_depth_scale),
         learn_scale=bool(args.learn_pred_depth_scale),
+        dataset_scale_mode=dataset_depth_scale_mode,
+        dataset_scales=dataset_depth_scales,
         residual_mode=str(args.depth_residual_mode),
         residual_hidden=int(args.depth_residual_hidden),
         residual_max_log=float(args.depth_residual_max_log),
+        residual_frames_chunk_size=normalize_dense_head_frames_chunk_size(
+            args.depth_residual_frames_chunk_size
+        ),
+        residual_use_checkpoint=bool(args.depth_residual_use_checkpoint),
+        store_residual_debug=bool(args.store_depth_residual_debug),
     ).to(device)
     if adapter_state is not None:
         adapter_state = {key: value.to(device) if torch.is_tensor(value) else value for key, value in adapter_state.items()}
