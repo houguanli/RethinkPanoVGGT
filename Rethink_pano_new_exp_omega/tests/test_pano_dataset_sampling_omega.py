@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from types import SimpleNamespace
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(THIS_DIR))
@@ -15,7 +16,7 @@ sys.path.insert(0, os.path.dirname(THIS_DIR))
 from training.data import PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E402
 from training.data.pano_minimal import _item, _read_pose_position_rotation, _read_structured3d_position  # noqa: E402
 from training.train_pano_omega import write_smoke_dataset  # noqa: E402
-from scripts.evaluate_depth_checkpoint import select_eval_indices  # noqa: E402
+from scripts.evaluate_depth_checkpoint import apply_eval_max_panos, select_eval_indices  # noqa: E402
 
 
 def test_single_pano_sampling_returns_one_erp():
@@ -269,6 +270,13 @@ def test_eval_scene_neighborhood_limit_fraction_applies_to_scene_groups():
     assert len(indices) == 2
 
 
+def test_eval_max_panos_clamps_min_and_max_counts():
+    args = SimpleNamespace(pano_min_count=8, pano_max_count=10)
+    apply_eval_max_panos(args, 6)
+    assert args.pano_min_count == 6
+    assert args.pano_max_count == 6
+
+
 def test_eval_scene_neighborhood_rejects_cross_scene_group():
     class DummyDataset:
         items = [
@@ -374,5 +382,6 @@ if __name__ == "__main__":
     test_structured3d_keeps_positions_but_disables_translation_supervision()
     test_eval_scene_neighborhood_selects_one_group_per_scene()
     test_eval_scene_neighborhood_limit_fraction_applies_to_scene_groups()
+    test_eval_max_panos_clamps_min_and_max_counts()
     test_eval_scene_neighborhood_rejects_cross_scene_group()
     print("pano dataset sampling (omega) ok")

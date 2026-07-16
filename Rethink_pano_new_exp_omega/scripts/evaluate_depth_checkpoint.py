@@ -171,6 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--curriculum-bins", default="all", help="Bins for the main validation run. Use all/clean,normal/hard.")
     parser.add_argument("--limit", type=int, default=100, help="Number of samples for the main validation run.")
     parser.add_argument("--limit-fraction", type=float, default=0.0, help="Fraction of scene groups/samples to evaluate when --limit <= 0.")
+    parser.add_argument("--eval-max-panos", type=int, default=0, help="Clamp eval multi-pano input length. Use 0 to keep config pano_max_count.")
     parser.add_argument("--hard-limit", type=int, default=100, help="Extra hard-bin val samples. Use 0 to disable.")
     parser.add_argument("--seed", type=int, default=123, help="Deterministic sample seed.")
     parser.add_argument(
@@ -210,6 +211,7 @@ def main() -> None:
 
     checkpoint_payload = load_checkpoint_payload(args.checkpoint)
     apply_checkpoint_eval_defaults(train_args, checkpoint_payload)
+    apply_eval_max_panos(train_args, args.eval_max_panos)
     model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
     model.eval()
 
@@ -281,6 +283,8 @@ def main() -> None:
             "window_size": int(train_args.window_size),
             "patch_size": int(train_args.patch_size),
             "num_yaw": int(train_args.num_yaw),
+            "pano_min_count": int(getattr(train_args, "pano_min_count", 1)),
+            "pano_max_count": int(getattr(train_args, "pano_max_count", 1)),
             "pitch_degrees": str(train_args.pitch_degrees),
             "fov_degrees": float(train_args.fov_degrees),
         },
@@ -319,6 +323,18 @@ def apply_checkpoint_eval_defaults(args: argparse.Namespace, payload: dict[str, 
     for key in ("window_size", "patch_size", "num_yaw", "pitch_degrees", "fov_degrees"):
         if key in ckpt_args and ckpt_args[key] is not None:
             setattr(args, key, ckpt_args[key])
+
+
+def apply_eval_max_panos(args: argparse.Namespace, max_panos: int | None) -> None:
+    max_value = int(max_panos or 0)
+    if max_value <= 0:
+        return
+    current_max = int(getattr(args, "pano_max_count", max_value) or max_value)
+    current_min = int(getattr(args, "pano_min_count", 1) or 1)
+    capped = max(1, min(current_max, max_value))
+    args.pano_max_count = capped
+    if current_min > capped:
+        args.pano_min_count = capped
 
 
 def build_eval_model(
@@ -647,6 +663,8 @@ def evaluate_run(
         "split": split,
         "curriculum_bins": curriculum_bins or "all",
         "dataset_size": len(dataset),
+        "eval_pano_min_count": int(getattr(eval_args, "pano_min_count", 1)),
+        "eval_pano_max_count": int(getattr(eval_args, "pano_max_count", 1)),
         "requested_samples": int(limit),
         "candidate_samples": len(indices),
         "evaluated_samples": len(rows),

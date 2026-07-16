@@ -31,6 +31,7 @@ from scripts.evaluate_depth_checkpoint import (  # noqa: E402
     apply_checkpoint_eval_defaults,
     build_eval_model,
     evaluate_run,
+    apply_eval_max_panos,
     initialize_csv,
     load_checkpoint_payload,
     normalize_args_for_eval,
@@ -91,6 +92,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--limit-per-dataset", type=int, default=100, help="Held-out samples per dataset. Use 0 for the full split.")
     parser.add_argument("--limit-fraction", type=float, default=0.0, help="Fraction of scene groups per dataset when --limit-per-dataset <= 0.")
+    parser.add_argument("--eval-max-panos", type=int, default=0, help="Clamp eval multi-pano input length for all datasets. Use 0 to keep config pano_max_count.")
+    parser.add_argument("--panocity-max-panos", type=int, default=0, help="Optional Panocity-specific eval pano cap, overriding --eval-max-panos for Panocity.")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument(
         "--sample-policy",
@@ -181,6 +184,10 @@ def main() -> None:
         dataset_args = copy.copy(train_args)
         dataset_args.dataset_format = "pano_minimal"
         dataset_args.minimal_datasets = minimal_name
+        dataset_eval_max_panos = int(args.eval_max_panos or 0)
+        if minimal_name == "panocity" and int(args.panocity_max_panos or 0) > 0:
+            dataset_eval_max_panos = int(args.panocity_max_panos)
+        apply_eval_max_panos(dataset_args, dataset_eval_max_panos)
         run_name = f"{display_name}_{split}_{args.limit_per_dataset}"
         before_count = len(per_sample_rows)
         run = evaluate_run(
@@ -215,6 +222,9 @@ def main() -> None:
         )
         run["dataset"] = display_name
         run["minimal_dataset"] = minimal_name
+        run["requested_eval_max_panos"] = dataset_eval_max_panos
+        run["effective_eval_pano_min_count"] = int(getattr(dataset_args, "pano_min_count", 1))
+        run["effective_eval_pano_max_count"] = int(getattr(dataset_args, "pano_max_count", 1))
         runs.append(run)
         for row in per_sample_rows[before_count:]:
             row["dataset"] = display_name
@@ -227,6 +237,8 @@ def main() -> None:
         "seed": args.seed,
         "limit_per_dataset": int(args.limit_per_dataset),
         "limit_fraction": float(args.limit_fraction or 0.0),
+        "eval_max_panos": int(args.eval_max_panos or 0),
+        "panocity_max_panos": int(args.panocity_max_panos or 0),
         "datasets": sorted(selected_datasets),
         "shard_rank": int(args.shard_rank),
         "num_shards": int(args.num_shards),
