@@ -332,6 +332,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional learning rate for --learn-pred-depth-scale; defaults to --lr.",
     )
     parser.add_argument(
+        "--normalize-scene-scale",
+        dest="normalize_scene_scale",
+        action="store_true",
+        default=False,
+        help=(
+            "Normalize each training sample to a PanoVGGT-style unit scene scale before "
+            "depth/camera losses. This disables global/dataset preset depth scales."
+        ),
+    )
+    parser.add_argument(
+        "--no-normalize-scene-scale",
+        dest="normalize_scene_scale",
+        action="store_false",
+        help="Disable PanoVGGT-style scene scale normalization.",
+    )
+    parser.add_argument("--scene-scale-normalization-eps", type=float, default=1e-3)
+    parser.add_argument("--scene-scale-normalization-min", type=float, default=1e-6)
+    parser.add_argument("--scene-scale-normalization-max", type=float, default=1e6)
+    parser.add_argument(
         "--depth-residual-mode",
         choices=["none", "log_conv"],
         default="none",
@@ -632,6 +651,7 @@ def train(args: argparse.Namespace) -> None:
         checkpoint_payload = load_checkpoint_payload(args.checkpoint) if args.checkpoint is not None else {}
         if args.inherit_checkpoint_training_defaults:
             apply_checkpoint_training_defaults(args, checkpoint_payload)
+            normalize_pred_depth_scale_args(args)
         if args.base_checkpoint is not None and (
             args.checkpoint is None or args.base_checkpoint.resolve() != args.checkpoint.resolve()
         ):
@@ -750,6 +770,13 @@ def train(args: argparse.Namespace) -> None:
             )
         rank0_print(f"[INFO] pred_depth_scale = {args.pred_depth_scale}", dist_state)
         rank0_print(f"[INFO] learn_pred_depth_scale = {args.learn_pred_depth_scale}", dist_state)
+        rank0_print(
+            "[INFO] scene_scale_normalization = "
+            f"{args.normalize_scene_scale} "
+            f"range=[{args.scene_scale_normalization_min}, {args.scene_scale_normalization_max}] "
+            f"eps={args.scene_scale_normalization_eps}",
+            dist_state,
+        )
         rank0_print(
             "[INFO] depth_scale_alignment = "
             f"{args.depth_scale_alignment} "
@@ -970,6 +997,11 @@ def train(args: argparse.Namespace) -> None:
                     ),
                     "depth_loss_scale_min": float(loss_dict.get("depth_loss_scale_min", torch.tensor(1.0)).item()),
                     "depth_loss_scale_max": float(loss_dict.get("depth_loss_scale_max", torch.tensor(1.0)).item()),
+                    "scene_norm_scale_median": float(
+                        loss_dict.get("scene_norm_scale_median", torch.tensor(1.0)).item()
+                    ),
+                    "scene_norm_scale_min": float(loss_dict.get("scene_norm_scale_min", torch.tensor(1.0)).item()),
+                    "scene_norm_scale_max": float(loss_dict.get("scene_norm_scale_max", torch.tensor(1.0)).item()),
                     "dataset_depth_scale_median": float(
                         loss_dict.get("dataset_depth_scale_median", torch.tensor(1.0)).item()
                     ),
@@ -1693,6 +1725,24 @@ def normalize_camera_supervision_args(args: argparse.Namespace) -> None:
 
 
 def normalize_pred_depth_scale_args(args: argparse.Namespace) -> None:
+    if bool(getattr(args, "normalize_scene_scale", False)):
+        if (
+            float(args.pred_depth_scale) != 1.0
+            or bool(args.learn_pred_depth_scale)
+            or str(args.dataset_depth_scale_mode) != "none"
+            or str(args.dataset_depth_scales or "")
+            or bool(args.camera_depth_scale_alignment)
+        ):
+            print(
+                "[INFO] normalize_scene_scale=true; disabling preset/global/dataset "
+                "depth scales and camera-depth scale alignment."
+            )
+        args.pred_depth_scale = 1.0
+        args.learn_pred_depth_scale = False
+        args.dataset_depth_scale_mode = "none"
+        args.dataset_depth_scales = ""
+        args.camera_depth_scale_alignment = False
+        return
     if args.dataset_format == "panocity_paired" and float(args.pred_depth_scale) == 1.0:
         args.pred_depth_scale = DEFAULT_PANOCITY_PRED_DEPTH_SCALE
         print(f"[INFO] using PanoCity pred_depth_scale = {args.pred_depth_scale}")
@@ -1955,12 +2005,28 @@ def train_step(
     pano_depths = batch["pano_depth"]
     sampler_model = unwrap_model(model)
 
-    target_depth, target_valid = sample_depth_targets(
+    sampled_depth_targets = sample_depth_targets(
         sampler_model,
         pano_depths,
         source_depth_semantics=args.gt_depth_semantics,
         max_range_depth=args.depth_max_m,
+        return_camera_meta=bool(args.normalize_scene_scale),
     )
+    if args.normalize_scene_scale:
+        target_depth, target_valid, target_camera_meta = sampled_depth_targets
+        batch, target_depth, scene_norm_scale = apply_scene_scale_normalization(
+            batch=batch,
+            target_depth=target_depth,
+            target_valid=target_valid,
+            camera_meta=target_camera_meta,
+            eps=float(args.scene_scale_normalization_eps),
+            min_scale=float(args.scene_scale_normalization_min),
+            max_scale=float(args.scene_scale_normalization_max),
+        )
+        pano_depths = batch["pano_depth"]
+    else:
+        target_depth, target_valid = sampled_depth_targets
+        scene_norm_scale = target_depth.new_ones(target_depth.shape[0])
     target_valid_float = target_valid.to(dtype=torch.float32)
     depth_valid_ratio = target_valid_float.mean()
     depth_window_keep_ratio = (
@@ -2203,6 +2269,9 @@ def train_step(
         "depth_loss_scale_median": formal_depth_scale.detach().float().median(),
         "depth_loss_scale_min": formal_depth_scale.detach().float().min(),
         "depth_loss_scale_max": formal_depth_scale.detach().float().max(),
+        "scene_norm_scale_median": scene_norm_scale.detach().float().median(),
+        "scene_norm_scale_min": scene_norm_scale.detach().float().min(),
+        "scene_norm_scale_max": scene_norm_scale.detach().float().max(),
         "dataset_depth_scale_median": dataset_scale_log.median(),
         "dataset_depth_scale_min": dataset_scale_log.min(),
         "dataset_depth_scale_max": dataset_scale_log.max(),
@@ -2339,7 +2408,8 @@ def sample_depth_targets(
     pano_depths: torch.Tensor,
     source_depth_semantics: str = "range",
     max_range_depth: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_camera_meta: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
     """Decode source ERP depth to radial range, sample it, and convert to window Z-depth."""
     source_valid_bool = torch.isfinite(pano_depths) & (pano_depths > 0)
     source_valid = source_valid_bool.to(dtype=pano_depths.dtype)
@@ -2365,7 +2435,112 @@ def sample_depth_targets(
     target_z = range_depth * z_factor[..., None]
     valid = valid & torch.isfinite(target_z) & (target_z > 0)
     target_z = torch.where(valid, target_z, torch.zeros_like(target_z))
+    if return_camera_meta:
+        return target_z, valid, sampled.camera_meta
     return target_z, valid
+
+
+def apply_scene_scale_normalization(
+    batch: Dict,
+    target_depth: torch.Tensor,
+    target_valid: torch.Tensor,
+    camera_meta: Dict[str, torch.Tensor] | None,
+    eps: float,
+    min_scale: float,
+    max_scale: float,
+) -> tuple[Dict, torch.Tensor, torch.Tensor]:
+    """Normalize GT depth and camera centers by per-sample scene scale.
+
+    PanoVGGT centers each training sample at the first camera and divides
+    camera translations/depths by the average valid 3D point distance. Our
+    pano losses already build anchor-relative camera targets, so this function
+    applies the shared scale only; anchor centering remains in the camera loss.
+    """
+    scene_scale = estimate_scene_normalization_scale(
+        target_depth=target_depth,
+        target_valid=target_valid,
+        camera_meta=camera_meta,
+        batch=batch,
+        eps=eps,
+        min_scale=min_scale,
+        max_scale=max_scale,
+    )
+    normalized = dict(batch)
+    depth_scale_view = scene_scale.view(scene_scale.shape[0], *([1] * (target_depth.ndim - 1)))
+    target_depth = target_depth / depth_scale_view
+
+    pano_depth = batch.get("pano_depth", None)
+    if torch.is_tensor(pano_depth) and pano_depth.ndim >= 2:
+        source_scale_view = scene_scale.view(scene_scale.shape[0], *([1] * (pano_depth.ndim - 1)))
+        normalized["pano_depth"] = pano_depth / source_scale_view
+
+    pano_position = batch.get("pano_position_m", None)
+    if torch.is_tensor(pano_position) and pano_position.ndim >= 2:
+        position_scale_view = scene_scale.view(scene_scale.shape[0], *([1] * (pano_position.ndim - 1)))
+        normalized["pano_position_m"] = pano_position / position_scale_view
+
+    normalized["scene_norm_scale"] = scene_scale
+    return normalized, target_depth, scene_scale
+
+
+def estimate_scene_normalization_scale(
+    target_depth: torch.Tensor,
+    target_valid: torch.Tensor,
+    camera_meta: Dict[str, torch.Tensor] | None,
+    batch: Dict,
+    eps: float,
+    min_scale: float,
+    max_scale: float,
+) -> torch.Tensor:
+    """Estimate PanoVGGT-style average valid 3D point distance per sample."""
+    depth = target_depth[..., 0].float()
+    valid = target_valid[..., 0].bool() & torch.isfinite(depth) & (depth > 0)
+    distance = depth
+    if camera_meta is not None:
+        try:
+            z_factor = build_window_z_factor(camera_meta, depth.shape[-2], depth.shape[-1]).to(
+                device=depth.device,
+                dtype=depth.dtype,
+            )
+            range_depth = depth / z_factor.clamp_min(1e-6)
+            center_norm = sampled_view_center_norm(batch, total_views=depth.shape[1], device=depth.device, dtype=depth.dtype)
+            if center_norm is not None:
+                distance = torch.sqrt(range_depth.square() + center_norm[..., None, None].square())
+            else:
+                distance = range_depth
+        except (KeyError, ValueError, IndexError):
+            distance = depth
+
+    valid_float = valid.to(dtype=distance.dtype)
+    reduce_dims = tuple(range(1, distance.ndim))
+    numerator = (distance * valid_float).sum(dim=reduce_dims)
+    count = valid_float.sum(dim=reduce_dims)
+    fallback = torch.ones_like(numerator)
+    scale = torch.where(count > 0, numerator / count.clamp_min(float(eps)), fallback)
+    return torch.nan_to_num(scale, nan=1.0, posinf=max_scale, neginf=1.0).clamp(
+        min=float(min_scale),
+        max=float(max_scale),
+    )
+
+
+def sampled_view_center_norm(
+    batch: Dict,
+    total_views: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    pano_position = batch.get("pano_position_m", None)
+    if not torch.is_tensor(pano_position):
+        return None
+    centers = pano_position.to(device=device, dtype=dtype)
+    if centers.ndim == 2:
+        centers = centers[:, None, :]
+    if centers.ndim != 3 or centers.shape[1] < 1 or total_views % centers.shape[1] != 0:
+        return None
+    relative_centers = centers - centers[:, :1]
+    center_norm = torch.linalg.vector_norm(relative_centers, dim=-1)
+    views_per_pano = total_views // centers.shape[1]
+    return center_norm[:, :, None].expand(-1, -1, views_per_pano).reshape(centers.shape[0], total_views)
 
 
 def sample_pano_tensor(

@@ -65,12 +65,13 @@ supervision:
   global_point_loss_weight: 0.10
   global_point_stride: 16
   overlap_band_fraction: 0.20
-  pred_depth_scale: 2.827019691467285
-  learn_pred_depth_scale: true
-  pred_depth_scale_lr: 5.0e-5
-  dataset_depth_scale_mode: learnable
-  dataset_depth_scales: "panocity=44.41180992126465,matterport3d=2.293140411376953,stanford2d3ds=3.1574957966804504,structured3d=1.5153944492340088"
-  dataset_depth_scale_lr: 5.0e-5
+  normalize_scene_scale: true
+  pred_depth_scale: 1.0
+  learn_pred_depth_scale: false
+  pred_depth_scale_lr: null
+  dataset_depth_scale_mode: none
+  dataset_depth_scales: ""
+  dataset_depth_scale_lr: null
   depth_residual_mode: none
   depth_residual_hidden: 32
   depth_residual_max_log: 0.5
@@ -92,7 +93,7 @@ supervision:
   camera_center_residual_weight: 0.5
   camera_center_residual_max_ratio: 0.25
   camera_center_residual_max_abs: 0.02
-  camera_depth_scale_alignment: true
+  camera_depth_scale_alignment: false
   camera_position_mode: relative_anchor
 
 optimization:
@@ -110,8 +111,8 @@ optimization:
       pano_max_count: 2
       trainable: luna_residual_tail_heads
       lr: 5.0e-5
-      pred_depth_scale_lr: 5.0e-5
-      dataset_depth_scale_lr: 5.0e-5
+      pred_depth_scale_lr: null
+      dataset_depth_scale_lr: null
       weight_decay: 0.05
       optimizer_type: adafactor
       camera_loss_weight: 0.15
@@ -120,8 +121,8 @@ optimization:
       enable_luna_forward: true
       enable_depth_residual: false
       train_depth_residual: false
-      learn_pred_depth_scale: true
-      learn_dataset_depth_scale: true
+      learn_pred_depth_scale: false
+      learn_dataset_depth_scale: false
     - name: multipano_camera_expand_4p_all384
       until_minutes: 180.0
       window_size: 384
@@ -129,8 +130,8 @@ optimization:
       pano_max_count: 4
       trainable: luna_residual_tail_heads
       lr: 5.0e-5
-      pred_depth_scale_lr: 5.0e-5
-      dataset_depth_scale_lr: 5.0e-5
+      pred_depth_scale_lr: null
+      dataset_depth_scale_lr: null
       weight_decay: 0.05
       optimizer_type: adafactor
       camera_loss_weight: 0.20
@@ -139,8 +140,8 @@ optimization:
       enable_luna_forward: true
       enable_depth_residual: false
       train_depth_residual: false
-      learn_pred_depth_scale: true
-      learn_dataset_depth_scale: true
+      learn_pred_depth_scale: false
+      learn_dataset_depth_scale: false
     - name: multipano_camera_expand_6p_all384
       until_minutes: 360.0
       window_size: 384
@@ -148,8 +149,8 @@ optimization:
       pano_max_count: 6
       trainable: luna_residual_tail_heads
       lr: 2.0e-5
-      pred_depth_scale_lr: 2.0e-5
-      dataset_depth_scale_lr: 2.0e-5
+      pred_depth_scale_lr: null
+      dataset_depth_scale_lr: null
       weight_decay: 0.05
       optimizer_type: adafactor
       camera_loss_weight: 0.25
@@ -158,16 +159,16 @@ optimization:
       enable_luna_forward: true
       enable_depth_residual: false
       train_depth_residual: false
-      learn_pred_depth_scale: true
-      learn_dataset_depth_scale: true
+      learn_pred_depth_scale: false
+      learn_dataset_depth_scale: false
     - name: multipano_camera_full_8p_all384
       window_size: 384
       dense_head_frames_chunk_size: 1
       pano_max_count: 8
       trainable: luna_residual_tail_heads
       lr: 1.0e-5
-      pred_depth_scale_lr: 1.0e-5
-      dataset_depth_scale_lr: 1.0e-5
+      pred_depth_scale_lr: null
+      dataset_depth_scale_lr: null
       weight_decay: 0.05
       optimizer_type: adafactor
       camera_loss_weight: 0.25
@@ -176,8 +177,8 @@ optimization:
       enable_luna_forward: true
       enable_depth_residual: false
       train_depth_residual: false
-      learn_pred_depth_scale: true
-      learn_dataset_depth_scale: true
+      learn_pred_depth_scale: false
+      learn_dataset_depth_scale: false
 
 runtime:
   device: cuda
