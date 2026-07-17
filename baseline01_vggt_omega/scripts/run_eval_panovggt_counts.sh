@@ -14,6 +14,8 @@ DATASETS="${DATASETS:-all}"
 LIMIT_PER_DATASET="${LIMIT_PER_DATASET:-0}"
 DEVICE="${DEVICE:-auto}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
+PRED_DEPTH_SCALE="${PRED_DEPTH_SCALE:-}"
+FOREGROUND="${FOREGROUND:-0}"
 
 mkdir -p "$OUT"
 rm -f \
@@ -24,7 +26,8 @@ rm -f \
   "$OUT/per_sample.csv" \
   "$OUT/camera_pairs.csv"
 
-nohup "$PYTHON_BIN" scripts/evaluate_mixed4_depth_checkpoint.py \
+EVAL_CMD=(
+  "$PYTHON_BIN" scripts/evaluate_mixed4_depth_checkpoint.py
   --config "$CONFIG" \
   --checkpoint "$CHECKPOINT" \
   --dataset-root "$DATASET_ROOT" \
@@ -36,10 +39,20 @@ nohup "$PYTHON_BIN" scripts/evaluate_mixed4_depth_checkpoint.py \
   --limit-per-dataset "$LIMIT_PER_DATASET" \
   --pano-count-policy panovggt \
   --device "$DEVICE" \
-  --amp-dtype "$AMP_DTYPE" \
-  --no-progress \
-  > "$OUT/eval_stdout.log" 2> "$OUT/eval_stderr.log" &
+  --amp-dtype "$AMP_DTYPE"
+)
+if [[ -n "$PRED_DEPTH_SCALE" ]]; then
+  EVAL_CMD+=(--pred-depth-scale "$PRED_DEPTH_SCALE")
+fi
+EVAL_CMD+=(--no-progress)
 
-echo "$!" > "$OUT/eval.pid"
-echo "[eval] pid=$(cat "$OUT/eval.pid")"
+if [[ "$FOREGROUND" == "1" ]]; then
+  echo "$$" > "$OUT/eval.pid"
+  "${EVAL_CMD[@]}" > "$OUT/eval_stdout.log" 2> "$OUT/eval_stderr.log"
+  echo "[eval] foreground finished"
+else
+  nohup "${EVAL_CMD[@]}" > "$OUT/eval_stdout.log" 2> "$OUT/eval_stderr.log" &
+  echo "$!" > "$OUT/eval.pid"
+  echo "[eval] pid=$(cat "$OUT/eval.pid")"
+fi
 echo "[eval] out=$OUT"
