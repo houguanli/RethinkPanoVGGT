@@ -111,8 +111,13 @@ def compute_camera_loss(
     pred_pose_encodings = pred_dict['pose_enc_list']
     # Binary mask for valid points per frame (B, N, H, W)
     point_masks = batch_data['point_masks']
-    # Only consider frames with enough valid points (>100)
-    valid_frame_mask = point_masks[:, 0].sum(dim=[-1, -2]) > 100
+    # Only consider frames with enough valid points (>100). Some pano datasets
+    # have reliable depth but intentionally disabled camera pose supervision.
+    valid_frame_mask = point_masks.sum(dim=[-1, -2]) > 100
+    camera_valid = batch_data.get("camera_valid")
+    if camera_valid is not None:
+        valid_frame_mask = valid_frame_mask & camera_valid.to(device=valid_frame_mask.device, dtype=torch.bool)
+    camera_weight = batch_data.get("camera_weight")
     # Number of prediction stages
     n_stages = len(pred_pose_encodings)
 
@@ -142,10 +147,14 @@ def compute_camera_loss(
             loss_FL_stage = (pred_pose_stage * 0).mean()
         else:
             # Only consider valid frames for loss computation
+            valid_weights = None
+            if camera_weight is not None:
+                valid_weights = camera_weight.to(device=pred_pose_stage.device, dtype=torch.float32)[valid_frame_mask]
             loss_T_stage, loss_R_stage, loss_FL_stage = camera_loss_single(
                 pred_pose_stage[valid_frame_mask].clone(),
                 gt_pose_encoding[valid_frame_mask].clone(),
-                loss_type=loss_type
+                loss_type=loss_type,
+                weights=valid_weights,
             )
         # Accumulate weighted losses across stages
         total_loss_T += loss_T_stage * stage_weight
@@ -169,10 +178,11 @@ def compute_camera_loss(
         "loss_camera": total_camera_loss,
         "loss_T": avg_loss_T,
         "loss_R": avg_loss_R,
-        "loss_FL": avg_loss_FL
+        "loss_FL": avg_loss_FL,
+        "camera_valid_fraction": valid_frame_mask.to(dtype=torch.float32).mean(),
     }
 
-def camera_loss_single(pred_pose_enc, gt_pose_enc, loss_type="l1"):
+def camera_loss_single(pred_pose_enc, gt_pose_enc, loss_type="l1", weights=None):
     """
     Computes translation, rotation, and focal loss for a batch of pose encodings.
     
@@ -206,12 +216,24 @@ def camera_loss_single(pred_pose_enc, gt_pose_enc, loss_type="l1"):
     loss_R = check_and_fix_inf_nan(loss_R, "loss_R")
     loss_FL = check_and_fix_inf_nan(loss_FL, "loss_FL")
 
-    # Clamp outlier translation loss to prevent instability, then average
-    loss_T = loss_T.clamp(max=100).mean()
-    loss_R = loss_R.mean()
-    loss_FL = loss_FL.mean()
+    # Clamp outlier translation loss to prevent instability, then average.
+    loss_T = _reduce_camera_component(loss_T.clamp(max=100), weights)
+    loss_R = _reduce_camera_component(loss_R, weights)
+    loss_FL = _reduce_camera_component(loss_FL, weights)
 
     return loss_T, loss_R, loss_FL
+
+
+def _reduce_camera_component(loss_value, weights=None):
+    if loss_value.ndim > 1:
+        loss_value = loss_value.mean(dim=-1)
+    if weights is None:
+        return loss_value.mean()
+    weights = weights.to(device=loss_value.device, dtype=loss_value.dtype).reshape(-1)
+    weights = weights.clamp_min(0.0)
+    if weights.numel() != loss_value.numel() or not bool((weights > 0).any()):
+        return loss_value.mean()
+    return (loss_value.reshape(-1) * weights).sum() / weights.sum().clamp_min(1e-6)
 
 
 def _extri_intri_to_pose_encoding(extrinsics, intrinsics, image_hw, pose_encoding_type="absT_quaR_FoV"):

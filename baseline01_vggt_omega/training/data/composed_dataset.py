@@ -143,9 +143,20 @@ class ComposedDataset(Dataset, ABC):
             "world_points": world_points,
             "point_masks": point_masks,
         }
-        for key in ["sample_weight", "metadata_valid_ratio", "metadata_structure_score"]:
+        for key in [
+            "sample_weight",
+            "metadata_valid_ratio",
+            "metadata_structure_score",
+            "camera_weight",
+        ]:
             if key in batch:
                 sample[key] = torch.as_tensor(batch[key], dtype=torch.float32)
+        for key in ["camera_valid"]:
+            if key in batch:
+                sample[key] = torch.as_tensor(batch[key], dtype=torch.bool)
+        for key in ["view_pano_index", "view_window_index", "pano_count", "windows_per_pano"]:
+            if key in batch:
+                sample[key] = torch.as_tensor(batch[key], dtype=torch.int64)
         if "metadata_quality_bin" in batch:
             sample["metadata_quality_bin"] = batch["metadata_quality_bin"]
 

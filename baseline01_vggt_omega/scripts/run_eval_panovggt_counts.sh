@@ -16,7 +16,13 @@ DEVICE="${DEVICE:-auto}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
 
 mkdir -p "$OUT"
-rm -f "$OUT/eval_stdout.log" "$OUT/eval_stderr.log" "$OUT/eval.pid"
+rm -f \
+  "$OUT/eval_stdout.log" \
+  "$OUT/eval_stderr.log" \
+  "$OUT/eval.pid" \
+  "$OUT/validation_mixed4_full_anchor_panovggt_counts_summary.json" \
+  "$OUT/per_sample.csv" \
+  "$OUT/camera_pairs.csv"
 
 nohup "$PYTHON_BIN" scripts/evaluate_mixed4_depth_checkpoint.py \
   --config "$CONFIG" \

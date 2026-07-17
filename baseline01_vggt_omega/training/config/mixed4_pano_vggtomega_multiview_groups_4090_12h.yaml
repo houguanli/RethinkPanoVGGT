@@ -11,7 +11,7 @@ limit_train_batches: 1000000
 limit_val_batches: 0
 max_epochs: 100000
 max_duration_minutes: 720.0
-normalize_scene_scale: true
+normalize_scene_scale: false
 save_checkpoint_on_exit: true
 mode: train
 device: cuda

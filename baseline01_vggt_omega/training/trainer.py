@@ -175,6 +175,13 @@ class Trainer:
                         "loss_reg_depth",
                         "loss_log_l1_depth",
                         "loss_overlap_depth",
+                        "loss_conf_depth",
+                        "loss_grad_depth",
+                        "loss_camera",
+                        "loss_T",
+                        "loss_R",
+                        "loss_FL",
+                        "camera_valid_fraction",
                         "lr",
                     ]
                 )
@@ -801,6 +808,8 @@ class Trainer:
 
                 loss /= accum_steps
                 self.scaler.scale(loss).backward()
+                if loss_key not in loss_meters:
+                    loss_meters[loss_key] = AverageMeter(loss_key, self.device, ":.4f")
                 loss_meters[loss_key].update(loss.item(), batch_size)
 
 
@@ -937,6 +946,10 @@ class Trainer:
         valid_fraction = float(point_masks.float().mean().item()) if torch.is_tensor(point_masks) else 0.0
         sample_weight = batch.get("sample_weight")
         sample_weight_value = float(sample_weight.float().mean().item()) if torch.is_tensor(sample_weight) else 1.0
+        camera_valid = batch.get("camera_valid")
+        camera_valid_fraction = (
+            float(camera_valid.float().mean().item()) if torch.is_tensor(camera_valid) else scalar("camera_valid_fraction")
+        )
         quality_bin = batch.get("metadata_quality_bin", "")
         if isinstance(quality_bin, (list, tuple)):
             quality_bin = "|".join(str(value) for value in quality_bin)
@@ -958,6 +971,13 @@ class Trainer:
                     scalar("loss_reg_depth"),
                     scalar("loss_log_l1_depth"),
                     scalar("loss_overlap_depth"),
+                    scalar("loss_conf_depth"),
+                    scalar("loss_grad_depth"),
+                    scalar("loss_camera"),
+                    scalar("loss_T"),
+                    scalar("loss_R"),
+                    scalar("loss_FL"),
+                    camera_valid_fraction,
                     lr,
                 ]
             )
@@ -970,7 +990,10 @@ class Trainer:
         for key in keys_to_log:
             if key in data:
                 value = data[key].item() if torch.is_tensor(data[key]) else data[key]
-                loss_meters[f"Loss/{phase}_{key}"].update(value, batch_size)
+                meter_key = f"Loss/{phase}_{key}"
+                if meter_key not in loss_meters:
+                    loss_meters[meter_key] = AverageMeter(meter_key, self.device, ":.4f")
+                loss_meters[meter_key].update(value, batch_size)
                 if step % self.logging_conf.log_freq == 0 and self.rank == 0:
                     self.tb_writer.log(f"Values/{phase}/{key}", value, step)
 

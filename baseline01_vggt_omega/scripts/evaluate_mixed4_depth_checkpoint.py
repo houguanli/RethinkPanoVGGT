@@ -277,6 +277,7 @@ def main() -> None:
             camera_pair_csv=camera_pair_csv,
             skipped_rows=skipped_rows,
             camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
+            normalize_scene_scale=bool(cfg.get("normalize_scene_scale", False)),
         )
         runs.append(run)
         torch.cuda.empty_cache()
@@ -297,6 +298,7 @@ def main() -> None:
             "uses_camera_supervision": True,
             "loss": "VGGT-Omega depth/camera losses on pano-cropped multi-view groups",
             "pred_depth_scale": float(depth_conf.get("pred_depth_scale", 1.0)),
+            "normalize_scene_scale": bool(cfg.get("normalize_scene_scale", False)),
         },
         "split_policy": {
             "Panocity": "test (PanoVGGT official split when cache was built with official split JSONs)",
@@ -472,6 +474,7 @@ def evaluate_dataset(
     camera_pair_csv: Path | None,
     skipped_rows: list[dict[str, Any]],
     camera_pose_trans_norm_thresh: float,
+    normalize_scene_scale: bool,
 ) -> dict[str, Any]:
     source_items = getattr(dataset, "items", None)
     if source_items is None and hasattr(dataset, "pano_dataset"):
@@ -502,7 +505,7 @@ def evaluate_dataset(
                     img_per_seq=img_per_seq,
                     aspect_ratio=1.0,
                 )
-                batch = sample_to_batch(sample, device)
+                batch = sample_to_batch(sample, device, normalize_scene_scale=normalize_scene_scale)
                 with torch.autocast(device_type=device.type, dtype=torch_amp_dtype, enabled=amp_enabled):
                     predictions = model(images=batch["images"])
                     loss_dict = compute_depth_loss(predictions, batch, **depth_conf)
@@ -617,7 +620,11 @@ def evaluate_dataset(
     }
 
 
-def sample_to_batch(sample: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
+def sample_to_batch(
+    sample: dict[str, Any],
+    device: torch.device,
+    normalize_scene_scale: bool = False,
+) -> dict[str, torch.Tensor]:
     images = torch.from_numpy(np.stack(sample["images"]).astype(np.float32)).contiguous()
     if images.ndim != 4 or images.shape[-1] != 3:
         raise ValueError(f"Expected NHWC images, got {tuple(images.shape)}")
@@ -635,18 +642,19 @@ def sample_to_batch(sample: dict[str, Any], device: torch.device) -> dict[str, t
         batch["intrinsics"] = torch.from_numpy(np.stack(sample["intrinsics"]).astype(np.float32)).unsqueeze(0)
         batch["cam_points"] = torch.from_numpy(np.stack(sample["cam_points"]).astype(np.float32)).unsqueeze(0)
         batch["world_points"] = torch.from_numpy(np.stack(sample["world_points"]).astype(np.float32)).unsqueeze(0)
-        (
-            batch["extrinsics"],
-            batch["cam_points"],
-            batch["world_points"],
-            batch["depths"],
-        ) = normalize_camera_extrinsics_and_points_batch(
-            extrinsics=batch["extrinsics"],
-            cam_points=batch["cam_points"],
-            world_points=batch["world_points"],
-            depths=batch["depths"],
-            point_masks=batch["point_masks"],
-        )
+        if normalize_scene_scale:
+            (
+                batch["extrinsics"],
+                batch["cam_points"],
+                batch["world_points"],
+                batch["depths"],
+            ) = normalize_camera_extrinsics_and_points_batch(
+                extrinsics=batch["extrinsics"],
+                cam_points=batch["cam_points"],
+                world_points=batch["world_points"],
+                depths=batch["depths"],
+                point_masks=batch["point_masks"],
+            )
     for key in ("sample_weight", "metadata_valid_ratio", "metadata_structure_score"):
         value = sample.get(key)
         if value is None:
