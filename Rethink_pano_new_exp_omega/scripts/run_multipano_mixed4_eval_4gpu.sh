@@ -284,4 +284,15 @@ PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/merge_mixed4_eva
   --train-loss-csv "$TRAIN_LOSS_CSV" \
   > "$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_console.log" 2>&1
 
+SUMMARY_JSON="$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_summary.json"
+PER_SAMPLE_CSV="$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_per_sample.csv"
+if [[ ! -s "$SUMMARY_JSON" ]]; then
+  echo "[eval-4gpu] missing merged summary: $SUMMARY_JSON" | tee -a "$EVAL_OUT/eval_4gpu.log"
+  exit 1
+fi
+if [[ ! -s "$PER_SAMPLE_CSV" ]]; then
+  echo "[eval-4gpu] missing merged per-sample CSV: $PER_SAMPLE_CSV" | tee -a "$EVAL_OUT/eval_4gpu.log"
+  exit 1
+fi
+
 echo "[eval-4gpu] finished $(date --iso-8601=seconds)" | tee -a "$EVAL_OUT/eval_4gpu.log"

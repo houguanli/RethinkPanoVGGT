@@ -6,7 +6,7 @@ LUNA="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROOT="$(cd "$LUNA/.." && pwd)"
 BASELINE="$ROOT/baseline01_vggt_omega"
 
-PYTHON="${PYTHON:-/home/aoki/miniconda3/envs/RethinkPanoVGGT_omega/bin/python}"
+PYTHON="${PYTHON:-python}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
@@ -17,7 +17,20 @@ if [[ -z "${PANOVGGT_ROOT:-}" ]]; then
     PANOVGGT_ROOT="$(cd "$ROOT/.." && pwd)/panovggt"
   fi
 fi
-BASE_CHECKPOINT="${BASE_CHECKPOINT:-/home/aoki/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt}"
+if [[ -z "${BASE_CHECKPOINT:-}" ]]; then
+  for candidate in \
+    /whitehole/AOKI/vggt-omega/ckpt/vggt_omega_1b_512.pt \
+    /whitehole/AOKI/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt \
+    /home/aoki/RethinkPanoVGGT_omega_compare_methods_only/ckpt/VGGT-Omega/vggt_omega_1b_512.pt \
+    /home/aoki/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt \
+    "$LUNA/ckpt/vggt_omega_1b_512.pt"; do
+    if [[ -s "$candidate" ]]; then
+      BASE_CHECKPOINT="$candidate"
+      break
+    fi
+  done
+fi
+BASE_CHECKPOINT="${BASE_CHECKPOINT:-/whitehole/AOKI/vggt-omega/ckpt/vggt_omega_1b_512.pt}"
 WARMUP_INIT_CHECKPOINT="${WARMUP_INIT_CHECKPOINT:-$BASE_CHECKPOINT}"
 if [[ ! -s "$WARMUP_INIT_CHECKPOINT" ]]; then
   WARMUP_INIT_CHECKPOINT="$BASE_CHECKPOINT"
@@ -225,7 +238,9 @@ if [[ "${RUN_VALIDATION:-1}" == "1" ]]; then
     echo "[sequence] missing LUNA checkpoint for validation: $LUNA_OUT/last.pt" | tee -a "$SEQ_LOG"
     exit 1
   fi
-  VALIDATION_GPUS="${VALIDATION_GPUS:-0,1,2,3}"
+  if [[ -z "${VALIDATION_GPUS:-}" ]]; then
+    VALIDATION_GPUS="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+  fi
   VALIDATION_OUT="${VALIDATION_OUT:-$LUNA_OUT/eval_full_4gpu}"
   VALIDATION_LIMIT_PER_DATASET="${VALIDATION_LIMIT_PER_DATASET:-0}"
   VALIDATION_DATASETS="${VALIDATION_DATASETS:-all}"
@@ -243,6 +258,12 @@ if [[ "${RUN_VALIDATION:-1}" == "1" ]]; then
     EVAL_DATASETS="$VALIDATION_DATASETS" \
     bash "$LUNA/scripts/run_multipano_mixed4_eval_4gpu.sh" \
     2>&1 | tee -a "$SEQ_LOG"
+  VALIDATION_SUMMARY="$VALIDATION_OUT/validation_mixed4_by_dataset_valtestfull_summary.json"
+  if [[ ! -s "$VALIDATION_SUMMARY" ]]; then
+    echo "[sequence] validation summary missing after eval: $VALIDATION_SUMMARY" | tee -a "$SEQ_LOG"
+    exit 1
+  fi
+  echo "[sequence] validation summary=$VALIDATION_SUMMARY" | tee -a "$SEQ_LOG"
   echo "[sequence] mixed4 4GPU validation finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 else
   echo "[sequence] validation skipped because RUN_VALIDATION=0" | tee -a "$SEQ_LOG"

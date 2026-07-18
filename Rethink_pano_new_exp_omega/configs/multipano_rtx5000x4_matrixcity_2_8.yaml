@@ -19,7 +19,7 @@ sampler:
   fov_degrees: 75.0
   pano_height: 0
   pano_width: 0
-  luna_patch_layers: second_half
+  luna_patch_layers: last3
   luna_camera_layers: "23"
 
 model:

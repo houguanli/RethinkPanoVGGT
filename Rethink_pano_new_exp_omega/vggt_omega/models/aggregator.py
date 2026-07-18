@@ -489,15 +489,27 @@ def expand_and_flatten(token_tensor: torch.Tensor, batch_size: int, num_frames: 
 
 
 def _resolve_luna_layers(layers, depth: int) -> Set[int]:
-    """Same parsing rules as b1: None → second half; string aliases supported."""
+    """Parse LUNA layer selectors.
+
+    The implicit default is intentionally conservative: only the final three
+    blocks get LUNA patch residuals, so early attention stays on the pretrained
+    Omega feature distribution. Explicit ``second_half`` remains available for
+    older ablations.
+    """
     if layers is None:
-        return set(range(depth // 2, depth))
+        return set(range(max(depth - 3, 0), depth))
     if isinstance(layers, str):
         normalized = layers.strip().lower()
         if normalized in {"", "none", "false", "off"}:
             return set()
         if normalized in {"last_half", "second_half"}:
             return set(range(depth // 2, depth))
+        if normalized in {"last2", "final2", "tail2"}:
+            return set(range(max(depth - 2, 0), depth))
+        if normalized in {"last3", "final3", "tail3"}:
+            return set(range(max(depth - 3, 0), depth))
+        if normalized in {"last4", "final4", "tail4"}:
+            return set(range(max(depth - 4, 0), depth))
         if normalized in {"last", "final"}:
             return {depth - 1}
         return {int(item.strip()) for item in normalized.split(",") if item.strip()}

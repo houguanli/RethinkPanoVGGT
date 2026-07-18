@@ -150,8 +150,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--luna-patch-layers",
         type=str,
-        default="second_half",
-        help="LUNA patch adapter layers: second_half, final, none, or comma-separated layer indices.",
+        default="last3",
+        help="LUNA patch adapter layers: last3, last2, second_half, final, none, or comma-separated layer indices.",
     )
     parser.add_argument(
         "--luna-camera-layers",
