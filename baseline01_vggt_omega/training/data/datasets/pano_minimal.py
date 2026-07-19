@@ -166,67 +166,96 @@ class PanoMinimalMultiPanoPinholeDataset(BaseDataset):
         self.dataset_pano_counts = _parse_dataset_pano_counts(dataset_pano_counts)
         self.depth_max_m = float(depth_max_m)
         self.camera_supervised_datasets = _parse_dataset_names(camera_supervised_datasets)
+        self._runtime_dataset_kwargs = {
+            "root": root,
+            "datasets": datasets,
+            "dataset_sampling_weights": dataset_sampling_weights,
+            "output_depth_scale": output_depth_scale,
+            "invalid_depth_value": invalid_depth_value,
+            "max_samples": max_samples,
+            "train_split_fraction": train_split_fraction,
+            "bad_sample_list": bad_sample_list,
+            "pano_sample_mode": pano_sample_mode,
+            "grouping": grouping,
+            "main_dataset_path": main_dataset_path,
+        }
+        self.pano_dataset = self._build_runtime_dataset()
+        if len(self.pano_dataset) <= 0:
+            raise FileNotFoundError(f"No multi-pano samples found under {root}")
+        summary = getattr(self.pano_dataset, "dataset_sampling_summary", None)
+        if summary and summary.get("enabled"):
+            print(f"[INFO] Omega multi-pano source sampling = {summary}")
 
-        module = _load_main_pano_minimal_module(main_dataset_path)
+    def _build_runtime_dataset(self):
+        kwargs = self._runtime_dataset_kwargs
+        module = _load_main_pano_minimal_module(kwargs["main_dataset_path"])
         if self.dataset_pano_counts:
             runtime_datasets = []
-            for dataset_name in _ordered_dataset_names(_parse_dataset_names(datasets)):
+            for dataset_name in _ordered_dataset_names(_parse_dataset_names(kwargs["datasets"])):
                 pano_count = int(self.dataset_pano_counts.get(dataset_name, self.pano_max_count))
                 if pano_count <= 0:
                     continue
                 runtime_dataset = module.PanoMinimalDataset(
-                    root=root,
+                    root=kwargs["root"],
                     pano_sample_mode="fixed_neighborhood" if pano_count > 1 else "single",
                     pano_min_count=pano_count,
                     pano_max_count=pano_count,
-                    grouping=grouping,
-                    max_samples=max_samples,
-                    split=split,
-                    train_split_fraction=train_split_fraction,
-                    split_seed=split_seed,
+                    grouping=kwargs["grouping"],
+                    max_samples=kwargs["max_samples"],
+                    split=self.split,
+                    train_split_fraction=kwargs["train_split_fraction"],
+                    split_seed=self.split_seed,
                     datasets=dataset_name,
-                    bad_sample_list=bad_sample_list,
+                    bad_sample_list=kwargs["bad_sample_list"],
                     dataset_sampling_weights=None,
-                    output_depth_scale=output_depth_scale,
-                    invalid_depth_value=invalid_depth_value,
+                    output_depth_scale=kwargs["output_depth_scale"],
+                    invalid_depth_value=kwargs["invalid_depth_value"],
                     strict=False,
                 )
                 if len(runtime_dataset) > 0:
                     runtime_datasets.append((dataset_name, runtime_dataset))
             if not runtime_datasets:
                 raise FileNotFoundError(
-                    f"No dataset-specific multi-pano samples found under {root} for counts {self.dataset_pano_counts}."
+                    f"No dataset-specific multi-pano samples found under {kwargs['root']} "
+                    f"for counts {self.dataset_pano_counts}."
                 )
-            self.pano_dataset = _WeightedRuntimeMixedPanoDataset(
+            pano_dataset = _WeightedRuntimeMixedPanoDataset(
                 runtime_datasets,
-                dataset_sampling_weights if self.split == "train" else None,
+                kwargs["dataset_sampling_weights"] if self.split == "train" else None,
                 seed=self.split_seed,
             )
             self.pano_min_count = min(int(self.dataset_pano_counts.get(key, self.pano_max_count)) for key, _ in runtime_datasets)
             self.pano_max_count = max(int(self.dataset_pano_counts.get(key, self.pano_max_count)) for key, _ in runtime_datasets)
         else:
-            self.pano_dataset = module.PanoMinimalDataset(
-                root=root,
-                pano_sample_mode=pano_sample_mode,
+            pano_dataset = module.PanoMinimalDataset(
+                root=kwargs["root"],
+                pano_sample_mode=kwargs["pano_sample_mode"],
                 pano_min_count=self.pano_min_count,
                 pano_max_count=self.pano_max_count,
-                grouping=grouping,
-                max_samples=max_samples,
-                split=split,
-                train_split_fraction=train_split_fraction,
-                split_seed=split_seed,
-                datasets=datasets,
-                bad_sample_list=bad_sample_list,
-                dataset_sampling_weights=dataset_sampling_weights,
-                output_depth_scale=output_depth_scale,
-                invalid_depth_value=invalid_depth_value,
+                grouping=kwargs["grouping"],
+                max_samples=kwargs["max_samples"],
+                split=self.split,
+                train_split_fraction=kwargs["train_split_fraction"],
+                split_seed=self.split_seed,
+                datasets=kwargs["datasets"],
+                bad_sample_list=kwargs["bad_sample_list"],
+                dataset_sampling_weights=kwargs["dataset_sampling_weights"],
+                output_depth_scale=kwargs["output_depth_scale"],
+                invalid_depth_value=kwargs["invalid_depth_value"],
                 strict=True,
             )
-        if len(self.pano_dataset) <= 0:
-            raise FileNotFoundError(f"No multi-pano samples found under {root}")
-        summary = getattr(self.pano_dataset, "dataset_sampling_summary", None)
-        if summary and summary.get("enabled"):
-            print(f"[INFO] Omega multi-pano source sampling = {summary}")
+        return pano_dataset
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # The main dataset is loaded from a runtime path, so its class is not
+        # importable while Python 3.14 forkserver workers unpickle this adapter.
+        state["pano_dataset"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.pano_dataset = self._build_runtime_dataset()
 
     def __len__(self):
         return self.len_train
