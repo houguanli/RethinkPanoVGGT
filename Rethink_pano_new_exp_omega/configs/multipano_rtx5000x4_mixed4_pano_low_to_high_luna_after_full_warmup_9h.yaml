@@ -38,8 +38,8 @@ model:
   enable_pano_global_token: true
   enable_pano_geometry_residual: false
   aggregator_use_checkpoint: true
-  # Keep 2..8 panos x 4 yaw as the model context, but decode dense depth in
-  # smaller frame chunks so a full 32-window sample fits on 32GB RTX5000 cards.
+  # Decode dense depth in smaller frame chunks so the final high-res
+  # 8-pano x 8-yaw stage fits on 32GB RTX5000 cards.
   dense_head_frames_chunk_size: 1
   dense_head_use_checkpoint: true
   dense_head_return_confidence: false
@@ -161,10 +161,11 @@ optimization:
       train_depth_residual: false
       learn_pred_depth_scale: false
       learn_dataset_depth_scale: false
-    - name: multipano_camera_high512_6p
+    - name: multipano_camera_high512_8p_8yaw
       window_size: 512
+      num_yaw: 8
       dense_head_frames_chunk_size: 1
-      pano_max_count: 6
+      pano_max_count: 8
       trainable: luna_residual_tail_heads
       lr: 1.0e-5
       pred_depth_scale_lr: null
