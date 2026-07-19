@@ -17,15 +17,22 @@ AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
 PRED_DEPTH_SCALE="${PRED_DEPTH_SCALE:-}"
 BASE_CHECKPOINT="${BASE_CHECKPOINT:-/home/aoki/RethinkPanoVGGT_omega_compare_methods_only/ckpt/VGGT-Omega/vggt_omega_1b_512.pt}"
 FOREGROUND="${FOREGROUND:-0}"
+RESUME="${RESUME:-0}"
 
 mkdir -p "$OUT"
-rm -f \
-  "$OUT/eval_stdout.log" \
-  "$OUT/eval_stderr.log" \
-  "$OUT/eval.pid" \
-  "$OUT/validation_mixed4_full_anchor_panovggt_counts_summary.json" \
-  "$OUT/per_sample.csv" \
-  "$OUT/camera_pairs.csv"
+if [[ "$RESUME" == "1" ]]; then
+  rm -f \
+    "$OUT/eval.pid" \
+    "$OUT/validation_mixed4_full_anchor_panovggt_counts_summary.json"
+else
+  rm -f \
+    "$OUT/eval_stdout.log" \
+    "$OUT/eval_stderr.log" \
+    "$OUT/eval.pid" \
+    "$OUT/validation_mixed4_full_anchor_panovggt_counts_summary.json" \
+    "$OUT/per_sample.csv" \
+    "$OUT/camera_pairs.csv"
+fi
 
 EVAL_CMD=(
   "$PYTHON_BIN" scripts/evaluate_mixed4_depth_checkpoint.py
@@ -48,14 +55,25 @@ export VGGT_OMEGA_CKPT="$BASE_CHECKPOINT"
 if [[ -n "$PRED_DEPTH_SCALE" ]]; then
   EVAL_CMD+=(--pred-depth-scale "$PRED_DEPTH_SCALE")
 fi
+if [[ "$RESUME" == "1" ]]; then
+  EVAL_CMD+=(--resume)
+fi
 EVAL_CMD+=(--fail-fast)
 
 if [[ "$FOREGROUND" == "1" ]]; then
   echo "$$" > "$OUT/eval.pid"
-  "${EVAL_CMD[@]}" > "$OUT/eval_stdout.log" 2> "$OUT/eval_stderr.log"
+  if [[ "$RESUME" == "1" ]]; then
+    "${EVAL_CMD[@]}" >> "$OUT/eval_stdout.log" 2>> "$OUT/eval_stderr.log"
+  else
+    "${EVAL_CMD[@]}" > "$OUT/eval_stdout.log" 2> "$OUT/eval_stderr.log"
+  fi
   echo "[eval] foreground finished"
 else
-  nohup "${EVAL_CMD[@]}" > "$OUT/eval_stdout.log" 2> "$OUT/eval_stderr.log" &
+  if [[ "$RESUME" == "1" ]]; then
+    nohup "${EVAL_CMD[@]}" >> "$OUT/eval_stdout.log" 2>> "$OUT/eval_stderr.log" &
+  else
+    nohup "${EVAL_CMD[@]}" > "$OUT/eval_stdout.log" 2> "$OUT/eval_stderr.log" &
+  fi
   echo "$!" > "$OUT/eval.pid"
   echo "[eval] pid=$(cat "$OUT/eval.pid")"
 fi

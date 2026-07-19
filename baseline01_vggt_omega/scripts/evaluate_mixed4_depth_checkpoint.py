@@ -191,6 +191,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True, help="baseline01 checkpoint.pt to evaluate.")
     parser.add_argument("--output", type=Path, required=True, help="Summary JSON output.")
     parser.add_argument("--per-sample-csv", type=Path, default=None)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from existing per-sample/camera-pair CSV files and skip completed dataset indices.",
+    )
     parser.add_argument("--train-loss-csv", type=Path, default=None)
     parser.add_argument("--dataset-root", type=Path, default=None, help="Override mixed4 dataset root.")
     parser.add_argument("--datasets", default="all", help="Comma list or all.")
@@ -252,10 +257,21 @@ def main() -> None:
     camera_pair_csv = args.camera_pair_csv
     if camera_pair_csv is None and args.per_sample_csv is not None:
         camera_pair_csv = args.per_sample_csv.with_name(f"{args.per_sample_csv.stem}_camera_pairs.csv")
-    if args.per_sample_csv is not None:
-        initialize_csv(args.per_sample_csv, PER_SAMPLE_CSV_FIELDS)
-    if camera_pair_csv is not None:
-        initialize_csv(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS)
+    completed_sample_keys: set[tuple[str, str, int]] = set()
+    if args.resume:
+        per_sample_rows, camera_pair_rows, completed_sample_keys = load_resume_rows(
+            args.per_sample_csv,
+            camera_pair_csv,
+        )
+        print(
+            f"[resume] loaded samples={len(per_sample_rows)} "
+            f"camera_pairs={len(camera_pair_rows)} completed_keys={len(completed_sample_keys)}"
+        )
+    else:
+        if args.per_sample_csv is not None:
+            initialize_csv(args.per_sample_csv, PER_SAMPLE_CSV_FIELDS)
+        if camera_pair_csv is not None:
+            initialize_csv(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS)
 
     for dataset_index, (display_name, minimal_name, split) in enumerate(DATASETS):
         if minimal_name not in selected:
@@ -292,6 +308,7 @@ def main() -> None:
             camera_eval_max_panos=args.camera_eval_max_panos,
             normalize_scene_scale=bool(cfg.get("normalize_scene_scale", False)),
             fail_fast=bool(args.fail_fast),
+            completed_sample_keys=completed_sample_keys,
         )
         runs.append(run)
         torch.cuda.empty_cache()
@@ -302,6 +319,7 @@ def main() -> None:
         "device": str(device),
         "seed": int(args.seed),
         "limit_per_dataset": int(args.limit_per_dataset),
+        "resumed": bool(args.resume),
         "datasets": sorted(selected),
         "sample_policy": str(args.sample_policy),
         "pano_count_policy": str(args.pano_count_policy),
@@ -506,6 +524,7 @@ def evaluate_dataset(
     camera_eval_max_panos: int,
     normalize_scene_scale: bool,
     fail_fast: bool,
+    completed_sample_keys: set[tuple[str, str, int]],
 ) -> dict[str, Any]:
     runtime_dataset = getattr(dataset, "pano_dataset", None)
     source_items = getattr(runtime_dataset, "items", None) if runtime_dataset is not None else None
@@ -519,12 +538,38 @@ def evaluate_dataset(
     else:
         item_count = len(source_items) if source_items is not None else len(dataset)
     indices = metrics_lib.sample_indices(item_count, limit, seed)
-    rows: list[dict[str, Any]] = []
+    selected_indices = {int(index) for index in indices}
+    rows = [
+        row
+        for row in per_sample_rows
+        if row.get("minimal_dataset") == minimal_name
+        and row.get("split") == split
+        and int(row["dataset_index"]) in selected_indices
+    ]
+    unexpected_indices = sorted(
+        int(row["dataset_index"])
+        for row in per_sample_rows
+        if row.get("minimal_dataset") == minimal_name
+        and row.get("split") == split
+        and int(row["dataset_index"]) not in selected_indices
+    )
+    if unexpected_indices:
+        raise ValueError(
+            "Resume CSV contains indices outside the current sample selection. "
+            f"Keep the original --limit-per-dataset/--seed settings; first unexpected indices: {unexpected_indices[:10]}"
+        )
+    resumed_row_count = len(rows)
     amp_enabled = device.type == "cuda" and amp_dtype != "none"
     torch_amp_dtype = torch.bfloat16 if amp_dtype == "bfloat16" else torch.float32
     run_name = f"{display_name}_{split}_{int(limit)}"
     iterator = tqdm(indices, desc=f"validate {run_name}", dynamic_ncols=True) if progress else indices
-    run_camera_pair_start = len(camera_pair_rows)
+    run_camera_pair_rows = [
+        row
+        for row in camera_pair_rows
+        if row.get("minimal_dataset") == minimal_name
+        and row.get("split") == split
+        and int(row["dataset_index"]) in selected_indices
+    ]
     ds_conf = cfg.data.train.dataset.dataset_configs[0]
     target = str(ds_conf.get("_target_", ""))
     if target.endswith("PanoMinimalMultiPanoPinholeDataset"):
@@ -533,9 +578,27 @@ def evaluate_dataset(
         )
     else:
         img_per_seq = int(ds_conf.get("num_yaw", 8))
+    expected_pano_count = int(getattr(dataset, "pano_max_count", 1))
+    expected_camera_pano_count = min(expected_pano_count, int(camera_eval_max_panos))
+    for row in rows:
+        if int(row["input_pano_count"]) != expected_pano_count:
+            raise ValueError(
+                "Resume CSV pano-count mismatch: "
+                f"dataset={minimal_name} index={row['dataset_index']} "
+                f"stored={row['input_pano_count']} current={expected_pano_count}"
+            )
+        if int(row["camera_eval_pano_count"]) != expected_camera_pano_count:
+            raise ValueError(
+                "Resume CSV camera pano-count mismatch: "
+                f"dataset={minimal_name} index={row['dataset_index']} "
+                f"stored={row['camera_eval_pano_count']} current={expected_camera_pano_count}"
+            )
 
     with torch.no_grad():
         for index in iterator:
+            sample_key = (minimal_name, split, int(index))
+            if sample_key in completed_sample_keys:
+                continue
             item = source_items[int(index)] if source_items is not None else {}
             try:
                 sample = dataset.get_data(
@@ -597,6 +660,7 @@ def evaluate_dataset(
                 }
                 rows.append(row)
                 per_sample_rows.append(row)
+                completed_sample_keys.add(sample_key)
                 if per_sample_csv is not None:
                     append_csv_row(per_sample_csv, PER_SAMPLE_CSV_FIELDS, row)
                 for pair_row in pose_pair_rows:
@@ -613,6 +677,7 @@ def evaluate_dataset(
                         }
                     )
                 camera_pair_rows.extend(pose_pair_rows)
+                run_camera_pair_rows.extend(pose_pair_rows)
                 if camera_pair_csv is not None:
                     append_csv_rows(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS, pose_pair_rows)
             except Exception as exc:
@@ -633,7 +698,6 @@ def evaluate_dataset(
                 print(f"[WARN] skipped {display_name} index={index}: {exc}")
                 print(error_traceback)
 
-    run_camera_pair_rows = camera_pair_rows[run_camera_pair_start:]
     return {
         "name": run_name,
         "dataset": display_name,
@@ -643,6 +707,7 @@ def evaluate_dataset(
         "requested_samples": int(limit),
         "candidate_samples": len(indices),
         "evaluated_samples": len(rows),
+        "resumed_samples": resumed_row_count,
         "effective_pano_min_count": int(getattr(dataset, "pano_min_count", 1)),
         "effective_pano_max_count": int(getattr(dataset, "pano_max_count", 1)),
         "windows_per_pano": int(getattr(dataset, "windows_per_pano", 1)),
@@ -1317,6 +1382,95 @@ def initialize_csv(path: Path, fieldnames: list[str]) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
+
+
+def load_resume_rows(
+    per_sample_csv: Path | None,
+    camera_pair_csv: Path | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[tuple[str, str, int]]]:
+    if per_sample_csv is None:
+        raise ValueError("--resume requires --per-sample-csv")
+
+    sample_exists = per_sample_csv.exists() and per_sample_csv.stat().st_size > 0
+    camera_exists = camera_pair_csv is not None and camera_pair_csv.exists() and camera_pair_csv.stat().st_size > 0
+    if sample_exists and camera_pair_csv is not None and not camera_exists:
+        raise FileNotFoundError(
+            f"Cannot resume safely: sample CSV exists but camera pair CSV is missing: {camera_pair_csv}"
+        )
+    if camera_exists and not sample_exists:
+        raise FileNotFoundError(
+            f"Cannot resume safely: camera pair CSV exists but sample CSV is missing: {per_sample_csv}"
+        )
+    if not sample_exists:
+        initialize_csv(per_sample_csv, PER_SAMPLE_CSV_FIELDS)
+        if camera_pair_csv is not None:
+            initialize_csv(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS)
+        return [], [], set()
+
+    sample_rows = read_typed_csv_rows(
+        per_sample_csv,
+        PER_SAMPLE_CSV_FIELDS,
+        string_fields={"dataset", "minimal_dataset", "split", "run", "seq_name", "rgb_path", "depth_path", "quality_bin"},
+        integer_fields={"dataset_index", "input_pano_count", "camera_eval_pano_count"},
+    )
+    camera_rows = read_typed_csv_rows(
+        camera_pair_csv,
+        CAMERA_PAIR_CSV_FIELDS,
+        string_fields={"dataset", "minimal_dataset", "split", "run", "seq_name", "rgb_path", "depth_path"},
+        integer_fields={"dataset_index", "batch_index", "pair_i", "pair_j"},
+    ) if camera_pair_csv is not None else []
+
+    completed_keys: set[tuple[str, str, int]] = set()
+    for row in sample_rows:
+        key = (str(row["minimal_dataset"]), str(row["split"]), int(row["dataset_index"]))
+        if key in completed_keys:
+            raise ValueError(f"Duplicate sample key in resume CSV: {key}")
+        completed_keys.add(key)
+
+    camera_keys: set[tuple[str, str, int, int, int, int]] = set()
+    for row in camera_rows:
+        sample_key = (str(row["minimal_dataset"]), str(row["split"]), int(row["dataset_index"]))
+        if sample_key not in completed_keys:
+            raise ValueError(f"Camera pair row has no matching completed sample: {sample_key}")
+        key = (*sample_key, int(row["batch_index"]), int(row["pair_i"]), int(row["pair_j"]))
+        if key in camera_keys:
+            raise ValueError(f"Duplicate camera pair key in resume CSV: {key}")
+        camera_keys.add(key)
+    return sample_rows, camera_rows, completed_keys
+
+
+def read_typed_csv_rows(
+    path: Path | None,
+    expected_fields: list[str],
+    *,
+    string_fields: set[str],
+    integer_fields: set[str],
+) -> list[dict[str, Any]]:
+    if path is None:
+        return []
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames != expected_fields:
+            raise ValueError(
+                f"Resume CSV schema mismatch for {path}: expected {expected_fields}, got {reader.fieldnames}"
+            )
+        rows: list[dict[str, Any]] = []
+        for line_number, raw_row in enumerate(reader, start=2):
+            if None in raw_row:
+                raise ValueError(f"Malformed resume CSV row at {path}:{line_number}")
+            row: dict[str, Any] = {}
+            for field in expected_fields:
+                raw = raw_row.get(field, "")
+                if field in string_fields:
+                    row[field] = raw
+                elif field in integer_fields:
+                    if raw == "":
+                        raise ValueError(f"Missing integer field {field!r} at {path}:{line_number}")
+                    row[field] = int(raw)
+                else:
+                    row[field] = float(raw) if raw != "" else float("nan")
+            rows.append(row)
+    return rows
 
 
 def append_csv_row(path: Path, fieldnames: list[str], row: dict[str, Any]) -> None:
