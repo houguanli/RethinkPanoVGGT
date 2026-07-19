@@ -18,6 +18,9 @@ WAIT_FOR_CHECKPOINT="${WAIT_FOR_CHECKPOINT:-1}"
 WAIT_TIMEOUT_SECONDS="${WAIT_TIMEOUT_SECONDS:-0}"
 POLL_SECONDS="${POLL_SECONDS:-60}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
+SAMPLE_POLICY="${SAMPLE_POLICY:-anchor}"
+PANO_COUNT_POLICY="${PANO_COUNT_POLICY:-panovggt}"
+DATASET_PANO_COUNTS="${DATASET_PANO_COUNTS:-}"
 
 SUMMARY_JSON="$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_summary.json"
 
@@ -46,6 +49,8 @@ mkdir -p "$EVAL_OUT"
   echo "[eval-after-training] gpus=${GPUS:-<none>}"
   echo "[eval-after-training] limit_per_dataset=$LIMIT_PER_DATASET"
   echo "[eval-after-training] datasets=$EVAL_DATASETS"
+  echo "[eval-after-training] sample_policy=$SAMPLE_POLICY"
+  echo "[eval-after-training] pano_count_policy=$PANO_COUNT_POLICY"
 } | tee "$EVAL_OUT/eval_after_training.log"
 
 if [[ -z "$GPUS" ]]; then
@@ -87,6 +92,9 @@ env \
   LIMIT_PER_DATASET="$LIMIT_PER_DATASET" \
   EVAL_DATASETS="$EVAL_DATASETS" \
   NUM_WORKERS_PER_GPU="$NUM_WORKERS_PER_GPU" \
+  SAMPLE_POLICY="$SAMPLE_POLICY" \
+  PANO_COUNT_POLICY="$PANO_COUNT_POLICY" \
+  DATASET_PANO_COUNTS="$DATASET_PANO_COUNTS" \
   bash "$LUNA/scripts/run_multipano_mixed4_eval_4gpu.sh" \
   2>&1 | tee -a "$EVAL_OUT/eval_after_training.log"
 

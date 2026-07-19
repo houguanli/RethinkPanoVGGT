@@ -15,6 +15,7 @@ LIMIT_PER_DATASET="${LIMIT_PER_DATASET:-0}"
 DEVICE="${DEVICE:-auto}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
 PRED_DEPTH_SCALE="${PRED_DEPTH_SCALE:-}"
+BASE_CHECKPOINT="${BASE_CHECKPOINT:-/home/aoki/RethinkPanoVGGT_omega_compare_methods_only/ckpt/VGGT-Omega/vggt_omega_1b_512.pt}"
 FOREGROUND="${FOREGROUND:-0}"
 
 mkdir -p "$OUT"
@@ -37,14 +38,16 @@ EVAL_CMD=(
   --train-loss-csv "$TRAIN_LOSS_CSV" \
   --datasets "$DATASETS" \
   --limit-per-dataset "$LIMIT_PER_DATASET" \
+  --sample-policy anchor \
   --pano-count-policy panovggt \
   --device "$DEVICE" \
   --amp-dtype "$AMP_DTYPE"
 )
+export VGGT_OMEGA_CKPT="$BASE_CHECKPOINT"
 if [[ -n "$PRED_DEPTH_SCALE" ]]; then
   EVAL_CMD+=(--pred-depth-scale "$PRED_DEPTH_SCALE")
 fi
-EVAL_CMD+=(--no-progress)
+EVAL_CMD+=(--fail-fast)
 
 if [[ "$FOREGROUND" == "1" ]]; then
   echo "$$" > "$OUT/eval.pid"

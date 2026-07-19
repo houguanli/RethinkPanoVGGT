@@ -70,6 +70,13 @@ PANOVGGT_TABLE3_MULTIVIEW = {
     "Panocity": {"abs_rel": 0.0196, "delta_1p25": 0.9812},
 }
 
+PANOVGGT_DATASET_PANO_COUNTS = {
+    "panocity": 10,
+    "matterport3d": 3,
+    "stanford2d3ds": 3,
+    "structured3d": 3,
+}
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -94,6 +101,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit-fraction", type=float, default=0.0, help="Fraction of scene groups per dataset when --limit-per-dataset <= 0.")
     parser.add_argument("--eval-max-panos", type=int, default=0, help="Clamp eval multi-pano input length for all datasets. Use 0 to keep config pano_max_count.")
     parser.add_argument("--panocity-max-panos", type=int, default=0, help="Optional Panocity-specific eval pano cap, overriding --eval-max-panos for Panocity.")
+    parser.add_argument(
+        "--pano-count-policy",
+        choices=["config", "panovggt"],
+        default="config",
+        help="Use config pano counts or PanoVGGT comparison counts: Panocity=10, indoor datasets=3.",
+    )
+    parser.add_argument(
+        "--dataset-pano-counts",
+        default="",
+        help="Optional comma list name:count overriding the selected pano-count policy.",
+    )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument(
         "--sample-policy",
@@ -162,6 +180,7 @@ def main() -> None:
         initialize_csv(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS)
 
     selected_datasets = select_datasets(args.datasets)
+    dataset_pano_counts = resolve_dataset_pano_counts(args.pano_count_policy, args.dataset_pano_counts)
     write_eval_progress(
         args.progress_file,
         {
@@ -184,10 +203,15 @@ def main() -> None:
         dataset_args = copy.copy(train_args)
         dataset_args.dataset_format = "pano_minimal"
         dataset_args.minimal_datasets = minimal_name
-        dataset_eval_max_panos = int(args.eval_max_panos or 0)
-        if minimal_name == "panocity" and int(args.panocity_max_panos or 0) > 0:
-            dataset_eval_max_panos = int(args.panocity_max_panos)
-        apply_eval_max_panos(dataset_args, dataset_eval_max_panos)
+        dataset_pano_count = dataset_pano_counts.get(minimal_name)
+        if dataset_pano_count is not None:
+            apply_exact_eval_pano_count(dataset_args, dataset_pano_count, minimal_name)
+            dataset_eval_max_panos = int(dataset_pano_count)
+        else:
+            dataset_eval_max_panos = int(args.eval_max_panos or 0)
+            if minimal_name == "panocity" and int(args.panocity_max_panos or 0) > 0:
+                dataset_eval_max_panos = int(args.panocity_max_panos)
+            apply_eval_max_panos(dataset_args, dataset_eval_max_panos)
         run_name = f"{display_name}_{split}_{args.limit_per_dataset}"
         before_count = len(per_sample_rows)
         run = evaluate_run(
@@ -239,6 +263,8 @@ def main() -> None:
         "limit_fraction": float(args.limit_fraction or 0.0),
         "eval_max_panos": int(args.eval_max_panos or 0),
         "panocity_max_panos": int(args.panocity_max_panos or 0),
+        "pano_count_policy": str(args.pano_count_policy),
+        "dataset_pano_counts": {key: int(value) for key, value in sorted(dataset_pano_counts.items())},
         "datasets": sorted(selected_datasets),
         "shard_rank": int(args.shard_rank),
         "num_shards": int(args.num_shards),
@@ -297,6 +323,30 @@ def select_datasets(raw: str) -> set[str]:
     if not selected:
         raise ValueError("No datasets selected")
     return selected
+
+
+def resolve_dataset_pano_counts(policy: str, raw_counts: str | None) -> dict[str, int]:
+    counts = dict(PANOVGGT_DATASET_PANO_COUNTS) if str(policy) == "panovggt" else {}
+    for token in str(raw_counts or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" not in token:
+            raise ValueError(f"Expected dataset:count in --dataset-pano-counts, got {token!r}")
+        name, raw_count = token.split(":", 1)
+        dataset_name = next(iter(select_datasets(name)))
+        count = int(raw_count)
+        if count < 1:
+            raise ValueError(f"Pano count must be positive for {dataset_name}: {count}")
+        counts[dataset_name] = count
+    return counts
+
+
+def apply_exact_eval_pano_count(args: argparse.Namespace, count: int, dataset_name: str) -> None:
+    count = max(1, int(count))
+    args.pano_min_count = count
+    args.pano_max_count = count
+    args.dataset_pano_counts = f"{dataset_name}:{count}"
 
 
 def torch_cuda_device_count() -> int:

@@ -23,6 +23,9 @@ SHOW_PROGRESS="${SHOW_PROGRESS:-1}"
 PROGRESS_STYLE="${PROGRESS_STYLE:-bar}"
 PROGRESS_BAR_WIDTH="${PROGRESS_BAR_WIDTH:-32}"
 SHOW_GPU_PROC="${SHOW_GPU_PROC:-0}"
+SAMPLE_POLICY="${SAMPLE_POLICY:-anchor}"
+PANO_COUNT_POLICY="${PANO_COUNT_POLICY:-panovggt}"
+DATASET_PANO_COUNTS="${DATASET_PANO_COUNTS:-}"
 
 mkdir -p "$EVAL_OUT/shards" "$EVAL_OUT/progress"
 rm -f "$EVAL_OUT"/progress/shard_*.json
@@ -67,6 +70,8 @@ fi
   echo "[eval-4gpu] gpus=$GPUS num_shards=$NUM_SHARDS"
   echo "[eval-4gpu] datasets=$EVAL_DATASETS"
   echo "[eval-4gpu] limit_per_dataset=$LIMIT_PER_DATASET"
+  echo "[eval-4gpu] sample_policy=$SAMPLE_POLICY"
+  echo "[eval-4gpu] pano_count_policy=$PANO_COUNT_POLICY"
   echo "[eval-4gpu] progress_interval_seconds=$PROGRESS_INTERVAL_SECONDS"
   echo "[eval-4gpu] progress_style=$PROGRESS_STYLE"
 } | tee "$EVAL_OUT/eval_4gpu.log"
@@ -121,6 +126,9 @@ PY
       --train-loss-csv "$TRAIN_LOSS_CSV" \
       --datasets "$EVAL_DATASETS" \
       --limit-per-dataset "$LIMIT_PER_DATASET" \
+      --sample-policy "$SAMPLE_POLICY" \
+      --pano-count-policy "$PANO_COUNT_POLICY" \
+      --dataset-pano-counts "$DATASET_PANO_COUNTS" \
       --device cuda \
       --num-workers "$NUM_WORKERS_PER_GPU" \
       --amp-dtype "$AMP_DTYPE" \
@@ -279,8 +287,10 @@ echo "[eval-4gpu] merging shards $(date --iso-8601=seconds)" | tee -a "$EVAL_OUT
 PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/merge_mixed4_eval_shards.py \
   --shard-json "$EVAL_OUT"/shards/shard_*.json \
   --shard-csv "$EVAL_OUT"/shards/shard_*.csv \
+  --shard-camera-csv "$EVAL_OUT"/shards/shard_*_camera_pairs.csv \
   --output "$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_summary.json" \
   --per-sample-csv "$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_per_sample.csv" \
+  --camera-pair-csv "$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_camera_pairs.csv" \
   --train-loss-csv "$TRAIN_LOSS_CSV" \
   > "$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_console.log" 2>&1
 

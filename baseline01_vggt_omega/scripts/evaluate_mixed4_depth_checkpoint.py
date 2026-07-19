@@ -16,6 +16,7 @@ import json
 import math
 import os
 import random
+import traceback
 import sys
 import time
 from pathlib import Path
@@ -193,6 +194,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--datasets", default="all", help="Comma list or all.")
     parser.add_argument("--limit-per-dataset", type=int, default=100, help="0 means full split.")
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--sample-policy",
+        choices=["anchor"],
+        default="anchor",
+        help="Evaluate each selected test item as an anchor-centered neighborhood.",
+    )
     parser.add_argument("--eval-max-panos", type=int, default=0, help="Clamp eval multi-pano input length. Use 0 to keep config pano_max_count.")
     parser.add_argument(
         "--pano-count-policy",
@@ -213,6 +220,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pred-depth-scale", type=float, default=None, help="Override cfg.loss.depth.pred_depth_scale.")
     parser.add_argument("--progress", action="store_true", default=True)
     parser.add_argument("--no-progress", dest="progress", action="store_false")
+    parser.add_argument("--fail-fast", action="store_true", help="Raise the first sample error with a full traceback.")
     return parser.parse_args()
 
 
@@ -279,6 +287,7 @@ def main() -> None:
             skipped_rows=skipped_rows,
             camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
             normalize_scene_scale=bool(cfg.get("normalize_scene_scale", False)),
+            fail_fast=bool(args.fail_fast),
         )
         runs.append(run)
         torch.cuda.empty_cache()
@@ -290,6 +299,7 @@ def main() -> None:
         "seed": int(args.seed),
         "limit_per_dataset": int(args.limit_per_dataset),
         "datasets": sorted(selected),
+        "sample_policy": str(args.sample_policy),
         "pano_count_policy": str(args.pano_count_policy),
         "dataset_pano_counts": {key: int(value) for key, value in sorted(dataset_pano_counts.items())},
         "dataset_root": str(resolve_dataset_root(cfg, args.dataset_root)),
@@ -364,6 +374,9 @@ def build_model(cfg: Any, checkpoint: Path, device: torch.device) -> torch.nn.Mo
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     state = extract_model_state(payload)
     missing, unexpected = model.load_state_dict(state, strict=False)
+    # LoRA modules are injected after the base model is moved, so migrate the
+    # completed module tree once more before inference.
+    model.to(device)
     print(f"[INFO] loaded checkpoint = {checkpoint}")
     print(f"[INFO] missing_keys = {len(missing)}; unexpected_keys = {len(unexpected)}")
     if unexpected:
@@ -486,6 +499,7 @@ def evaluate_dataset(
     skipped_rows: list[dict[str, Any]],
     camera_pose_trans_norm_thresh: float,
     normalize_scene_scale: bool,
+    fail_fast: bool,
 ) -> dict[str, Any]:
     source_items = getattr(dataset, "items", None)
     if source_items is None and hasattr(dataset, "pano_dataset"):
@@ -581,6 +595,9 @@ def evaluate_dataset(
                 if camera_pair_csv is not None:
                     append_csv_rows(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS, pose_pair_rows)
             except Exception as exc:
+                if fail_fast:
+                    raise
+                error_traceback = traceback.format_exc()
                 skipped = {
                     "dataset": display_name,
                     "split": split,
@@ -589,9 +606,11 @@ def evaluate_dataset(
                     "rgb_path": str(item.get("rgb_path", "")),
                     "depth_path": str(item.get("depth_path", "")),
                     "error": repr(exc),
+                    "traceback": error_traceback,
                 }
                 skipped_rows.append(skipped)
                 print(f"[WARN] skipped {display_name} index={index}: {exc}")
+                print(error_traceback)
 
     run_camera_pair_rows = camera_pair_rows[run_camera_pair_start:]
     return {
