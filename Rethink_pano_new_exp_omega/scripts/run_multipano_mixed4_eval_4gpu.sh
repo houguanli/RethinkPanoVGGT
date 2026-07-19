@@ -26,6 +26,7 @@ SHOW_GPU_PROC="${SHOW_GPU_PROC:-0}"
 SAMPLE_POLICY="${SAMPLE_POLICY:-anchor}"
 PANO_COUNT_POLICY="${PANO_COUNT_POLICY:-panovggt}"
 DATASET_PANO_COUNTS="${DATASET_PANO_COUNTS:-}"
+CAMERA_EVAL_MAX_PANOS="${CAMERA_EVAL_MAX_PANOS:-3}"
 
 mkdir -p "$EVAL_OUT/shards" "$EVAL_OUT/progress"
 rm -f "$EVAL_OUT"/progress/shard_*.json
@@ -72,6 +73,7 @@ fi
   echo "[eval-4gpu] limit_per_dataset=$LIMIT_PER_DATASET"
   echo "[eval-4gpu] sample_policy=$SAMPLE_POLICY"
   echo "[eval-4gpu] pano_count_policy=$PANO_COUNT_POLICY"
+  echo "[eval-4gpu] camera_eval_max_panos=$CAMERA_EVAL_MAX_PANOS"
   echo "[eval-4gpu] progress_interval_seconds=$PROGRESS_INTERVAL_SECONDS"
   echo "[eval-4gpu] progress_style=$PROGRESS_STYLE"
 } | tee "$EVAL_OUT/eval_4gpu.log"
@@ -129,6 +131,7 @@ PY
       --sample-policy "$SAMPLE_POLICY" \
       --pano-count-policy "$PANO_COUNT_POLICY" \
       --dataset-pano-counts "$DATASET_PANO_COUNTS" \
+      --camera-eval-max-panos "$CAMERA_EVAL_MAX_PANOS" \
       --device cuda \
       --num-workers "$NUM_WORKERS_PER_GPU" \
       --amp-dtype "$AMP_DTYPE" \

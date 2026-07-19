@@ -164,6 +164,8 @@ PER_SAMPLE_CSV_FIELDS = [
     "rgb_path",
     "depth_path",
     "quality_bin",
+    "input_pano_count",
+    "camera_eval_pano_count",
     "loss",
     "loss_depth",
     "loss_overlap",
@@ -215,6 +217,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--windows-per-pano", type=int, default=0, help="Override windows per pano for multi-pano eval. Use 0 to keep config.")
     parser.add_argument("--camera-pair-csv", type=Path, default=None, help="Optional streaming PanoVGGT-style camera pair CSV path.")
     parser.add_argument("--camera-pose-trans-norm-thresh", type=float, default=1e-2, help="GT baseline threshold for translation-angle camera eval.")
+    parser.add_argument("--camera-eval-max-panos", type=int, default=3, help="Maximum pano views used for PanoVGGT Table-2 camera metrics.")
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default=None)
     parser.add_argument("--pred-depth-scale", type=float, default=None, help="Override cfg.loss.depth.pred_depth_scale.")
@@ -286,6 +289,7 @@ def main() -> None:
             camera_pair_csv=camera_pair_csv,
             skipped_rows=skipped_rows,
             camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
+            camera_eval_max_panos=args.camera_eval_max_panos,
             normalize_scene_scale=bool(cfg.get("normalize_scene_scale", False)),
             fail_fast=bool(args.fail_fast),
         )
@@ -302,6 +306,7 @@ def main() -> None:
         "sample_policy": str(args.sample_policy),
         "pano_count_policy": str(args.pano_count_policy),
         "dataset_pano_counts": {key: int(value) for key, value in sorted(dataset_pano_counts.items())},
+        "camera_eval_max_panos": int(args.camera_eval_max_panos),
         "dataset_root": str(resolve_dataset_root(cfg, args.dataset_root)),
         "ablation": {
             "model": "baseline01 VGGTOmega full finetune on flattened multi-pano pinhole windows",
@@ -498,13 +503,21 @@ def evaluate_dataset(
     camera_pair_csv: Path | None,
     skipped_rows: list[dict[str, Any]],
     camera_pose_trans_norm_thresh: float,
+    camera_eval_max_panos: int,
     normalize_scene_scale: bool,
     fail_fast: bool,
 ) -> dict[str, Any]:
-    source_items = getattr(dataset, "items", None)
-    if source_items is None and hasattr(dataset, "pano_dataset"):
-        source_items = getattr(dataset.pano_dataset, "items", None)
-    item_count = len(source_items) if source_items is not None else len(dataset)
+    runtime_dataset = getattr(dataset, "pano_dataset", None)
+    source_items = getattr(runtime_dataset, "items", None) if runtime_dataset is not None else None
+    if source_items is None:
+        source_items = getattr(dataset, "items", None)
+    # PanoMinimalMultiPanoPinholeDataset exposes a large synthetic training
+    # length and wraps real anchor groups modulo the runtime dataset length.
+    # Evaluation must visit each real anchor exactly once.
+    if runtime_dataset is not None:
+        item_count = len(runtime_dataset)
+    else:
+        item_count = len(source_items) if source_items is not None else len(dataset)
     indices = metrics_lib.sample_indices(item_count, limit, seed)
     rows: list[dict[str, Any]] = []
     amp_enabled = device.type == "cuda" and amp_dtype != "none"
@@ -544,6 +557,7 @@ def evaluate_dataset(
                     predictions=predictions,
                     batch=batch,
                     trans_norm_thresh=float(camera_pose_trans_norm_thresh),
+                    max_panos=int(camera_eval_max_panos),
                 )
                 loss_total = scalar_tensor(loss_dict.get("loss_reg_depth", 0.0))
                 loss_depth = scalar_tensor(loss_dict.get("loss_log_l1_depth", loss_dict.get("loss_reg_depth", 0.0)))
@@ -558,6 +572,13 @@ def evaluate_dataset(
                     "rgb_path": str(item.get("rgb_path", "")),
                     "depth_path": str(item.get("depth_path", "")),
                     "quality_bin": str(item.get("metadata_quality_bin", sample.get("metadata_quality_bin", "unknown"))),
+                    "input_pano_count": int(batch["images"].shape[1])
+                    // max(int(getattr(dataset, "windows_per_pano", 1)), 1),
+                    "camera_eval_pano_count": min(
+                        int(batch["images"].shape[1])
+                        // max(int(getattr(dataset, "windows_per_pano", 1)), 1),
+                        int(camera_eval_max_panos),
+                    ),
                     "loss": loss_total,
                     "loss_depth": loss_depth,
                     "loss_overlap": loss_overlap,
@@ -715,6 +736,7 @@ def compute_window0_camera_pose_metrics(
     predictions: dict[str, Any],
     batch: dict[str, torch.Tensor],
     trans_norm_thresh: float = 1e-2,
+    max_panos: int = 3,
 ) -> tuple[dict[str, float], list[dict[str, Any]]]:
     """PanoVGGT-style pair metrics from Omega window pose predictions.
 
@@ -766,6 +788,9 @@ def compute_window0_camera_pose_metrics(
             ref_panos.append(pano_id)
         if len(ref_indices) < 2:
             continue
+        if int(max_panos) > 0:
+            ref_indices = ref_indices[: int(max_panos)]
+            ref_panos = ref_panos[: int(max_panos)]
 
         for a in range(len(ref_indices)):
             for b in range(a + 1, len(ref_indices)):

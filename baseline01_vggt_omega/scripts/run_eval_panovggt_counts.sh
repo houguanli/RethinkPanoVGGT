@@ -40,6 +40,7 @@ EVAL_CMD=(
   --limit-per-dataset "$LIMIT_PER_DATASET" \
   --sample-policy anchor \
   --pano-count-policy panovggt \
+  --camera-eval-max-panos 3 \
   --device "$DEVICE" \
   --amp-dtype "$AMP_DTYPE"
 )

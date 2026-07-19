@@ -119,6 +119,8 @@ PER_SAMPLE_CSV_FIELDS = [
     "rgb_path",
     "depth_path",
     "quality_bin",
+    "input_pano_count",
+    "camera_eval_pano_count",
     "loss",
     "loss_depth",
     "loss_overlap",
@@ -186,6 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--camera-pair-csv", type=Path, default=None, help="Optional streaming PanoVGGT-style camera pair CSV path.")
     parser.add_argument("--camera-pose-trans-norm-thresh", type=float, default=1e-2, help="GT baseline threshold for PanoVGGT-style camera translation-angle eval.")
+    parser.add_argument("--camera-eval-max-panos", type=int, default=3, help="Maximum pano views used for PanoVGGT Table-2 camera metrics.")
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default=None)
@@ -246,6 +249,7 @@ def main() -> None:
             camera_pair_csv=camera_pair_csv,
             row_context={"split": args.split},
             camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
+            camera_eval_max_panos=args.camera_eval_max_panos,
         )
     )
     if args.hard_limit > 0:
@@ -405,6 +409,7 @@ def evaluate_run(
     progress_every: int = 25,
     progress_context: dict[str, Any] | None = None,
     camera_pose_trans_norm_thresh: float = 1e-2,
+    camera_eval_max_panos: int = 3,
 ) -> dict[str, Any]:
     if int(num_shards) < 1:
         raise ValueError(f"num_shards must be >= 1, got {num_shards}")
@@ -545,6 +550,7 @@ def evaluate_run(
                             )
                         ),
                         trans_norm_thresh=float(camera_pose_trans_norm_thresh),
+                        max_panos=int(camera_eval_max_panos),
                     )
                 if float(eval_args.global_point_loss_weight) > 0:
                     global_point_metrics = shared_frame_point_loss(
@@ -582,6 +588,10 @@ def evaluate_run(
                 "rgb_path": scalar_string(batch.get("rgb_path")),
                 "depth_path": scalar_string(batch.get("depth_path")),
                 "quality_bin": scalar_string(batch.get("metadata_quality_bin"), default="unknown"),
+                "input_pano_count": int(moved["pano_image"].shape[1]),
+                "camera_eval_pano_count": min(
+                    int(moved["pano_image"].shape[1]), int(camera_eval_max_panos)
+                ),
                 "loss": float(loss.detach().cpu()),
                 "loss_depth": float(loss_depth.detach().cpu()),
                 "loss_overlap": float(loss_overlap.detach().cpu()),
@@ -778,6 +788,7 @@ def compute_panovggt_camera_pose_metrics(
     position_mode: str,
     pred_translation_scale: torch.Tensor | None,
     trans_norm_thresh: float = 1e-2,
+    max_panos: int = 3,
 ) -> tuple[dict[str, float], list[dict[str, Any]]]:
     """PanoVGGT-style pairwise relative-pose metrics for pano-level camera heads."""
     empty = empty_camera_pose_sample_metrics()
@@ -797,6 +808,14 @@ def compute_panovggt_camera_pose_metrics(
     target_center, target_quat, position_valid, rotation_valid = targets
     if pred_center.shape != target_center.shape or pred_quat.shape != target_quat.shape:
         return empty, []
+    if int(max_panos) > 0:
+        pano_limit = int(max_panos)
+        pred_center = pred_center[:, :pano_limit]
+        pred_quat = pred_quat[:, :pano_limit]
+        target_center = target_center[:, :pano_limit]
+        target_quat = target_quat[:, :pano_limit]
+        position_valid = position_valid[:, :pano_limit]
+        rotation_valid = rotation_valid[:, :pano_limit]
 
     pred_center = torch.nan_to_num(pred_center.float(), nan=0.0, posinf=0.0, neginf=0.0)
     pred_quat = F.normalize(

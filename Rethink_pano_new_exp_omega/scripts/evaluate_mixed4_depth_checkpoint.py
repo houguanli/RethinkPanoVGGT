@@ -124,6 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--camera-pair-csv", type=Path, default=None, help="Optional streaming PanoVGGT-style camera pair CSV path.")
     parser.add_argument("--camera-pose-trans-norm-thresh", type=float, default=1e-2, help="GT baseline threshold for PanoVGGT-style camera translation-angle eval.")
+    parser.add_argument("--camera-eval-max-panos", type=int, default=3, help="Maximum pano views used for PanoVGGT Table-2 camera metrics.")
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default=None)
@@ -243,6 +244,7 @@ def main() -> None:
                 "selected_datasets": sorted(selected_datasets),
             },
             camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
+            camera_eval_max_panos=args.camera_eval_max_panos,
         )
         run["dataset"] = display_name
         run["minimal_dataset"] = minimal_name
@@ -265,6 +267,7 @@ def main() -> None:
         "panocity_max_panos": int(args.panocity_max_panos or 0),
         "pano_count_policy": str(args.pano_count_policy),
         "dataset_pano_counts": {key: int(value) for key, value in sorted(dataset_pano_counts.items())},
+        "camera_eval_max_panos": int(args.camera_eval_max_panos),
         "datasets": sorted(selected_datasets),
         "shard_rank": int(args.shard_rank),
         "num_shards": int(args.num_shards),
