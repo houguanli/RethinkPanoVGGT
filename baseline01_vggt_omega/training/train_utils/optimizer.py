@@ -215,7 +215,9 @@ def construct_optimizer(model: nn.Module,
     *No* allowlist handling – we always optimize *all* model parameters.
     """
 
-    named_parameters = dict(model.named_parameters())
+    named_parameters = {name: param for name, param in model.named_parameters() if param.requires_grad}
+    if not named_parameters:
+        raise ValueError("No trainable parameters found for optimizer construction.")
     all_parameter_names = set(named_parameters.keys())
     module_cls_to_all_param_names = get_module_cls_to_param_names(model)
 

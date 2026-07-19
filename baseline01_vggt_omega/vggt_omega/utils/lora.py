@@ -14,6 +14,8 @@ class LoRALinear(nn.Module):
         if rank <= 0:
             raise ValueError("LoRA rank must be positive")
         self.base = base
+        self.in_features = int(base.in_features)
+        self.out_features = int(base.out_features)
         self.rank = rank
         self.scaling = alpha / rank
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -28,6 +30,14 @@ class LoRALinear(nn.Module):
         base_out = self.base(x)
         update = F.linear(F.linear(self.dropout(x), self.lora_a), self.lora_b) * self.scaling
         return base_out + update
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.base.weight
+
+    @property
+    def bias(self) -> torch.Tensor | None:
+        return self.base.bias
 
 
 def apply_lora_to_model(

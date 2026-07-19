@@ -87,6 +87,7 @@ class Trainer:
         limit_val_batches: Optional[int] = None,
         optim: Optional[Dict[str, Any]] = None,
         loss: Optional[Dict[str, Any]] = None,
+        lora: Optional[Dict[str, Any]] = None,
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
         max_duration_minutes: float = 0.0,
@@ -122,6 +123,7 @@ class Trainer:
         # Store Hydra configurations
         self.data_conf = data
         self.model_conf = model
+        self.lora_conf = lora
         self.loss_conf = loss
         self.logging_conf = logging
         self.checkpoint_conf = checkpoint
@@ -252,6 +254,7 @@ class Trainer:
         
         # Load model state
         model_state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+        model_state_dict = self._adapt_state_dict_for_lora(model_state_dict)
         missing, unexpected = self.model.load_state_dict(
             model_state_dict, strict=self.checkpoint_conf.strict
         )
@@ -259,19 +262,46 @@ class Trainer:
             logging.info(f"Model state loaded. Missing keys: {missing or 'None'}. Unexpected keys: {unexpected or 'None'}.")
 
         # Load optimizer state if available and in training mode
-        if "optimizer" in checkpoint:
+        if bool(self.checkpoint_conf.get("resume_optimizer", True)) and "optimizer" in checkpoint:
             logging.info(f"Loading optimizer state dict (rank {self.rank})")
             self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
 
         # Load training progress
-        if "epoch" in checkpoint:
-            self.epoch = checkpoint["epoch"]
-        self.steps = checkpoint["steps"] if "steps" in checkpoint else {"train": 0, "val": 0}
-        self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
+        if bool(self.checkpoint_conf.get("resume_training_progress", True)):
+            if "epoch" in checkpoint:
+                self.epoch = checkpoint["epoch"]
+            self.steps = checkpoint["steps"] if "steps" in checkpoint else {"train": 0, "val": 0}
+            self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
 
         # Load AMP scaler state if available
-        if self.optim_conf.amp.enabled and "scaler" in checkpoint:
+        if bool(self.checkpoint_conf.get("resume_scaler", True)) and self.optim_conf.amp.enabled and "scaler" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler"])
+
+    def _adapt_state_dict_for_lora(self, state_dict: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
+        """Map full-model Linear weights into LoRALinear.base slots when resuming into LoRA."""
+        if self.lora_conf is None or not self.lora_conf.get("enabled", False):
+            return state_dict
+        target_keys = set(self.model.state_dict().keys())
+        adapted = {}
+        remapped = 0
+        for key, value in state_dict.items():
+            if key in target_keys:
+                adapted[key] = value
+                continue
+            mapped = False
+            for suffix in (".weight", ".bias"):
+                if key.endswith(suffix):
+                    candidate = key[: -len(suffix)] + ".base" + suffix
+                    if candidate in target_keys:
+                        adapted[candidate] = value
+                        remapped += 1
+                        mapped = True
+                        break
+            if not mapped:
+                adapted[key] = value
+        if self.rank == 0 and remapped:
+            logging.info(f"Remapped {remapped} Linear checkpoint tensors into LoRA base modules.")
+        return adapted
 
     def _setup_device(self, device: str):
         """Sets up the device for training (CPU or CUDA)."""
@@ -293,7 +323,7 @@ class Trainer:
         # Instantiate components from configs
         self.tb_writer = instantiate(self.logging_conf.tensorboard_writer, _recursive_=False)
         self.model = instantiate(self.model_conf, _recursive_=False)
-        lora_conf = self.model_conf.get("lora", None)
+        lora_conf = self.lora_conf
         if lora_conf is not None and lora_conf.get("enabled", False):
             replaced = apply_lora_to_model(
                 self.model,
@@ -303,6 +333,9 @@ class Trainer:
                 dropout=lora_conf.get("dropout", 0.0),
             )
             logging.info(f"Enabled LoRA on {len(replaced)} Linear modules.")
+            if lora_conf.get("train_lora_only", False):
+                trainable = self._set_lora_only_trainable()
+                logging.info(f"LoRA-only training enabled with {trainable} trainable LoRA parameters.")
         self.loss = instantiate(self.loss_conf, _recursive_=False)
         self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.optim_conf.amp.enabled)
@@ -327,6 +360,18 @@ class Trainer:
             logging.info(f"Model summary saved to {model_summary_path}")
 
         logging.info("Successfully initialized training components.")
+
+    def _set_lora_only_trainable(self) -> int:
+        """Freeze the base model and leave only LoRA residual adapter tensors trainable."""
+        trainable = 0
+        for name, param in self.model.named_parameters():
+            enabled = name.endswith(".lora_a") or name.endswith(".lora_b")
+            param.requires_grad_(enabled)
+            if enabled:
+                trainable += param.numel()
+        if trainable <= 0:
+            raise ValueError("LoRA-only training requested, but no lora_a/lora_b parameters were found.")
+        return trainable
 
     def _setup_dataloaders(self):
         """Initializes train and validation datasets and dataloaders."""

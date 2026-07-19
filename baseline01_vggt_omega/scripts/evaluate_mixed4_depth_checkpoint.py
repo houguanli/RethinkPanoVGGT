@@ -44,6 +44,7 @@ from data.datasets.pano_minimal import (  # noqa: E402
 )
 from loss import compute_camera_loss, compute_depth_loss  # noqa: E402
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch  # noqa: E402
+from vggt_omega.utils.lora import apply_lora_to_model  # noqa: E402
 from vggt_omega.utils.geometry import closed_form_inverse_se3  # noqa: E402
 from vggt_omega.utils.pose_enc import encoding_to_camera  # noqa: E402
 from vggt_omega.utils.rotation import mat_to_quat  # noqa: E402
@@ -350,6 +351,16 @@ def resolve_device(raw: str) -> torch.device:
 
 def build_model(cfg: Any, checkpoint: Path, device: torch.device) -> torch.nn.Module:
     model = instantiate(cfg.model, _recursive_=False).to(device)
+    lora_conf = cfg.get("lora", None)
+    if lora_conf is not None and lora_conf.get("enabled", False):
+        replaced = apply_lora_to_model(
+            model,
+            target_modules=lora_conf.get("target_modules", None),
+            rank=lora_conf.get("rank", 8),
+            alpha=lora_conf.get("alpha", 16.0),
+            dropout=lora_conf.get("dropout", 0.0),
+        )
+        print(f"[INFO] enabled LoRA modules for eval = {len(replaced)}")
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     state = extract_model_state(payload)
     missing, unexpected = model.load_state_dict(state, strict=False)
