@@ -3745,11 +3745,27 @@ def shared_frame_point_loss(
     so Structured3D is excluded through ``pano_translation_valid``.
     """
     zero = pred_depth.sum() * 0.0
+
+    def empty_result() -> Dict[str, torch.Tensor]:
+        # Every rank must participate in the same collective even when its
+        # local dataset/sample has no usable camera target. Otherwise one rank
+        # can enter DDP gradient reduction while another is still reducing the
+        # global-point label count.
+        empty_valid = torch.zeros((), device=zero.device, dtype=torch.bool)
+        synchronized_zero = distributed_masked_mean(zero, empty_valid)
+        detached_zero = synchronized_zero.detach()
+        return {
+            "loss_global_point": synchronized_zero,
+            "global_point_valid_ratio": detached_zero,
+            "global_point_finite_ratio": detached_zero,
+            "global_point_geometry_finite_ratio": detached_zero,
+        }
+
     pred_center = predictions.get("pano_camera_center")
     pred_quat = predictions.get("pano_rotation_quat_w2c")
     camera_meta = predictions.get("pano_camera_meta")
     if pred_center is None or pred_quat is None or camera_meta is None:
-        return {"loss_global_point": zero, "global_point_valid_ratio": zero.detach()}
+        return empty_result()
 
     targets = build_relative_pano_pose_targets(
         batch=batch,
@@ -3758,10 +3774,10 @@ def shared_frame_point_loss(
         dtype=pred_depth.dtype,
     )
     if targets is None:
-        return {"loss_global_point": zero, "global_point_valid_ratio": zero.detach()}
+        return empty_result()
     target_center, target_quat, position_valid, rotation_valid = targets
     if pred_center.shape != target_center.shape or pred_quat.shape != target_quat.shape:
-        return {"loss_global_point": zero, "global_point_valid_ratio": zero.detach()}
+        return empty_result()
 
     pred_center = torch.nan_to_num(pred_center.float(), nan=0.0, posinf=0.0, neginf=0.0)
     pred_quat = F.normalize(
@@ -3776,7 +3792,7 @@ def shared_frame_point_loss(
     batch_size, view_count, height, width, _ = pred_depth.shape
     num_panos = pred_center.shape[1]
     if num_panos < 1 or view_count % num_panos != 0:
-        return {"loss_global_point": zero, "global_point_valid_ratio": zero.detach()}
+        return empty_result()
     views_per_pano = view_count // num_panos
     low_h = max(2, int(math.ceil(height / max(int(stride), 1))))
     low_w = max(2, int(math.ceil(width / max(int(stride), 1))))

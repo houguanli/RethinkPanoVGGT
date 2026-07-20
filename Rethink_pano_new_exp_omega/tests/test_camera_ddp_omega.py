@@ -14,7 +14,7 @@ import torch.multiprocessing as mp
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR.parent))
 
-from training.train_pano_omega import camera_alignment_loss  # noqa: E402
+from training.train_pano_omega import camera_alignment_loss, shared_frame_point_loss  # noqa: E402
 
 
 def _worker(rank: int, world_size: int, init_file: str) -> None:
@@ -55,6 +55,41 @@ def _worker(rank: int, world_size: int, init_file: str) -> None:
         reported_degrees /= world_size
         assert 89.0 < float(reported_degrees) < 91.0
         losses["loss_camera"].backward()
+
+        view_count = 8
+        point_predictions = {
+            "pano_camera_center": torch.zeros(1, 2, 3, requires_grad=True),
+            "pano_rotation_quat_w2c": identity_quat.reshape(1, 1, 4)
+            .expand(1, 2, 4)
+            .clone()
+            .requires_grad_(True),
+        }
+        if rank != 0:
+            point_predictions["pano_camera_meta"] = {
+                "yaw": torch.zeros(1, view_count),
+                "pitch": torch.zeros(1, view_count),
+                "fov_x": torch.full((1, view_count), 90.0),
+                "fov_y": torch.full((1, view_count), 90.0),
+                "rotations": torch.eye(3).reshape(1, 1, 3, 3).expand(1, view_count, 3, 3),
+            }
+        point_batch = {
+            "pano_position_m": torch.tensor([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]),
+            "pano_translation_valid": torch.tensor([[True, True]]),
+            "pano_rotation_c2w": torch.eye(3).reshape(1, 1, 3, 3).expand(1, 2, 3, 3),
+            "pano_rotation_valid": torch.tensor([[True, True]]),
+        }
+        pred_depth = torch.ones(1, view_count, 4, 4, 1, requires_grad=True)
+        point_losses = shared_frame_point_loss(
+            pred_depth=pred_depth,
+            target_depth=torch.ones_like(pred_depth),
+            valid_mask=torch.ones_like(pred_depth, dtype=torch.bool),
+            predictions=point_predictions,
+            batch=point_batch,
+            pred_translation_scale=None,
+            stride=2,
+        )
+        point_losses["loss_global_point"].backward()
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
