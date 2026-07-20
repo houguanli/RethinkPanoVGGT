@@ -100,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit-per-dataset", type=int, default=100, help="Held-out samples per dataset. Use 0 for the full split.")
     parser.add_argument("--limit-fraction", type=float, default=0.0, help="Fraction of scene groups per dataset when --limit-per-dataset <= 0.")
     parser.add_argument("--eval-max-panos", type=int, default=0, help="Clamp eval multi-pano input length for all datasets. Use 0 to keep config pano_max_count.")
+    parser.add_argument("--num-yaw", type=int, default=0, help="Override yaw windows per pano; 0 keeps checkpoint/config.")
     parser.add_argument("--panocity-max-panos", type=int, default=0, help="Optional Panocity-specific eval pano cap, overriding --eval-max-panos for Panocity.")
     parser.add_argument(
         "--pano-count-policy",
@@ -125,6 +126,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-pair-csv", type=Path, default=None, help="Optional streaming PanoVGGT-style camera pair CSV path.")
     parser.add_argument("--camera-pose-trans-norm-thresh", type=float, default=1e-2, help="GT baseline threshold for PanoVGGT-style camera translation-angle eval.")
     parser.add_argument("--camera-eval-max-panos", type=int, default=3, help="Maximum pano views used for PanoVGGT Table-2 camera metrics.")
+    parser.add_argument(
+        "--erp-latitude-limit-deg",
+        type=float,
+        default=75.0,
+        help="Covered-ERP metric latitude limit; polar caps outside +/- this value are excluded.",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default=None)
@@ -169,6 +176,8 @@ def main() -> None:
 
     checkpoint_payload = load_checkpoint_payload(args.checkpoint)
     apply_checkpoint_eval_defaults(train_args, checkpoint_payload)
+    if args.num_yaw > 0:
+        train_args.num_yaw = int(args.num_yaw)
     model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
     model.eval()
 
@@ -245,6 +254,7 @@ def main() -> None:
             },
             camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
             camera_eval_max_panos=args.camera_eval_max_panos,
+            erp_latitude_limit_deg=args.erp_latitude_limit_deg,
         )
         run["dataset"] = display_name
         run["minimal_dataset"] = minimal_name
@@ -264,10 +274,12 @@ def main() -> None:
         "limit_per_dataset": int(args.limit_per_dataset),
         "limit_fraction": float(args.limit_fraction or 0.0),
         "eval_max_panos": int(args.eval_max_panos or 0),
+        "num_yaw": int(train_args.num_yaw),
         "panocity_max_panos": int(args.panocity_max_panos or 0),
         "pano_count_policy": str(args.pano_count_policy),
         "dataset_pano_counts": {key: int(value) for key, value in sorted(dataset_pano_counts.items())},
         "camera_eval_max_panos": int(args.camera_eval_max_panos),
+        "erp_latitude_limit_deg": float(args.erp_latitude_limit_deg),
         "datasets": sorted(selected_datasets),
         "shard_rank": int(args.shard_rank),
         "num_shards": int(args.num_shards),
@@ -283,6 +295,7 @@ def main() -> None:
         "runs": runs,
         "overall": summarize_runs(runs),
         "panovggt_depth_benchmark": summarize_panovggt_benchmark(runs, per_sample_rows),
+        "panovggt_covered_erp_depth_benchmark": summarize_erp_panovggt_benchmark(runs, per_sample_rows),
         "panovggt_camera_benchmark": summarize_panovggt_camera_benchmark(runs, camera_pair_rows),
         "case_rankings": {
             "best_by_depth_irls_abs_rel": rank_samples(per_sample_rows, "depth_irls_abs_rel", reverse=False, limit=20),
@@ -450,7 +463,8 @@ def summarize_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str
     return {
         "paper_protocol_note": (
             "PanoVGGT Table 3 reports Abs Rel and delta<1.25 after IRLS scale normalization. "
-            "Use ours_micro_irls_scale_aligned for the closest automatic comparison; raw-scale metrics are also retained."
+            "This legacy block is computed on sampled pinhole windows. Prefer "
+            "panovggt_covered_erp_depth_benchmark for the ERP-splat common-mask result."
         ),
         "per_dataset": per_dataset,
         "overall_micro_irls_scale_aligned": summarize_panovggt_rows(rows).get("micro_by_valid_pixel", {}),
@@ -458,6 +472,35 @@ def summarize_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str
         "panovggt_table3_monocular_macro_reference": macro_reference(PANOVGGT_TABLE3_MONOCULAR),
         "panovggt_table3_multiview_macro_reference": macro_reference(PANOVGGT_TABLE3_MULTIVIEW),
     }
+
+
+def summarize_erp_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    def unprefix(row: dict[str, Any]) -> dict[str, Any]:
+        converted = dict(row)
+        for key, value in row.items():
+            if key.startswith("erp_depth_"):
+                converted[key[4:]] = value
+        return converted
+
+    converted_rows = [unprefix(row) for row in rows]
+    converted_runs = []
+    for run in runs:
+        converted = dict(run)
+        dataset = str(run.get("dataset", "unknown"))
+        dataset_rows = [
+            row for row in converted_rows if str(row.get("dataset", "unknown")) == dataset
+        ]
+        converted["panovggt_metric_summary"] = summarize_panovggt_rows(dataset_rows)
+        converted_runs.append(converted)
+    result = summarize_panovggt_benchmark(converted_runs, converted_rows)
+    result["paper_protocol_note"] = (
+        "Window Z-depth is converted to radial depth and splatted back to ERP. Metrics use the "
+        "intersection of deterministic window coverage, valid GT, and the configured "
+        "non-polar latitude band. Coverage is reported separately; this is a covered-ERP common-mask "
+        "protocol, not a claim of polar/full-sphere prediction."
+    )
+    result["coverage"] = summarize_metric_rows(rows, ["erp_coverage_fraction", "erp_common_valid_fraction"])
+    return result
 
 
 def summarize_panovggt_camera_benchmark(runs: list[dict[str, Any]], pair_rows: list[dict[str, Any]]) -> dict[str, Any]:

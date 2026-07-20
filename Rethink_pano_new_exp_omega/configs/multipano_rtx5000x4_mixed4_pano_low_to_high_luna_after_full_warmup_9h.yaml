@@ -18,6 +18,7 @@ data:
   pano_min_count: 2
   pano_max_count: 8
   pano_grouping: nearest
+  randomize_pano_order: true
   output_depth_scale: 1000.0
   invalid_depth_value: 65535.0
   pano_position_step_m: 1.0

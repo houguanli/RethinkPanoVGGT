@@ -20,6 +20,9 @@ from scripts.evaluate_depth_checkpoint import (  # noqa: E402
     CAMERA_PAIR_CSV_FIELDS,
     DEPTH_ACCUMULATOR_KEYS,
     DEPTH_METRIC_KEYS,
+    ERP_COVERAGE_KEYS,
+    ERP_DEPTH_ACCUMULATOR_KEYS,
+    ERP_DEPTH_METRIC_KEYS,
     PANOVGGT_PRIMARY_METRICS,
     rank_samples,
     read_train_loss_reference,
@@ -31,6 +34,7 @@ from scripts.evaluate_depth_checkpoint import (  # noqa: E402
 from scripts.evaluate_mixed4_depth_checkpoint import (  # noqa: E402
     summarize_panovggt_camera_benchmark,
     summarize_panovggt_benchmark,
+    summarize_erp_panovggt_benchmark,
     summarize_runs,
     write_per_sample_csv,
 )
@@ -57,6 +61,9 @@ NUMERIC_FIELDS = {
     "sample_weight",
     *DEPTH_METRIC_KEYS,
     *DEPTH_ACCUMULATOR_KEYS,
+    *ERP_COVERAGE_KEYS,
+    *ERP_DEPTH_METRIC_KEYS,
+    *ERP_DEPTH_ACCUMULATOR_KEYS,
 }
 
 
@@ -130,17 +137,21 @@ def main() -> None:
                 ),
                 "valid_fraction_summary": summarize_values([float(row["valid_fraction"]) for row in run_rows]),
                 "depth_metric_summary": summarize_metric_rows(run_rows, DEPTH_METRIC_KEYS),
+                "erp_depth_metric_summary": summarize_metric_rows(run_rows, ERP_DEPTH_METRIC_KEYS),
+                "erp_coverage_summary": summarize_metric_rows(run_rows, ERP_COVERAGE_KEYS),
                 "panovggt_metric_summary": summarize_panovggt_rows(run_rows),
                 "by_quality_bin": summarize_by_key(run_rows, "quality_bin", "loss"),
                 "best_samples": {
                     "by_loss": rank_samples(run_rows, "loss", reverse=False),
                     "by_depth_irls_abs_rel": rank_samples(run_rows, "depth_irls_abs_rel", reverse=False),
                     "by_depth_irls_delta_1p25": rank_samples(run_rows, "depth_irls_delta_1p25", reverse=True),
+                    "by_erp_depth_irls_abs_rel": rank_samples(run_rows, "erp_depth_irls_abs_rel", reverse=False),
                 },
                 "worst_samples": {
                     "by_loss": rank_samples(run_rows, "loss", reverse=True),
                     "by_depth_irls_abs_rel": rank_samples(run_rows, "depth_irls_abs_rel", reverse=True),
                     "by_depth_irls_delta_1p25": rank_samples(run_rows, "depth_irls_delta_1p25", reverse=False),
+                    "by_erp_depth_irls_abs_rel": rank_samples(run_rows, "erp_depth_irls_abs_rel", reverse=True),
                 },
                 "dataset": dataset,
                 "minimal_dataset": meta.get("minimal_dataset"),
@@ -164,12 +175,15 @@ def main() -> None:
         "runs": runs,
         "overall": summarize_runs(runs),
         "panovggt_depth_benchmark": summarize_panovggt_benchmark(runs, rows),
+        "panovggt_covered_erp_depth_benchmark": summarize_erp_panovggt_benchmark(runs, rows),
         "panovggt_camera_benchmark": summarize_panovggt_camera_benchmark(runs, camera_pair_rows),
         "case_rankings": {
             "best_by_depth_irls_abs_rel": rank_samples(rows, "depth_irls_abs_rel", reverse=False, limit=20),
             "worst_by_depth_irls_abs_rel": rank_samples(rows, "depth_irls_abs_rel", reverse=True, limit=20),
             "best_by_depth_irls_delta_1p25": rank_samples(rows, "depth_irls_delta_1p25", reverse=True, limit=20),
             "worst_by_depth_irls_delta_1p25": rank_samples(rows, "depth_irls_delta_1p25", reverse=False, limit=20),
+            "best_by_erp_depth_irls_abs_rel": rank_samples(rows, "erp_depth_irls_abs_rel", reverse=False, limit=20),
+            "worst_by_erp_depth_irls_abs_rel": rank_samples(rows, "erp_depth_irls_abs_rel", reverse=True, limit=20),
             "worst_by_loss": rank_samples(rows, "loss", reverse=True, limit=20),
         },
     }
@@ -263,7 +277,7 @@ def coerce_row(row: dict[str, str]) -> dict[str, Any]:
             continue
         if not math.isfinite(number):
             continue
-        out[key] = int(number) if key in {"dataset_index", "depth_valid_pixels"} else number
+        out[key] = int(number) if key in {"dataset_index", "depth_valid_pixels", "erp_depth_valid_pixels"} else number
     return out
 
 

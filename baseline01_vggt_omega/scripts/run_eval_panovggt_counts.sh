@@ -18,6 +18,9 @@ PRED_DEPTH_SCALE="${PRED_DEPTH_SCALE:-}"
 BASE_CHECKPOINT="${BASE_CHECKPOINT:-/home/aoki/RethinkPanoVGGT_omega_compare_methods_only/ckpt/VGGT-Omega/vggt_omega_1b_512.pt}"
 FOREGROUND="${FOREGROUND:-0}"
 RESUME="${RESUME:-0}"
+CAMERA_EVAL_MAX_PANOS="${CAMERA_EVAL_MAX_PANOS:-0}"
+WINDOWS_PER_PANO="${WINDOWS_PER_PANO:-8}"
+ERP_LATITUDE_LIMIT_DEG="${ERP_LATITUDE_LIMIT_DEG:-75}"
 
 mkdir -p "$OUT"
 if [[ "$RESUME" == "1" ]]; then
@@ -47,7 +50,9 @@ EVAL_CMD=(
   --limit-per-dataset "$LIMIT_PER_DATASET" \
   --sample-policy anchor \
   --pano-count-policy panovggt \
-  --camera-eval-max-panos 3 \
+  --camera-eval-max-panos "$CAMERA_EVAL_MAX_PANOS" \
+  --windows-per-pano "$WINDOWS_PER_PANO" \
+  --erp-latitude-limit-deg "$ERP_LATITUDE_LIMIT_DEG" \
   --device "$DEVICE" \
   --amp-dtype "$AMP_DTYPE"
 )

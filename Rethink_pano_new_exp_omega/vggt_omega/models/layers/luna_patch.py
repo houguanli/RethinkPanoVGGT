@@ -52,7 +52,15 @@ class LunaPatchAdapter(nn.Module):
                 f"Expected global_patch_id shape {tokens.shape[:3]}, got {tuple(global_ids.shape)}"
             )
 
-        global_feat = scatter_mean_by_global_id(tokens, global_ids)
+        pano_ids = token_meta.get("pano_id")
+        if pano_ids is not None:
+            pano_ids = pano_ids.to(device=tokens.device, dtype=torch.long)
+            if pano_ids.ndim == 4:
+                pano_ids = pano_ids.flatten(2)
+            if pano_ids.shape != tokens.shape[:3]:
+                raise ValueError(f"Expected pano_id shape {tokens.shape[:3]}, got {tuple(pano_ids.shape)}")
+
+        global_feat = scatter_mean_by_global_id(tokens, global_ids, pano_ids=pano_ids)
         sphere_enc = self._get_sphere_encoding(tokens, token_meta)
         corr = self.mlp(torch.cat([tokens, global_feat, sphere_enc], dim=-1))
         return tokens + self.alpha.to(dtype=tokens.dtype) * corr
@@ -81,23 +89,44 @@ class LunaPatchAdapter(nn.Module):
         return enc
 
 
-def scatter_mean_by_global_id(tokens: torch.Tensor, global_ids: torch.Tensor) -> torch.Tensor:
-    """Batch-local scatter mean without requiring torch_scatter."""
+def scatter_mean_by_global_id(
+    tokens: torch.Tensor,
+    global_ids: torch.Tensor,
+    *,
+    pano_ids: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Pool repeated ERP patches within each panorama.
+
+    ``global_patch_id`` identifies a direction on one ERP sphere. The same ID
+    in another panorama belongs to another camera center and must not share a
+    mean pool, so multi-pano inputs use ``(pano_id, global_patch_id)`` as the
+    grouping key.
+    """
     B, S, N, C = tokens.shape
-    flat_ids = global_ids.reshape(B, S * N)
-    valid = flat_ids >= 0
+    flat_global_ids = global_ids.reshape(B, S * N)
+    valid = flat_global_ids >= 0
+
+    if pano_ids is None:
+        flat_pano_ids = torch.zeros_like(flat_global_ids)
+    else:
+        if pano_ids.shape != global_ids.shape:
+            raise ValueError(f"Expected pano_ids shape {tuple(global_ids.shape)}, got {tuple(pano_ids.shape)}")
+        flat_pano_ids = pano_ids.reshape(B, S * N)
+        valid = valid & (flat_pano_ids >= 0)
 
     if not bool(valid.any()):
         return torch.zeros_like(tokens)
 
-    num_ids = int(flat_ids[valid].max().item()) + 1
-    offsets = torch.arange(B, device=tokens.device, dtype=torch.long)[:, None] * num_ids
-    safe_ids = flat_ids.clamp_min(0) + offsets
+    num_global_ids = int(flat_global_ids[valid].max().item()) + 1
+    combined_ids = flat_pano_ids.clamp_min(0) * num_global_ids + flat_global_ids.clamp_min(0)
+    num_combined_ids = int(combined_ids[valid].max().item()) + 1
+    offsets = torch.arange(B, device=tokens.device, dtype=torch.long)[:, None] * num_combined_ids
+    safe_ids = combined_ids + offsets
     flat_tokens = tokens.reshape(B * S * N, C)
     flat_safe_ids = safe_ids.reshape(-1)
     flat_valid = valid.reshape(-1)
 
-    bank_size = B * num_ids
+    bank_size = B * num_combined_ids
     sums = tokens.new_zeros(bank_size, C)
     counts = tokens.new_zeros(bank_size, 1)
     sums.index_add_(0, flat_safe_ids[flat_valid], flat_tokens[flat_valid])

@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(THIS_DIR))
 from vggt_omega.data.pano_sampler import PanoWindowSampler  # noqa: E402
 from vggt_omega.models.aggregator import Aggregator  # noqa: E402
 from vggt_omega.models.layers import LunaCameraAdapter, LunaPatchAdapter, PatchEmbed  # noqa: E402
+from vggt_omega.models.layers.luna_patch import scatter_mean_by_global_id  # noqa: E402
 from vggt_omega.models.vggt_omega_luna import VGGTOmega_LUNA  # noqa: E402
 
 
@@ -60,6 +61,19 @@ def test_luna_adapters_are_zero_init_residuals():
     camera_adapter = LunaCameraAdapter(dim=8, camera_meta_dim=16)
     camera_out = camera_adapter(camera_tokens, camera_meta)
     assert torch.allclose(camera_out, camera_tokens), "LUNA-Camera is not a zero-init residual"
+
+
+def test_luna_patch_pooling_is_isolated_by_pano_id():
+    # Repeated windows from pano 0 share a mean. Pano 1 has the same ERP grid
+    # ID but another camera center, so it must remain in a separate pool.
+    tokens = torch.tensor([[[[1.0]], [[3.0]], [[100.0]]]])
+    global_ids = torch.zeros(1, 3, 1, dtype=torch.long)
+    pano_ids = torch.tensor([[[0], [0], [1]]], dtype=torch.long)
+
+    pooled = scatter_mean_by_global_id(tokens, global_ids, pano_ids=pano_ids)
+
+    assert pooled[:, :2].tolist() == [[[[2.0]], [[2.0]]]]
+    assert pooled[:, 2:].tolist() == [[[[100.0]]]]
 
 
 def _swap_in_conv_patch_embed(aggregator: Aggregator, img_size: int, embed_dim: int) -> None:
@@ -138,6 +152,7 @@ def test_luna_wrapper_can_skip_default_checkpoint_load():
 if __name__ == "__main__":
     test_pano_window_sampler_shapes()
     test_luna_adapters_are_zero_init_residuals()
+    test_luna_patch_pooling_is_isolated_by_pano_id()
     test_luna_aggregator_smoke()
     test_luna_wrapper_can_skip_default_checkpoint_load()
     print("pano sampler + LUNA aggregator smoke (omega) ok")

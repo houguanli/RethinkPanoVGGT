@@ -100,6 +100,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pano-min-count", type=int, default=1)
     parser.add_argument("--pano-max-count", type=int, default=1)
+    parser.add_argument(
+        "--randomize-pano-order",
+        action="store_true",
+        default=False,
+        help="Randomize multi-pano order during training so the first pano is not a fixed anchor.",
+    )
+    parser.add_argument("--no-randomize-pano-order", dest="randomize_pano_order", action="store_false")
     parser.add_argument("--panos-per-sample", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--pano-grouping", choices=["nearest", "sequential"], default="nearest")
     parser.add_argument("--dataset-max-samples", type=int, default=None, help="Optional dataset cap for debugging.")
@@ -1149,6 +1156,7 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
     if args.dataset_format == "pano_minimal":
         return PanoMinimalDataset(
             **common_kwargs,
+            randomize_pano_order=args.randomize_pano_order,
             split=args.dataset_split,
             train_split_fraction=args.train_split_fraction,
             split_seed=args.split_seed,
@@ -1183,6 +1191,7 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
                 datasets.append(
                     PanoMinimalDataset(
                         **{**common_kwargs, "root": root},
+                        randomize_pano_order=args.randomize_pano_order,
                         split=args.dataset_split,
                         train_split_fraction=args.train_split_fraction,
                         split_seed=args.split_seed,

@@ -27,6 +27,8 @@ SAMPLE_POLICY="${SAMPLE_POLICY:-anchor}"
 PANO_COUNT_POLICY="${PANO_COUNT_POLICY:-panovggt}"
 DATASET_PANO_COUNTS="${DATASET_PANO_COUNTS:-}"
 CAMERA_EVAL_MAX_PANOS="${CAMERA_EVAL_MAX_PANOS:-3}"
+NUM_YAW="${NUM_YAW:-8}"
+ERP_LATITUDE_LIMIT_DEG="${ERP_LATITUDE_LIMIT_DEG:-75}"
 
 mkdir -p "$EVAL_OUT/shards" "$EVAL_OUT/progress"
 rm -f "$EVAL_OUT"/progress/shard_*.json
@@ -74,6 +76,8 @@ fi
   echo "[eval-4gpu] sample_policy=$SAMPLE_POLICY"
   echo "[eval-4gpu] pano_count_policy=$PANO_COUNT_POLICY"
   echo "[eval-4gpu] camera_eval_max_panos=$CAMERA_EVAL_MAX_PANOS"
+  echo "[eval-4gpu] num_yaw=$NUM_YAW"
+  echo "[eval-4gpu] erp_latitude_limit_deg=$ERP_LATITUDE_LIMIT_DEG"
   echo "[eval-4gpu] progress_interval_seconds=$PROGRESS_INTERVAL_SECONDS"
   echo "[eval-4gpu] progress_style=$PROGRESS_STYLE"
 } | tee "$EVAL_OUT/eval_4gpu.log"
@@ -132,6 +136,8 @@ PY
       --pano-count-policy "$PANO_COUNT_POLICY" \
       --dataset-pano-counts "$DATASET_PANO_COUNTS" \
       --camera-eval-max-panos "$CAMERA_EVAL_MAX_PANOS" \
+      --num-yaw "$NUM_YAW" \
+      --erp-latitude-limit-deg "$ERP_LATITUDE_LIMIT_DEG" \
       --device cuda \
       --num-workers "$NUM_WORKERS_PER_GPU" \
       --amp-dtype "$AMP_DTYPE" \

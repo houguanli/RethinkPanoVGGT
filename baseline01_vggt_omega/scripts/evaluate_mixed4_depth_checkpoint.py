@@ -32,12 +32,15 @@ from tqdm.auto import tqdm
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+GIT_ROOT = REPO_ROOT.parent
 TRAINING_ROOT = REPO_ROOT / "training"
 LUNA_ROOT = REPO_ROOT.parent / "Rethink_pano_new_exp_omega"
 
-for path in (str(REPO_ROOT), str(TRAINING_ROOT)):
+for path in (str(GIT_ROOT), str(REPO_ROOT), str(TRAINING_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
+
+from evaluation_common.erp_depth import splat_window_z_depth_to_erp  # noqa: E402
 
 from data.datasets.pano_minimal import (  # noqa: E402
     PanoMinimalMultiPanoPinholeDataset,
@@ -111,6 +114,10 @@ DEPTH_ACCUMULATOR_KEYS = [
     "depth_irls_delta_1p25_3_count",
 ]
 
+ERP_DEPTH_METRIC_KEYS = [f"erp_{key}" for key in DEPTH_METRIC_KEYS]
+ERP_DEPTH_ACCUMULATOR_KEYS = [f"erp_{key}" for key in DEPTH_ACCUMULATOR_KEYS]
+ERP_COVERAGE_KEYS = ["erp_coverage_fraction", "erp_common_valid_fraction"]
+
 CAMERA_POSE_SAMPLE_KEYS = [
     "camera_pose_pair_count",
     "camera_pose_auc3",
@@ -182,6 +189,9 @@ PER_SAMPLE_CSV_FIELDS = [
     "sample_weight",
     *DEPTH_METRIC_KEYS,
     *DEPTH_ACCUMULATOR_KEYS,
+    *ERP_COVERAGE_KEYS,
+    *ERP_DEPTH_METRIC_KEYS,
+    *ERP_DEPTH_ACCUMULATOR_KEYS,
 ]
 
 
@@ -222,7 +232,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--windows-per-pano", type=int, default=0, help="Override windows per pano for multi-pano eval. Use 0 to keep config.")
     parser.add_argument("--camera-pair-csv", type=Path, default=None, help="Optional streaming PanoVGGT-style camera pair CSV path.")
     parser.add_argument("--camera-pose-trans-norm-thresh", type=float, default=1e-2, help="GT baseline threshold for translation-angle camera eval.")
-    parser.add_argument("--camera-eval-max-panos", type=int, default=3, help="Maximum pano views used for PanoVGGT Table-2 camera metrics.")
+    parser.add_argument(
+        "--erp-latitude-limit-deg",
+        type=float,
+        default=75.0,
+        help="Covered-ERP metric latitude limit; polar caps outside +/- this value are excluded.",
+    )
+    parser.add_argument(
+        "--camera-eval-max-panos",
+        type=int,
+        default=0,
+        help="Maximum pano views used for PanoVGGT camera metrics. Use 0 to evaluate all input panos.",
+    )
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default=None)
     parser.add_argument("--pred-depth-scale", type=float, default=None, help="Override cfg.loss.depth.pred_depth_scale.")
@@ -306,6 +327,7 @@ def main() -> None:
             skipped_rows=skipped_rows,
             camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
             camera_eval_max_panos=args.camera_eval_max_panos,
+            erp_latitude_limit_deg=args.erp_latitude_limit_deg,
             normalize_scene_scale=bool(cfg.get("normalize_scene_scale", False)),
             fail_fast=bool(args.fail_fast),
             completed_sample_keys=completed_sample_keys,
@@ -325,6 +347,7 @@ def main() -> None:
         "pano_count_policy": str(args.pano_count_policy),
         "dataset_pano_counts": {key: int(value) for key, value in sorted(dataset_pano_counts.items())},
         "camera_eval_max_panos": int(args.camera_eval_max_panos),
+        "erp_latitude_limit_deg": float(args.erp_latitude_limit_deg),
         "dataset_root": str(resolve_dataset_root(cfg, args.dataset_root)),
         "ablation": {
             "model": "baseline01 VGGTOmega full finetune on flattened multi-pano pinhole windows",
@@ -344,6 +367,7 @@ def main() -> None:
         "runs": runs,
         "overall": summarize_runs(runs),
         "panovggt_depth_benchmark": summarize_panovggt_benchmark(runs, per_sample_rows, metrics_lib),
+        "panovggt_covered_erp_depth_benchmark": summarize_erp_panovggt_benchmark(runs, per_sample_rows, metrics_lib),
         "panovggt_camera_pose_summary": summarize_camera_pose_pairs(camera_pair_rows),
         "case_rankings": {
             "best_by_depth_irls_abs_rel": metrics_lib.rank_samples(per_sample_rows, "depth_irls_abs_rel", reverse=False, limit=20),
@@ -522,6 +546,7 @@ def evaluate_dataset(
     skipped_rows: list[dict[str, Any]],
     camera_pose_trans_norm_thresh: float,
     camera_eval_max_panos: int,
+    erp_latitude_limit_deg: float,
     normalize_scene_scale: bool,
     fail_fast: bool,
     completed_sample_keys: set[tuple[str, str, int]],
@@ -579,7 +604,11 @@ def evaluate_dataset(
     else:
         img_per_seq = int(ds_conf.get("num_yaw", 8))
     expected_pano_count = int(getattr(dataset, "pano_max_count", 1))
-    expected_camera_pano_count = min(expected_pano_count, int(camera_eval_max_panos))
+    expected_camera_pano_count = (
+        expected_pano_count
+        if int(camera_eval_max_panos) <= 0
+        else min(expected_pano_count, int(camera_eval_max_panos))
+    )
     for row in rows:
         if int(row["input_pano_count"]) != expected_pano_count:
             raise ValueError(
@@ -616,6 +645,12 @@ def evaluate_dataset(
                 target_depth = batch["depths"].detach().float()[..., None]
                 target_valid = batch["point_masks"].detach().bool()[..., None]
                 depth_metrics = metrics_lib.compute_depth_metrics(pred_depth, target_depth, target_valid)
+                erp_metrics = compute_covered_erp_depth_metrics(
+                    pred_window_z=pred_depth,
+                    batch=batch,
+                    metrics_lib=metrics_lib,
+                    latitude_limit_deg=float(erp_latitude_limit_deg),
+                )
                 pose_metrics, pose_pair_rows = compute_window0_camera_pose_metrics(
                     predictions=predictions,
                     batch=batch,
@@ -637,10 +672,15 @@ def evaluate_dataset(
                     "quality_bin": str(item.get("metadata_quality_bin", sample.get("metadata_quality_bin", "unknown"))),
                     "input_pano_count": int(batch["images"].shape[1])
                     // max(int(getattr(dataset, "windows_per_pano", 1)), 1),
-                    "camera_eval_pano_count": min(
+                    "camera_eval_pano_count": (
                         int(batch["images"].shape[1])
-                        // max(int(getattr(dataset, "windows_per_pano", 1)), 1),
-                        int(camera_eval_max_panos),
+                        // max(int(getattr(dataset, "windows_per_pano", 1)), 1)
+                        if int(camera_eval_max_panos) <= 0
+                        else min(
+                            int(batch["images"].shape[1])
+                            // max(int(getattr(dataset, "windows_per_pano", 1)), 1),
+                            int(camera_eval_max_panos),
+                        )
                     ),
                     "loss": loss_total,
                     "loss_depth": loss_depth,
@@ -657,6 +697,7 @@ def evaluate_dataset(
                     "metadata_structure_score": sample_scalar(sample.get("metadata_structure_score"), 0.0),
                     "sample_weight": sample_scalar(sample.get("sample_weight"), 1.0),
                     **depth_metrics,
+                    **erp_metrics,
                 }
                 rows.append(row)
                 per_sample_rows.append(row)
@@ -722,16 +763,20 @@ def evaluate_dataset(
         "camera_R_summary": metrics_lib.summarize_values([row["loss_R"] for row in rows]),
         "camera_pose_summary": summarize_camera_pose_pairs(run_camera_pair_rows),
         "depth_metric_summary": metrics_lib.summarize_metric_rows(rows, metrics_lib.DEPTH_METRIC_KEYS),
+        "erp_depth_metric_summary": metrics_lib.summarize_metric_rows(rows, ERP_DEPTH_METRIC_KEYS),
+        "erp_coverage_summary": metrics_lib.summarize_metric_rows(rows, ERP_COVERAGE_KEYS),
         "panovggt_metric_summary": metrics_lib.summarize_panovggt_rows(rows),
         "best_samples": {
             "by_loss": metrics_lib.rank_samples(rows, "loss", reverse=False),
             "by_depth_irls_abs_rel": metrics_lib.rank_samples(rows, "depth_irls_abs_rel", reverse=False),
             "by_depth_irls_delta_1p25": metrics_lib.rank_samples(rows, "depth_irls_delta_1p25", reverse=True),
+            "by_erp_depth_irls_abs_rel": metrics_lib.rank_samples(rows, "erp_depth_irls_abs_rel", reverse=False),
         },
         "worst_samples": {
             "by_loss": metrics_lib.rank_samples(rows, "loss", reverse=True),
             "by_depth_irls_abs_rel": metrics_lib.rank_samples(rows, "depth_irls_abs_rel", reverse=True),
             "by_depth_irls_delta_1p25": metrics_lib.rank_samples(rows, "depth_irls_delta_1p25", reverse=False),
+            "by_erp_depth_irls_abs_rel": metrics_lib.rank_samples(rows, "erp_depth_irls_abs_rel", reverse=True),
         },
     }
 
@@ -752,13 +797,19 @@ def sample_to_batch(
         "images": images,
         "depths": depths,
         "point_masks": point_masks,
+        "scene_norm_multiplier": torch.ones(1, dtype=torch.float32),
     }
+    if sample.get("pano_range_depth_erp") is not None:
+        batch["pano_range_depth_erp"] = torch.from_numpy(
+            np.asarray(sample["pano_range_depth_erp"], dtype=np.float32)
+        ).unsqueeze(0)
     if all(key in sample for key in ("extrinsics", "intrinsics", "cam_points", "world_points")):
         batch["extrinsics"] = torch.from_numpy(np.stack(sample["extrinsics"]).astype(np.float32)).unsqueeze(0)
         batch["intrinsics"] = torch.from_numpy(np.stack(sample["intrinsics"]).astype(np.float32)).unsqueeze(0)
         batch["cam_points"] = torch.from_numpy(np.stack(sample["cam_points"]).astype(np.float32)).unsqueeze(0)
         batch["world_points"] = torch.from_numpy(np.stack(sample["world_points"]).astype(np.float32)).unsqueeze(0)
         if normalize_scene_scale:
+            raw_depths = batch["depths"].clone()
             (
                 batch["extrinsics"],
                 batch["cam_points"],
@@ -771,6 +822,11 @@ def sample_to_batch(
                 depths=batch["depths"],
                 point_masks=batch["point_masks"],
             )
+            ratio_valid = batch["point_masks"] & torch.isfinite(raw_depths) & (raw_depths > 0)
+            if bool(ratio_valid.any()):
+                batch["scene_norm_multiplier"] = torch.median(
+                    batch["depths"][ratio_valid] / raw_depths[ratio_valid]
+                ).reshape(1)
     for key in ("sample_weight", "metadata_valid_ratio", "metadata_structure_score"):
         value = sample.get(key)
         if value is None:
@@ -791,10 +847,69 @@ def sample_to_batch(
         if value is None:
             value = np.zeros((frame_count,), dtype=np.int64)
         batch[key] = torch.as_tensor(value, dtype=torch.int64).reshape(1, frame_count)
+    for key in ("view_yaw", "view_pitch", "view_fov_x", "view_fov_y"):
+        value = sample.get(key)
+        if value is None:
+            value = np.zeros((frame_count,), dtype=np.float32)
+        batch[key] = torch.as_tensor(value, dtype=torch.float32).reshape(1, frame_count)
     for key, value in list(batch.items()):
         if torch.is_tensor(value):
             batch[key] = value.to(device, non_blocking=True)
     return batch
+
+
+def compute_covered_erp_depth_metrics(
+    *,
+    pred_window_z: torch.Tensor,
+    batch: dict[str, torch.Tensor],
+    metrics_lib: Any,
+    latitude_limit_deg: float,
+) -> dict[str, float]:
+    gt_erp = batch.get("pano_range_depth_erp")
+    if gt_erp is None:
+        empty = metrics_lib.compute_depth_metrics(
+            pred_window_z.new_zeros(1, 1, 1, 1),
+            pred_window_z.new_zeros(1, 1, 1, 1),
+            torch.zeros(1, 1, 1, 1, device=pred_window_z.device, dtype=torch.bool),
+        )
+        return {
+            "erp_coverage_fraction": 0.0,
+            "erp_common_valid_fraction": 0.0,
+            **{f"erp_{key}": value for key, value in empty.items()},
+        }
+    gt_erp = gt_erp.float() * batch.get("scene_norm_multiplier", gt_erp.new_ones(1)).reshape(-1, 1, 1, 1)
+    batch_size, num_panos, erp_height, erp_width = gt_erp.shape
+    splatted = splat_window_z_depth_to_erp(
+        pred_window_z,
+        yaw=batch["view_yaw"],
+        pitch=batch["view_pitch"],
+        fov_x=batch["view_fov_x"],
+        fov_y=batch["view_fov_y"],
+        view_pano_index=batch["view_pano_index"],
+        num_panos=num_panos,
+        erp_height=erp_height,
+        erp_width=erp_width,
+        align_corners=False,
+    )
+    lat_limit = min(max(float(latitude_limit_deg), 0.0), 90.0)
+    row_latitudes = 90.0 - (torch.arange(erp_height, device=gt_erp.device) + 0.5) * 180.0 / erp_height
+    latitude_mask = (row_latitudes.abs() <= lat_limit).reshape(1, 1, erp_height, 1)
+    latitude_mask = latitude_mask.expand(batch_size, num_panos, erp_height, erp_width)
+    gt_valid = torch.isfinite(gt_erp) & (gt_erp > 0.0)
+    coverage_mask = splatted["coverage_mask"] & latitude_mask
+    # This mask is shared across methods; invalid predictions are retained as
+    # zero-depth failures instead of reducing the evaluated region.
+    common_mask = coverage_mask & gt_valid
+    metrics = metrics_lib.compute_depth_metrics(splatted["depth"], gt_erp, common_mask)
+    return {
+        "erp_coverage_fraction": float(
+            coverage_mask.sum().float().div(latitude_mask.sum().clamp_min(1)).cpu()
+        ),
+        "erp_common_valid_fraction": float(
+            common_mask.sum().float().div((gt_valid & latitude_mask).sum().clamp_min(1)).cpu()
+        ),
+        **{f"erp_{key}": value for key, value in metrics.items()},
+    }
 
 
 def compute_window0_camera_pose_metrics(
@@ -1214,7 +1329,8 @@ def summarize_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str
     return {
         "paper_protocol_note": (
             "PanoVGGT Table 3 reports Abs Rel and delta<1.25 after IRLS scale normalization. "
-            "Use ours_micro_irls_scale_aligned for the closest automatic comparison; raw-scale metrics are also retained."
+            "This legacy block is computed on sampled pinhole windows. Prefer "
+            "panovggt_covered_erp_depth_benchmark for the ERP-splat common-mask result."
         ),
         "per_dataset": per_dataset,
         "overall_micro_irls_scale_aligned": metrics_lib.summarize_panovggt_rows(rows).get("micro_by_valid_pixel", {}),
@@ -1222,6 +1338,38 @@ def summarize_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str
         "panovggt_table3_monocular_macro_reference": macro_reference(PANOVGGT_TABLE3_MONOCULAR),
         "panovggt_table3_multiview_macro_reference": macro_reference(PANOVGGT_TABLE3_MULTIVIEW),
     }
+
+
+def summarize_erp_panovggt_benchmark(
+    runs: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    metrics_lib: Any,
+) -> dict[str, Any]:
+    def unprefix(row: dict[str, Any]) -> dict[str, Any]:
+        converted = dict(row)
+        for key, value in row.items():
+            if key.startswith("erp_depth_"):
+                converted[key[4:]] = value
+        return converted
+
+    converted_rows = [unprefix(row) for row in rows]
+    converted_runs = []
+    for run in runs:
+        converted = dict(run)
+        dataset = str(run.get("dataset", "unknown"))
+        dataset_rows = [row for row in converted_rows if str(row.get("dataset", "unknown")) == dataset]
+        converted["panovggt_metric_summary"] = metrics_lib.summarize_panovggt_rows(dataset_rows)
+        converted_runs.append(converted)
+    result = summarize_panovggt_benchmark(converted_runs, converted_rows, metrics_lib)
+    result["paper_protocol_note"] = (
+        "Window Z-depth is converted to radial depth and splatted back to ERP. Metrics use the "
+        "intersection of deterministic 8-window coverage, finite prediction, valid GT, and the "
+        "configured non-polar latitude band. Coverage is reported separately."
+    )
+    result["coverage"] = metrics_lib.summarize_metric_rows(
+        rows, ["erp_coverage_fraction", "erp_common_valid_fraction"]
+    )
+    return result
 
 
 def summarize_camera_pose_pairs(rows: list[dict[str, Any]]) -> dict[str, Any]:

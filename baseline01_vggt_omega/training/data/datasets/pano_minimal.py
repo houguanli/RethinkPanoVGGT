@@ -312,10 +312,16 @@ class PanoMinimalMultiPanoPinholeDataset(BaseDataset):
         camera_weight = []
         view_pano_index = []
         view_window_index = []
+        view_yaw = []
+        view_pitch = []
+        view_fov_x = []
+        view_fov_y = []
+        pano_range_depths = []
 
         for pano_idx in range(pano_count):
             image = _pano_image_to_uint8_numpy(pano_images[pano_idx])
             range_depth = _pano_depth_to_numpy(pano_depths[pano_idx], depth_max_m=self.depth_max_m)
+            pano_range_depths.append(range_depth)
             pano_c2w = _pano_c2w_from_group(group, pano_idx)
             pano_camera_valid = bool(camera_dataset_enabled and translation_valid[pano_idx] and rotation_valid[pano_idx])
 
@@ -347,6 +353,10 @@ class PanoMinimalMultiPanoPinholeDataset(BaseDataset):
                 camera_weight.append(float(sample_weight_by_pano[pano_idx]))
                 view_pano_index.append(pano_idx)
                 view_window_index.append(window_idx)
+                view_yaw.append(float(yaw))
+                view_pitch.append(float(pitch))
+                view_fov_x.append(float(fov_x))
+                view_fov_y.append(float(fov_y))
 
         scene_name = group.get("scene_name", "")
         if isinstance(scene_name, (list, tuple)):
@@ -371,6 +381,11 @@ class PanoMinimalMultiPanoPinholeDataset(BaseDataset):
             "camera_weight": np.asarray(camera_weight, dtype=np.float32),
             "view_pano_index": np.asarray(view_pano_index, dtype=np.int64),
             "view_window_index": np.asarray(view_window_index, dtype=np.int64),
+            "view_yaw": np.asarray(view_yaw, dtype=np.float32),
+            "view_pitch": np.asarray(view_pitch, dtype=np.float32),
+            "view_fov_x": np.asarray(view_fov_x, dtype=np.float32),
+            "view_fov_y": np.asarray(view_fov_y, dtype=np.float32),
+            "pano_range_depth_erp": np.stack(pano_range_depths).astype(np.float32),
             "pano_count": np.full((view_count,), pano_count, dtype=np.int64),
             "windows_per_pano": np.full((view_count,), self.windows_per_pano, dtype=np.int64),
         }

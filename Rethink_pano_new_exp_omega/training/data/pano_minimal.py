@@ -100,6 +100,7 @@ class PanoMinimalDataset(Dataset):
         pano_sample_mode: str = "single",
         pano_min_count: int = 1,
         pano_max_count: int = 1,
+        randomize_pano_order: bool = False,
         panos_per_sample: Optional[int] = None,
         grouping: str = "nearest",
         max_samples: Optional[int] = None,
@@ -130,6 +131,7 @@ class PanoMinimalDataset(Dataset):
         self.pano_sample_mode = pano_sample_mode
         self.pano_min_count = pano_min_count
         self.pano_max_count = pano_max_count
+        self.randomize_pano_order = bool(randomize_pano_order)
         self.grouping = grouping
         self.split = str(split)
         self.train_split_fraction = float(train_split_fraction)
@@ -166,6 +168,8 @@ class PanoMinimalDataset(Dataset):
             min_count = min(self.pano_min_count, max_count)
             group = group[: random.randint(min_count, max_count)]
         samples = self._read_group_with_scene_fallback(group)
+        if self.randomize_pano_order and len(samples) > 1:
+            random.shuffle(samples)
         return {
             "pano_image": torch.stack([sample["pano_image"] for sample in samples], dim=0),
             "pano_depth": torch.stack([sample["pano_depth"] for sample in samples], dim=0),
