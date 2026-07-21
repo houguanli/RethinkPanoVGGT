@@ -1,19 +1,20 @@
-exp_name: mixed4_pano_vggtomega_panovggt_counts_4090_12h
-experiment_variant: window_split_ablation
-input_representation: perspective_window_split
+exp_name: naive_fullerp_vggtomega_scalealigned_2pano
+experiment_variant: naive_vggt_omega
+input_representation: full_erp_no_window_split
 img_size: 384
-num_workers: 4
+num_workers: 2
 seed_value: 42
 accum_steps: 1
 patch_size: 16
 val_epoch_freq: 999
-max_img_per_gpu: 8
+max_img_per_gpu: 2
 
 limit_train_batches: 1000000
 limit_val_batches: 0
 max_epochs: 100000
-max_duration_minutes: 720.0
-normalize_scene_scale: false
+max_duration_minutes: 180.0
+max_duration_excludes_setup: true
+normalize_scene_scale: true
 save_checkpoint_on_exit: true
 mode: train
 device: cuda
@@ -27,8 +28,8 @@ data:
     pin_memory: false
     persistent_workers: false
     common_config:
-      fix_img_num: -1
-      fix_aspect_ratio: 1.0
+      fix_img_num: 2
+      fix_aspect_ratio: 0.5
       load_track: false
       track_num: 1024
       training: true
@@ -41,9 +42,7 @@ data:
       debug: false
       get_nearby: false
       load_depth: true
-      # PanoVGGT eval protocol uses 10 panoramas for Panocity and 3 for indoor
-      # datasets. With 4 pinhole windows per panorama this spans 12-40 views.
-      img_nums: [12, 40]
+      img_nums: [2, 2]
       max_img_per_gpu: ${max_img_per_gpu}
       allow_duplicate_img: false
       repeat_batch: false
@@ -51,14 +50,14 @@ data:
         cojitter: false
         cojitter_ratio: 0.0
         scales: null
-        aspects: [1.0, 1.0]
+        aspects: [0.5, 0.5]
         color_jitter: null
         gray_scale: false
         gau_blur: false
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.pano_minimal.PanoMinimalMultiPanoPinholeDataset
+        - _target_: data.datasets.pano_minimal.PanoMinimalMultiPanoFullERPDataset
           split: train
           root: ${oc.env:PANOVGGT_ROOT,/mnt/e/PanoVGGT_minimal_datasets/datasets}
           datasets: all
@@ -70,15 +69,13 @@ data:
           train_split_fraction: 0.95
           split_seed: 42
           bad_sample_list: ../Rethink_pano_new_exp_omega/configs/structured3d_bad_scenes.txt
-          max_samples: null
+          # Short-run cap is applied independently to each dataset below.
+          max_samples: 500
           pano_sample_mode: fixed_neighborhood
-          pano_min_count: 3
-          pano_max_count: 10
-          dataset_pano_counts: "panocity:10,matterport3d:3,stanford2d3ds:3,structured3d:3"
+          pano_min_count: 2
+          pano_max_count: 2
+          dataset_pano_counts: "panocity:2,matterport3d:2,stanford2d3ds:2,structured3d:2"
           grouping: nearest
-          windows_per_pano: 4
-          pitch_degrees: -15.0
-          fov_degrees: 75.0
           camera_supervised_datasets: "panocity,stanford2d3ds"
   val: null
 
@@ -87,7 +84,7 @@ logging:
   log_visuals: false
   log_freq: 1
   progress_bar: true
-  progress_log_every: 50
+  progress_log_every: 20
   log_level_primary: DEBUG
   log_level_secondary: WARNING
   all_ranks: false
@@ -120,8 +117,11 @@ logging:
 checkpoint:
   save_dir: logs/${exp_name}/ckpts
   save_freq: 0
-  save_step_freq: 5000
+  save_step_freq: 0
   resume_checkpoint_path: null
+  resume_optimizer: true
+  resume_training_progress: true
+  resume_scaler: true
   strict: false
 
 loss:
@@ -138,10 +138,15 @@ loss:
     valid_range: 0.98
     mode: vggt
     pred_depth_scale: 1.0
-    depth_scale_alignment: none
+    depth_scale_alignment: sample_log_median
+    depth_scale_alignment_min: 0.05
+    depth_scale_alignment_max: 1000000.0
   point: null
   track: null
   pano: null
+
+lora:
+  enabled: false
 
 optim:
   param_group_modifiers: false

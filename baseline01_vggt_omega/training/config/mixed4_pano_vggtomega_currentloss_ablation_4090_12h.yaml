@@ -1,4 +1,6 @@
 exp_name: mixed4_pano_vggtomega_currentloss_ablation_4090_12h
+experiment_variant: window_split_ablation
+input_representation: perspective_window_split
 img_size: 384
 num_workers: 4
 seed_value: 42

@@ -159,6 +159,8 @@ class ComposedDataset(Dataset, ABC):
                 sample[key] = torch.as_tensor(batch[key], dtype=torch.int64)
         if "metadata_quality_bin" in batch:
             sample["metadata_quality_bin"] = batch["metadata_quality_bin"]
+        if "input_representation" in batch:
+            sample["input_representation"] = batch["input_representation"]
 
         # --- Track Processing (if enabled) ---
         if self.load_track:

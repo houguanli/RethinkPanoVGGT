@@ -5,6 +5,7 @@ import random
 from pathlib import Path
 from typing import Iterable, Optional
 
+import cv2
 import numpy as np
 
 from data.base_dataset import BaseDataset
@@ -117,11 +118,11 @@ class PanoMinimalPinholeDataset(PanoCityPairedPinholeDataset):
 
 
 class PanoMinimalMultiPanoPinholeDataset(BaseDataset):
-    """Flatten validated multi-pano samples into Omega-style pinhole multiviews.
+    """WINDOW-SPLIT ABLATION: flatten panos into Omega-style pinhole views.
 
     The main multi-pano reader owns scene grouping, split handling, and pose
-    conventions. This adapter keeps that input logic and only converts each
-    pano group into a regular VGGT-Omega sequence of pinhole windows.
+    conventions. This adapter converts every pano to perspective windows, so it
+    is not the naive full-ERP VGGT-Omega baseline.
     """
 
     def __init__(
@@ -399,6 +400,127 @@ class PanoMinimalMultiPanoPinholeDataset(BaseDataset):
         return int(count) if count is not None else None
 
 
+class PanoMinimalMultiPanoFullERPDataset(PanoMinimalMultiPanoPinholeDataset):
+    """Naive VGGT-Omega baseline with one complete ERP image per pano.
+
+    The panorama is resized as a whole and is never projected to perspective
+    windows. ERP radial depth is supervised directly. Spherical camera/world
+    points preserve the existing scene-scale normalization, while the pseudo
+    intrinsics only keep the pinhole camera-head interface operational.
+    """
+
+    def __init__(self, common_conf, **kwargs):
+        kwargs.pop("windows_per_pano", None)
+        kwargs.pop("pitch_degrees", None)
+        kwargs.pop("fov_degrees", None)
+        super().__init__(
+            common_conf=common_conf,
+            windows_per_pano=1,
+            pitch_degrees=0.0,
+            fov_degrees=360.0,
+            **kwargs,
+        )
+
+    def get_data(self, seq_index=None, img_per_seq=None, seq_name=None, ids=None, aspect_ratio=0.5):
+        if seq_index is None:
+            seq_index = 0
+        group = self.pano_dataset[int(seq_index) % len(self.pano_dataset)]
+        pano_images = group["pano_image"]
+        pano_depths = group["pano_depth"]
+        if pano_images.ndim == 3:
+            pano_images = pano_images[None]
+            pano_depths = pano_depths[None]
+
+        target_pano_count = self._target_pano_count(group)
+        desired_views = int(img_per_seq) if img_per_seq is not None else self.pano_max_count
+        if target_pano_count is not None:
+            pano_count = min(int(pano_images.shape[0]), int(target_pano_count), desired_views)
+        else:
+            pano_count = min(int(pano_images.shape[0]), self.pano_max_count, desired_views)
+        pano_count = max(1, pano_count)
+
+        target_shape = self.get_target_shape(aspect_ratio)
+        height, width = int(target_shape[0]), int(target_shape[1])
+        dataset_names = _as_string_list(group.get("sequence_name"), pano_count)
+        camera_dataset_enabled = all(_dataset_key(name) in self.camera_supervised_datasets for name in dataset_names)
+        translation_valid = _as_bool_array(group.get("pano_translation_valid"), pano_count, default=False)
+        rotation_valid = _as_bool_array(group.get("pano_rotation_valid"), pano_count, default=False)
+        sample_weight = _as_float_array(group.get("sample_weight"), pano_count, default=1.0)
+        valid_ratio = _as_float_array(group.get("metadata_valid_ratio"), pano_count, default=1.0)
+        structure_score = _as_float_array(group.get("metadata_structure_score"), pano_count, default=0.0)
+        quality_bins = _as_string_list(group.get("metadata_quality_bin"), pano_count, default="unknown")
+
+        images = []
+        depths = []
+        cam_points = []
+        world_points = []
+        point_masks = []
+        extrinsics = []
+        intrinsics = []
+        original_sizes = []
+        camera_valid = []
+
+        for pano_idx in range(pano_count):
+            image = _resize_full_erp_image(
+                _pano_image_to_uint8_numpy(pano_images[pano_idx]),
+                height=height,
+                width=width,
+            )
+            range_depth = _resize_full_erp_depth(
+                _pano_depth_to_numpy(pano_depths[pano_idx], depth_max_m=self.depth_max_m),
+                height=height,
+                width=width,
+            )
+            pano_c2w = _pano_c2w_from_group(group, pano_idx)
+            erp_c2w = pano_c2w @ _opencv_camera_to_pano_basis()
+            extrinsic = _c2w_to_extrinsic_w2c(erp_c2w)
+            intrinsic = _full_erp_pseudo_intrinsic(height=height, width=width)
+            world_coords, cam_coords, point_mask = _full_erp_points(
+                range_depth=range_depth,
+                erp_c2w=erp_c2w,
+            )
+
+            images.append(image)
+            depths.append(range_depth)
+            extrinsics.append(extrinsic)
+            intrinsics.append(intrinsic)
+            cam_points.append(cam_coords)
+            world_points.append(world_coords)
+            point_masks.append(point_mask)
+            original_sizes.append(np.array([height, width], dtype=np.int32))
+            camera_valid.append(
+                bool(camera_dataset_enabled and translation_valid[pano_idx] and rotation_valid[pano_idx])
+            )
+
+        scene_name = group.get("scene_name", "")
+        if isinstance(scene_name, (list, tuple)):
+            scene_name = "|".join(str(value) for value in scene_name)
+        return {
+            "seq_name": "omega_naive_fullerp_" + str(scene_name),
+            "ids": np.arange(pano_count, dtype=np.int64),
+            "frame_num": pano_count,
+            "images": images,
+            "depths": depths,
+            "extrinsics": extrinsics,
+            "intrinsics": intrinsics,
+            "cam_points": cam_points,
+            "world_points": world_points,
+            "point_masks": point_masks,
+            "original_sizes": original_sizes,
+            "sample_weight": sample_weight,
+            "metadata_valid_ratio": valid_ratio,
+            "metadata_structure_score": structure_score,
+            "metadata_quality_bin": "|".join(quality_bins),
+            "camera_valid": np.asarray(camera_valid, dtype=np.bool_),
+            "camera_weight": sample_weight,
+            "view_pano_index": np.arange(pano_count, dtype=np.int64),
+            "view_window_index": np.full((pano_count,), -1, dtype=np.int64),
+            "pano_count": np.full((pano_count,), pano_count, dtype=np.int64),
+            "windows_per_pano": np.zeros((pano_count,), dtype=np.int64),
+            "input_representation": "naive_full_erp",
+        }
+
+
 class _WeightedRuntimeMixedPanoDataset:
     """Mix exact-count per-dataset PanoMinimalDataset instances."""
 
@@ -551,6 +673,61 @@ def _c2w_to_extrinsic_w2c(c2w: np.ndarray) -> np.ndarray:
     extrinsic[:3, :3] = rotation.T
     extrinsic[:3, 3] = -rotation.T @ translation
     return extrinsic
+
+
+def _resize_full_erp_image(image: np.ndarray, height: int, width: int) -> np.ndarray:
+    interpolation = cv2.INTER_AREA if image.shape[0] >= height and image.shape[1] >= width else cv2.INTER_LINEAR
+    return cv2.resize(image, (width, height), interpolation=interpolation)
+
+
+def _resize_full_erp_depth(depth: np.ndarray, height: int, width: int) -> np.ndarray:
+    return cv2.resize(depth, (width, height), interpolation=cv2.INTER_NEAREST).astype(np.float32)
+
+
+def _opencv_camera_to_pano_basis() -> np.ndarray:
+    """Map OpenCV camera axes (right, down, forward) to ERP pano axes."""
+    basis = np.eye(4, dtype=np.float32)
+    basis[1, 1] = -1.0
+    return basis
+
+
+def _full_erp_pseudo_intrinsic(height: int, width: int) -> np.ndarray:
+    """Angular-density pseudo intrinsics for the pinhole-only camera head."""
+    return np.array(
+        [
+            [float(width) / (2.0 * math.pi), 0.0, (width - 1.0) * 0.5],
+            [0.0, float(height) / math.pi, (height - 1.0) * 0.5],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _full_erp_points(range_depth: np.ndarray, erp_c2w: np.ndarray):
+    """Unproject ERP radial depth with spherical rays in OpenCV camera axes."""
+    height, width = range_depth.shape
+    u = (np.arange(width, dtype=np.float32) + 0.5) / float(width)
+    v = (np.arange(height, dtype=np.float32) + 0.5) / float(height)
+    vv, uu = np.meshgrid(v, u, indexing="ij")
+    theta = (uu - 0.5) * (2.0 * math.pi)
+    phi = (0.5 - vv) * math.pi
+    cos_phi = np.cos(phi)
+
+    # The ERP basis is y-up; OpenCV camera coordinates are y-down.
+    cam_rays = np.stack(
+        [
+            cos_phi * np.sin(theta),
+            -np.sin(phi),
+            cos_phi * np.cos(theta),
+        ],
+        axis=-1,
+    ).astype(np.float32)
+    cam_coords = cam_rays * range_depth[..., None]
+    rotation = erp_c2w[:3, :3].astype(np.float32)
+    translation = erp_c2w[:3, 3].astype(np.float32)
+    world_coords = cam_coords @ rotation.T + translation
+    point_mask = np.isfinite(range_depth) & (range_depth > 1e-8)
+    return world_coords.astype(np.float32), cam_coords.astype(np.float32), point_mask
 
 
 def _as_float_array(value, length: int, default: float = 0.0) -> np.ndarray:

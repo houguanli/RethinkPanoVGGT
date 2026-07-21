@@ -1,4 +1,6 @@
 exp_name: local_vggtomega_scalealigned_2pano_384_lora_9h
+experiment_variant: window_split_ablation
+input_representation: perspective_window_split
 img_size: 384
 num_workers: 4
 seed_value: 42

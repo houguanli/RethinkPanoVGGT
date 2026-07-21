@@ -91,8 +91,11 @@ class Trainer:
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
         max_duration_minutes: float = 0.0,
+        max_duration_excludes_setup: bool = False,
         normalize_scene_scale: bool = True,
         save_checkpoint_on_exit: bool = True,
+        experiment_variant: str = "unspecified",
+        input_representation: str = "unspecified",
         **kwargs,
     ):
         """
@@ -138,8 +141,12 @@ class Trainer:
         self.limit_val_batches = limit_val_batches
         self.seed_value = seed_value
         self.max_duration_seconds = float(max_duration_minutes) * 60.0
+        self.max_duration_excludes_setup = bool(max_duration_excludes_setup)
         self.normalize_scene_scale = bool(normalize_scene_scale)
         self.save_checkpoint_on_exit = bool(save_checkpoint_on_exit)
+        self.experiment_variant = str(experiment_variant)
+        self.input_representation = str(input_representation)
+        self.checkpoint_label = f"{self.experiment_variant}__{self.input_representation}"
         self.stop_requested = False
         self._duration_stop_logged = False
         self.progress_bar_enabled = bool(self.logging_conf.get("progress_bar", True))
@@ -161,6 +168,22 @@ class Trainer:
             log_level_secondary=self.logging_conf.log_level_secondary,
             all_ranks=self.logging_conf.all_ranks,
         )
+        self.experiment_manifest_path = os.path.join(self.logging_conf.log_dir, "experiment_manifest.json")
+        if self.rank == 0:
+            with open(self.experiment_manifest_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "experiment_variant": self.experiment_variant,
+                        "input_representation": self.input_representation,
+                        "checkpoint_label": self.checkpoint_label,
+                        "normalize_scene_scale": self.normalize_scene_scale,
+                        "max_duration_excludes_setup": self.max_duration_excludes_setup,
+                    },
+                    handle,
+                    indent=2,
+                    sort_keys=True,
+                )
+                handle.write("\n")
         self.metrics_csv_path = os.path.join(self.logging_conf.log_dir, "loss.csv")
         if self.rank == 0:
             with open(self.metrics_csv_path, "w", newline="", encoding="utf-8") as handle:
@@ -264,7 +287,20 @@ class Trainer:
         # Load optimizer state if available and in training mode
         if bool(self.checkpoint_conf.get("resume_optimizer", True)) and "optimizer" in checkpoint:
             logging.info(f"Loading optimizer state dict (rank {self.rank})")
-            self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
+            optimizer_state = checkpoint["optimizer"]
+            if isinstance(self.optims, (list, tuple)):
+                if len(self.optims) == 1 and isinstance(optimizer_state, Mapping):
+                    self.optims[0].optimizer.load_state_dict(optimizer_state)
+                else:
+                    if not isinstance(optimizer_state, (list, tuple)) or len(optimizer_state) != len(self.optims):
+                        raise ValueError(
+                            "Optimizer checkpoint count does not match configured optimizers: "
+                            f"checkpoint={type(optimizer_state).__name__}, configured={len(self.optims)}"
+                        )
+                    for optimizer, state in zip(self.optims, optimizer_state):
+                        optimizer.optimizer.load_state_dict(state)
+            else:
+                self.optims.optimizer.load_state_dict(optimizer_state)
 
         # Load training progress
         if bool(self.checkpoint_conf.get("resume_training_progress", True)):
@@ -440,6 +476,9 @@ class Trainer:
             "prev_epoch": epoch,
             "steps": self.steps,
             "time_elapsed": self.time_elapsed_meter.val,
+            "experiment_variant": self.experiment_variant,
+            "input_representation": self.input_representation,
+            "checkpoint_label": self.checkpoint_label,
             "optimizer": [optim.optimizer.state_dict() for optim in self.optims],
         }
         
@@ -478,6 +517,8 @@ class Trainer:
     def run(self):
         """Main entry point to start the training or validation process."""
         assert self.mode in ["train", "val"], f"Invalid mode: {self.mode}"
+        if self.max_duration_excludes_setup:
+            self.start_time = time.time()
         if self.mode == "train":
             self.run_train()
             # Optionally run a final validation after all training is done
