@@ -44,7 +44,13 @@ if [[ -z "${VGGT_OMEGA_CKPT:-}" ]]; then
 fi
 VGGT_OMEGA_CKPT="${VGGT_OMEGA_CKPT:-/whitehole/AOKI/vggt-omega/ckpt/vggt_omega_1b_512.pt}"
 
-CONFIG="${CONFIG:-mixed4_naive_fullerp_vggtomega_scalealigned_2pano}"
+CONFIG="${NAIVE_FULLERP_CONFIG:-mixed4_naive_fullerp_vggtomega_scalealigned_2pano}"
+CONFIG="${CONFIG%.yaml}"
+if [[ "$CONFIG" == */* || ! -f "$BASELINE/training/config/$CONFIG.yaml" ]]; then
+  echo "[naive-fullerp] invalid baseline config: $CONFIG" >&2
+  echo "[naive-fullerp] expected: $BASELINE/training/config/$CONFIG.yaml" >&2
+  exit 1
+fi
 EXP_NAME="${EXP_NAME:-local_naive_fullerp_vggtomega_2p_progressive_$(date +%Y%m%d_%H%M%S)}"
 OUT="${OUT:-$BASELINE/logs/$EXP_NAME}"
 RESOLUTIONS="${RESOLUTIONS:-384,512,1024,2048}"
@@ -72,6 +78,11 @@ cd "$BASELINE"
   echo "[naive-fullerp] depth_scale_alignment=sample_log_median"
   echo "[naive-fullerp] start_checkpoint=${START_CHECKPOINT:-none}"
 } | tee "$OUT/run_manifest.log"
+
+if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
+  echo "[naive-fullerp] preflight passed" | tee -a "$OUT/run_manifest.log"
+  exit 0
+fi
 
 if [[ "$BUILD_INDEXES" == "1" ]]; then
   echo "[naive-fullerp] building/checking mixed4 indexes $(date --iso-8601=seconds)" | tee -a "$OUT/run_manifest.log"
