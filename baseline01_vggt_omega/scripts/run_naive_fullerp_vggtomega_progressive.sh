@@ -57,6 +57,7 @@ STAGE_PLAN="${STAGE_PLAN:-384:2,512:6,1024:10}"
 STAGE_DURATION_MINUTES="${STAGE_DURATION_MINUTES:-4}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1000000}"
 START_CHECKPOINT="${START_CHECKPOINT:-}"
+STAGE_INDEX_OFFSET="${STAGE_INDEX_OFFSET:-0}"
 BUILD_INDEXES="${BUILD_INDEXES:-0}"
 RUN_EVAL="${RUN_EVAL:-1}"
 EVAL_IMG_SIZE="${EVAL_IMG_SIZE:-384}"
@@ -81,7 +82,13 @@ cd "$BASELINE"
   echo "[naive-fullerp] normalize_scene_scale=true"
   echo "[naive-fullerp] depth_scale_alignment=sample_log_median"
   echo "[naive-fullerp] start_checkpoint=${START_CHECKPOINT:-none}"
-} | tee "$OUT/run_manifest.log"
+  echo "[naive-fullerp] stage_index_offset=$STAGE_INDEX_OFFSET"
+} | tee -a "$OUT/run_manifest.log"
+
+if [[ ! "$STAGE_INDEX_OFFSET" =~ ^[0-9]+$ ]]; then
+  echo "[naive-fullerp] STAGE_INDEX_OFFSET must be a non-negative integer" >&2
+  exit 2
+fi
 
 if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
   echo "[naive-fullerp] preflight passed" | tee -a "$OUT/run_manifest.log"
@@ -102,7 +109,7 @@ fi
 previous_checkpoint="$START_CHECKPOINT"
 last_successful_pano_count=""
 training_status=0
-stage_index=0
+stage_index="$STAGE_INDEX_OFFSET"
 for stage_spec in ${STAGE_PLAN//,/ }; do
   stage_index=$((stage_index + 1))
   resolution="${stage_spec%%:*}"
