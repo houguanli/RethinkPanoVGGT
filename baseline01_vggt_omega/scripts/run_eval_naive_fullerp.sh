@@ -11,7 +11,7 @@ elif [[ -x /home/aoki/miniconda3/envs/RethinkPanoVGGT_omega/bin/python ]]; then
 else
   PYTHON_BIN=python
 fi
-CONFIG="${CONFIG:-mixed4_naive_fullerp_vggtomega_scalealigned_2pano}"
+CONFIG="mixed4_naive_fullerp_vggtomega_scalealigned_2pano"
 if [[ -z "${DATASET_ROOT:-}" ]]; then
   DATASET_ROOT="${PANOVGGT_ROOT:-}"
 fi
@@ -37,13 +37,16 @@ CHECKPOINT="$(readlink -f "$CHECKPOINT")"
 STAGE_OUT="$(dirname "$(dirname "$CHECKPOINT")")"
 RUN_OUT="${RUN_OUT:-$STAGE_OUT}"
 
-LIMIT_PER_DATASET="${LIMIT_PER_DATASET:-0}"
-DATASETS="${DATASETS:-all}"
-EVAL_IMG_SIZE="${EVAL_IMG_SIZE:-384}"
-FOREGROUND="${FOREGROUND:-0}"
-RESUME="${RESUME:-0}"
-PANO_COUNT_POLICY="${PANO_COUNT_POLICY:-auto}"
-DATASET_PANO_COUNTS_OVERRIDE="${DATASET_PANO_COUNTS_OVERRIDE:-}"
+LIMIT_PER_DATASET=0
+DATASETS=all
+EVAL_IMG_SIZE=384
+FOREGROUND=0
+if [[ "${2:-}" == "--foreground" ]]; then
+  FOREGROUND=1
+fi
+RESUME=0
+PANO_COUNT_POLICY=auto
+DATASET_PANO_COUNTS_OVERRIDE=""
 PANO_PROTOCOL_LABEL=""
 if [[ "$PANO_COUNT_POLICY" == "auto" ]]; then
   if [[ "$CHECKPOINT" =~ _10p/ ]]; then
@@ -63,7 +66,7 @@ if [[ "$PANO_COUNT_POLICY" != "config" && "$PANO_COUNT_POLICY" != "panovggt" ]];
   exit 2
 fi
 PANO_PROTOCOL_LABEL="${PANO_PROTOCOL_LABEL:-$PANO_COUNT_POLICY}"
-OUT="${EVAL_OUT:-$RUN_OUT/eval_naive_fullerp_${PANO_PROTOCOL_LABEL}_384}"
+OUT="$RUN_OUT/eval_naive_fullerp_${PANO_PROTOCOL_LABEL}_384"
 mkdir -p "$OUT"
 
 cmd=(

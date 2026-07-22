@@ -199,5 +199,5 @@ if [[ "$RUN_EVAL" == "1" && -n "$previous_checkpoint" ]]; then
   EVAL_IMG_SIZE="$EVAL_IMG_SIZE" \
   LIMIT_PER_DATASET="$EVAL_LIMIT_PER_DATASET" \
   FOREGROUND=1 \
-    bash "$SCRIPT_DIR/run_eval_naive_fullerp.sh" "$previous_checkpoint" 2>&1 | tee -a "$OUT/run_manifest.log"
+    bash "$SCRIPT_DIR/run_eval_naive_fullerp.sh" "$previous_checkpoint" --foreground 2>&1 | tee -a "$OUT/run_manifest.log"
 fi
