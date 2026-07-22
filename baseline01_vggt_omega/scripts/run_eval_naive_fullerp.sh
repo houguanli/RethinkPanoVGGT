@@ -12,9 +12,49 @@ else
   PYTHON_BIN=python
 fi
 CONFIG="mixed4_naive_fullerp_vggtomega_scalealigned_2pano"
-if [[ -z "${DATASET_ROOT:-}" ]]; then
-  DATASET_ROOT="${PANOVGGT_ROOT:-}"
+CHECKPOINT="${1:-}"
+if [[ ! -s "$CHECKPOINT" ]]; then
+  echo "usage: bash scripts/run_eval_naive_fullerp.sh /absolute/path/to/checkpoint.pt [options]" >&2
+  echo "[naive-fullerp-eval] checkpoint not found: ${CHECKPOINT:-unset}" >&2
+  exit 2
 fi
+CHECKPOINT="$(readlink -f "$CHECKPOINT")"
+STAGE_OUT="$(dirname "$(dirname "$CHECKPOINT")")"
+RUN_OUT="$STAGE_OUT"
+
+DATASET_ROOT=""
+LIMIT_PER_DATASET=0
+DATASETS="all"
+EVAL_IMG_SIZE=384
+FOREGROUND=0
+RESUME=0
+PANO_COUNT_POLICY=auto
+DATASET_PANO_COUNTS_OVERRIDE=""
+PANO_PROTOCOL_LABEL=""
+TRAINED_PANO_COUNT=0
+
+shift
+while (( $# > 0 )); do
+  case "$1" in
+    --foreground) FOREGROUND=1; shift ;;
+    --resume) RESUME=1; shift ;;
+    --dataset-root) DATASET_ROOT="${2:?missing value for --dataset-root}"; shift 2 ;;
+    --run-out) RUN_OUT="${2:?missing value for --run-out}"; shift 2 ;;
+    --img-size) EVAL_IMG_SIZE="${2:?missing value for --img-size}"; shift 2 ;;
+    --limit-per-dataset) LIMIT_PER_DATASET="${2:?missing value for --limit-per-dataset}"; shift 2 ;;
+    --datasets) DATASETS="${2:?missing value for --datasets}"; shift 2 ;;
+    --trained-pano-count) TRAINED_PANO_COUNT="${2:?missing value for --trained-pano-count}"; shift 2 ;;
+    --pano-count-policy) PANO_COUNT_POLICY="${2:?missing value for --pano-count-policy}"; shift 2 ;;
+    --dataset-pano-counts) DATASET_PANO_COUNTS_OVERRIDE="${2:?missing value for --dataset-pano-counts}"; shift 2 ;;
+    *) echo "[naive-fullerp-eval] unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ ! "$TRAINED_PANO_COUNT" =~ ^[0-9]+$ || ! "$EVAL_IMG_SIZE" =~ ^[0-9]+$ || ! "$LIMIT_PER_DATASET" =~ ^[0-9]+$ ]]; then
+  echo "[naive-fullerp-eval] pano count, image size, and limit must be non-negative integers" >&2
+  exit 2
+fi
+
 if [[ -z "$DATASET_ROOT" ]]; then
   for candidate in /whitehole/AOKI/panovggt /mnt/e/PanoVGGT_minimal_datasets/datasets; do
     if [[ -d "$candidate" ]]; then
@@ -24,35 +64,15 @@ if [[ -z "$DATASET_ROOT" ]]; then
   done
 fi
 if [[ -z "$DATASET_ROOT" || ! -d "$DATASET_ROOT" ]]; then
-  echo "[naive-fullerp-eval] mixed4 dataset root not found" >&2
+  echo "[naive-fullerp-eval] mixed4 dataset root not found; pass --dataset-root" >&2
   exit 2
 fi
-CHECKPOINT="${1:-${CHECKPOINT:-}}"
-if [[ ! -s "$CHECKPOINT" ]]; then
-  echo "usage: bash scripts/run_eval_naive_fullerp.sh /absolute/path/to/checkpoint.pt" >&2
-  echo "[naive-fullerp-eval] checkpoint not found: ${CHECKPOINT:-unset}" >&2
-  exit 2
-fi
-CHECKPOINT="$(readlink -f "$CHECKPOINT")"
-STAGE_OUT="$(dirname "$(dirname "$CHECKPOINT")")"
-RUN_OUT="${RUN_OUT:-$STAGE_OUT}"
 
-LIMIT_PER_DATASET=0
-DATASETS=all
-EVAL_IMG_SIZE=384
-FOREGROUND=0
-if [[ "${2:-}" == "--foreground" ]]; then
-  FOREGROUND=1
-fi
-RESUME=0
-PANO_COUNT_POLICY=auto
-DATASET_PANO_COUNTS_OVERRIDE=""
-PANO_PROTOCOL_LABEL=""
 if [[ "$PANO_COUNT_POLICY" == "auto" ]]; then
-  if [[ "$CHECKPOINT" =~ _10p/ ]]; then
+  if (( TRAINED_PANO_COUNT >= 10 )) || [[ "$CHECKPOINT" =~ _10p/ ]]; then
     PANO_COUNT_POLICY=panovggt
     PANO_PROTOCOL_LABEL=panovggt_counts
-  elif [[ "$CHECKPOINT" =~ _6p/ ]]; then
+  elif (( TRAINED_PANO_COUNT >= 6 )) || [[ "$CHECKPOINT" =~ _6p/ ]]; then
     PANO_COUNT_POLICY=config
     DATASET_PANO_COUNTS_OVERRIDE=panocity:6,matterport3d:3,stanford2d3ds:3,structured3d:3
     PANO_PROTOCOL_LABEL=6p3p_counts
@@ -66,7 +86,7 @@ if [[ "$PANO_COUNT_POLICY" != "config" && "$PANO_COUNT_POLICY" != "panovggt" ]];
   exit 2
 fi
 PANO_PROTOCOL_LABEL="${PANO_PROTOCOL_LABEL:-$PANO_COUNT_POLICY}"
-OUT="$RUN_OUT/eval_naive_fullerp_${PANO_PROTOCOL_LABEL}_384"
+OUT="$RUN_OUT/eval_naive_fullerp_${PANO_PROTOCOL_LABEL}_${EVAL_IMG_SIZE}"
 mkdir -p "$OUT"
 
 cmd=(

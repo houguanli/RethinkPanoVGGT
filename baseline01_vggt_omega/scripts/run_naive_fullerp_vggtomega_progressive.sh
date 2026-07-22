@@ -61,6 +61,7 @@ BUILD_INDEXES="${BUILD_INDEXES:-0}"
 RUN_EVAL="${RUN_EVAL:-1}"
 EVAL_IMG_SIZE="${EVAL_IMG_SIZE:-384}"
 EVAL_LIMIT_PER_DATASET="${EVAL_LIMIT_PER_DATASET:-0}"
+EVAL_DATASETS="${EVAL_DATASETS:-all}"
 
 mkdir -p "$OUT"
 cd "$BASELINE"
@@ -99,6 +100,8 @@ if [[ "$BUILD_INDEXES" == "1" ]]; then
 fi
 
 previous_checkpoint="$START_CHECKPOINT"
+last_successful_pano_count=""
+training_status=0
 stage_index=0
 for stage_spec in ${STAGE_PLAN//,/ }; do
   stage_index=$((stage_index + 1))
@@ -167,13 +170,17 @@ for stage_spec in ${STAGE_PLAN//,/ }; do
   set -e
 
   if [[ "$status" -ne 0 ]]; then
+    training_status="$status"
     if grep -Eiq "CUDA out of memory|torch.OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED" "$stage_out/train_console.log"; then
       echo "[naive-fullerp] stage=$stage_index resolution=$resolution OOM; keeping $previous_checkpoint" \
         | tee -a "$OUT/run_manifest.log"
       break
     fi
-    echo "[naive-fullerp] stage=$stage_index resolution=$resolution failed status=$status" \
+    echo "[naive-fullerp] stage=$stage_index resolution=$resolution failed status=$status; keeping $previous_checkpoint" \
       | tee -a "$OUT/run_manifest.log"
+    if [[ -n "$previous_checkpoint" ]]; then
+      break
+    fi
     exit "$status"
   fi
 
@@ -183,7 +190,9 @@ for stage_spec in ${STAGE_PLAN//,/ }; do
     exit 1
   fi
   previous_checkpoint="$stage_checkpoint"
+  last_successful_pano_count="$pano_count"
   printf '%s\n' "$previous_checkpoint" > "$OUT/last_successful_checkpoint.txt"
+  printf '%s\n' "$last_successful_pano_count" > "$OUT/last_successful_pano_count.txt"
   echo "[naive-fullerp] stage=$stage_index resolution=$resolution complete checkpoint=$stage_checkpoint" \
     | tee -a "$OUT/run_manifest.log"
 done
@@ -191,13 +200,23 @@ done
 echo "[naive-fullerp] finished $(date --iso-8601=seconds)" | tee -a "$OUT/run_manifest.log"
 
 if [[ "$RUN_EVAL" == "1" && -n "$previous_checkpoint" ]]; then
-  echo "[naive-fullerp] launching full-ERP eval checkpoint=$previous_checkpoint" | tee -a "$OUT/run_manifest.log"
-  RUN_OUT="$OUT" \
-  CONFIG="$CONFIG" \
-  DATASET_ROOT="$PANOVGGT_ROOT" \
-  VGGT_OMEGA_CKPT="$VGGT_OMEGA_CKPT" \
-  EVAL_IMG_SIZE="$EVAL_IMG_SIZE" \
-  LIMIT_PER_DATASET="$EVAL_LIMIT_PER_DATASET" \
-  FOREGROUND=1 \
-    bash "$SCRIPT_DIR/run_eval_naive_fullerp.sh" "$previous_checkpoint" --foreground 2>&1 | tee -a "$OUT/run_manifest.log"
+  if [[ -z "$last_successful_pano_count" && "$previous_checkpoint" =~ _([0-9]+)p/ ]]; then
+    last_successful_pano_count="${BASH_REMATCH[1]}"
+  fi
+  last_successful_pano_count="${last_successful_pano_count:-2}"
+  echo "[naive-fullerp] launching full-ERP eval checkpoint=$previous_checkpoint trained_panos=$last_successful_pano_count" \
+    | tee -a "$OUT/run_manifest.log"
+  PYTHON="$PYTHON" VGGT_OMEGA_CKPT="$VGGT_OMEGA_CKPT" \
+    bash "$SCRIPT_DIR/run_eval_naive_fullerp.sh" \
+      "$previous_checkpoint" \
+      --foreground \
+      --dataset-root "$PANOVGGT_ROOT" \
+      --run-out "$OUT" \
+      --trained-pano-count "$last_successful_pano_count" \
+      --img-size "$EVAL_IMG_SIZE" \
+      --limit-per-dataset "$EVAL_LIMIT_PER_DATASET" \
+      --datasets "$EVAL_DATASETS" \
+      2>&1 | tee -a "$OUT/run_manifest.log"
 fi
+
+exit "$training_status"
