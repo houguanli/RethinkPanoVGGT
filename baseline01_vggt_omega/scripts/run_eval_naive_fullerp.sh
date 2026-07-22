@@ -27,7 +27,7 @@ if [[ -z "$DATASET_ROOT" || ! -d "$DATASET_ROOT" ]]; then
   echo "[naive-fullerp-eval] mixed4 dataset root not found" >&2
   exit 2
 fi
-CHECKPOINT="${CHECKPOINT:-${1:-}}"
+CHECKPOINT="${1:-${CHECKPOINT:-}}"
 if [[ ! -s "$CHECKPOINT" ]]; then
   echo "usage: bash scripts/run_eval_naive_fullerp.sh /absolute/path/to/checkpoint.pt" >&2
   echo "[naive-fullerp-eval] checkpoint not found: ${CHECKPOINT:-unset}" >&2

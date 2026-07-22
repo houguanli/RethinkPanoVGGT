@@ -193,12 +193,11 @@ echo "[naive-fullerp] finished $(date --iso-8601=seconds)" | tee -a "$OUT/run_ma
 if [[ "$RUN_EVAL" == "1" && -n "$previous_checkpoint" ]]; then
   echo "[naive-fullerp] launching full-ERP eval checkpoint=$previous_checkpoint" | tee -a "$OUT/run_manifest.log"
   RUN_OUT="$OUT" \
-  CHECKPOINT="$previous_checkpoint" \
   CONFIG="$CONFIG" \
   DATASET_ROOT="$PANOVGGT_ROOT" \
   VGGT_OMEGA_CKPT="$VGGT_OMEGA_CKPT" \
   EVAL_IMG_SIZE="$EVAL_IMG_SIZE" \
   LIMIT_PER_DATASET="$EVAL_LIMIT_PER_DATASET" \
   FOREGROUND=1 \
-    bash "$SCRIPT_DIR/run_eval_naive_fullerp.sh" 2>&1 | tee -a "$OUT/run_manifest.log"
+    bash "$SCRIPT_DIR/run_eval_naive_fullerp.sh" "$previous_checkpoint" 2>&1 | tee -a "$OUT/run_manifest.log"
 fi
