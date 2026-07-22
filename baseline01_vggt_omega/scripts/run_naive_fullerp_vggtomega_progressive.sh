@@ -51,9 +51,9 @@ if [[ "$CONFIG" == */* || ! -f "$BASELINE/training/config/$CONFIG.yaml" ]]; then
   echo "[naive-fullerp] expected: $BASELINE/training/config/$CONFIG.yaml" >&2
   exit 1
 fi
-EXP_NAME="${EXP_NAME:-local_naive_fullerp_vggtomega_2p_progressive_$(date +%Y%m%d_%H%M%S)}"
+EXP_NAME="${EXP_NAME:-local_naive_fullerp_vggtomega_2to10p_progressive_$(date +%Y%m%d_%H%M%S)}"
 OUT="${OUT:-$BASELINE/logs/$EXP_NAME}"
-RESOLUTIONS="${RESOLUTIONS:-384,512,1024,2048}"
+STAGE_PLAN="${STAGE_PLAN:-384:2,512:6,1024:10}"
 STAGE_DURATION_MINUTES="${STAGE_DURATION_MINUTES:-4}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1000000}"
 START_CHECKPOINT="${START_CHECKPOINT:-}"
@@ -75,7 +75,7 @@ cd "$BASELINE"
   echo "[naive-fullerp] panovggt_root=$PANOVGGT_ROOT"
   echo "[naive-fullerp] vggt_omega_ckpt=$VGGT_OMEGA_CKPT"
   echo "[naive-fullerp] representation=full_erp_no_window_split"
-  echo "[naive-fullerp] resolutions=$RESOLUTIONS"
+  echo "[naive-fullerp] stage_plan=$STAGE_PLAN"
   echo "[naive-fullerp] stage_duration_minutes=$STAGE_DURATION_MINUTES"
   echo "[naive-fullerp] normalize_scene_scale=true"
   echo "[naive-fullerp] depth_scale_alignment=sample_log_median"
@@ -100,14 +100,31 @@ fi
 
 previous_checkpoint="$START_CHECKPOINT"
 stage_index=0
-for resolution in ${RESOLUTIONS//,/ }; do
+for stage_spec in ${STAGE_PLAN//,/ }; do
   stage_index=$((stage_index + 1))
-  stage_out="$OUT/stage_${stage_index}_${resolution}x$((resolution / 2))"
+  resolution="${stage_spec%%:*}"
+  pano_count="${stage_spec##*:}"
+  if [[ ! "$resolution" =~ ^[0-9]+$ || ! "$pano_count" =~ ^[0-9]+$ ]]; then
+    echo "[naive-fullerp] invalid stage spec: $stage_spec" | tee -a "$OUT/run_manifest.log"
+    exit 2
+  fi
+  if (( pano_count <= 2 )); then
+    dataset_pano_counts="panocity:${pano_count},matterport3d:${pano_count},stanford2d3ds:${pano_count},structured3d:${pano_count}"
+  else
+    dataset_pano_counts="panocity:${pano_count},matterport3d:3,stanford2d3ds:3,structured3d:3"
+  fi
+  stage_out="$OUT/stage_${stage_index}_${resolution}x$((resolution / 2))_${pano_count}p"
   stage_port=$((MASTER_PORT + stage_index - 1))
   mkdir -p "$stage_out"
   overrides=(
     "exp_name=${EXP_NAME}_stage${stage_index}_${resolution}"
     "img_size=$resolution"
+    "max_img_per_gpu=$pano_count"
+    "data.train.common_config.fix_img_num=$pano_count"
+    "data.train.common_config.img_nums=[$pano_count,$pano_count]"
+    "data.train.common_config.max_img_per_gpu=$pano_count"
+    "data.train.dataset.dataset_configs.0.pano_min_count=2"
+    "data.train.dataset.dataset_configs.0.pano_max_count=$pano_count"
     "logging.log_dir=$stage_out"
     "checkpoint.save_dir=$stage_out/ckpts"
     "max_duration_minutes=$STAGE_DURATION_MINUTES"
@@ -122,7 +139,7 @@ for resolution in ${RESOLUTIONS//,/ }; do
     )
   fi
 
-  echo "[naive-fullerp] stage=$stage_index resolution=${resolution}x$((resolution / 2)) started $(date --iso-8601=seconds)" \
+  echo "[naive-fullerp] stage=$stage_index resolution=${resolution}x$((resolution / 2)) max_panos=$pano_count dataset_pano_counts=$dataset_pano_counts started $(date --iso-8601=seconds)" \
     | tee -a "$OUT/run_manifest.log"
   if (( NPROC_PER_NODE > 1 )); then
     launcher=(
@@ -142,6 +159,7 @@ for resolution in ${RESOLUTIONS//,/ }; do
   MASTER_ADDR="$MASTER_ADDR" MASTER_PORT="$stage_port" \
   CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
   PANOVGGT_ROOT="$PANOVGGT_ROOT" VGGT_OMEGA_CKPT="$VGGT_OMEGA_CKPT" \
+  DATASET_PANO_COUNTS="$dataset_pano_counts" \
   PYTHONPATH="$BASELINE${PYTHONPATH:+:$PYTHONPATH}" \
   "${launcher[@]}" --config "$CONFIG" "${overrides[@]}" \
     2>&1 | tee "$stage_out/train_console.log"
@@ -181,6 +199,7 @@ if [[ "$RUN_EVAL" == "1" && -n "$previous_checkpoint" ]]; then
   VGGT_OMEGA_CKPT="$VGGT_OMEGA_CKPT" \
   EVAL_IMG_SIZE="$EVAL_IMG_SIZE" \
   LIMIT_PER_DATASET="$EVAL_LIMIT_PER_DATASET" \
+  PANO_COUNT_POLICY=panovggt \
   FOREGROUND=1 \
     bash "$SCRIPT_DIR/run_eval_naive_fullerp.sh" 2>&1 | tee -a "$OUT/run_manifest.log"
 fi

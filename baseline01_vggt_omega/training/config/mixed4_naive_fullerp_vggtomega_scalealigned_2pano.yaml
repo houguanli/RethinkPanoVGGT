@@ -74,7 +74,7 @@ data:
           pano_sample_mode: fixed_neighborhood
           pano_min_count: 2
           pano_max_count: 2
-          dataset_pano_counts: "panocity:2,matterport3d:2,stanford2d3ds:2,structured3d:2"
+          dataset_pano_counts: ${oc.env:DATASET_PANO_COUNTS,"panocity:2,matterport3d:2,stanford2d3ds:2,structured3d:2"}
           grouping: nearest
           camera_supervised_datasets: "panocity,stanford2d3ds"
   val: null

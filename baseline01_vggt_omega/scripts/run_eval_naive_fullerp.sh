@@ -4,23 +4,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-if [[ -z "${RUN_OUT:-}" ]]; then
-  marker="$({
-    find "$ROOT/logs" -mindepth 2 -maxdepth 2 -name last_successful_checkpoint.txt -printf '%T@ %h\n' 2>/dev/null || true
-  } | sort -nr | while read -r _ candidate; do
-    if grep -q 'representation=full_erp_no_window_split' "$candidate/run_manifest.log" 2>/dev/null; then
-      printf '%s\n' "$candidate"
-      break
-    fi
-  done)"
-  RUN_OUT="${marker:-}"
-fi
-if [[ -z "$RUN_OUT" || ! -d "$RUN_OUT" ]]; then
-  echo "[naive-fullerp-eval] no completed naive full-ERP run found under $ROOT/logs" >&2
-  echo "[naive-fullerp-eval] set RUN_OUT only when evaluating a non-standard output directory" >&2
-  exit 2
-fi
-
 if [[ -n "${PYTHON:-}" ]]; then
   PYTHON_BIN="$PYTHON"
 elif [[ -x /home/aoki/miniconda3/envs/RethinkPanoVGGT_omega/bin/python ]]; then
@@ -44,21 +27,34 @@ if [[ -z "$DATASET_ROOT" || ! -d "$DATASET_ROOT" ]]; then
   echo "[naive-fullerp-eval] mixed4 dataset root not found" >&2
   exit 2
 fi
-CHECKPOINT="${CHECKPOINT:-}"
-if [[ -z "$CHECKPOINT" && -s "$RUN_OUT/last_successful_checkpoint.txt" ]]; then
-  CHECKPOINT="$(<"$RUN_OUT/last_successful_checkpoint.txt")"
-fi
+CHECKPOINT="${CHECKPOINT:-${1:-}}"
 if [[ ! -s "$CHECKPOINT" ]]; then
+  echo "usage: bash scripts/run_eval_naive_fullerp.sh /absolute/path/to/checkpoint.pt" >&2
   echo "[naive-fullerp-eval] checkpoint not found: ${CHECKPOINT:-unset}" >&2
   exit 2
 fi
+CHECKPOINT="$(readlink -f "$CHECKPOINT")"
+STAGE_OUT="$(dirname "$(dirname "$CHECKPOINT")")"
+RUN_OUT="${RUN_OUT:-$STAGE_OUT}"
 
-OUT="${EVAL_OUT:-$RUN_OUT/eval_naive_fullerp_panovggt_counts_384}"
 LIMIT_PER_DATASET="${LIMIT_PER_DATASET:-0}"
 DATASETS="${DATASETS:-all}"
 EVAL_IMG_SIZE="${EVAL_IMG_SIZE:-384}"
 FOREGROUND="${FOREGROUND:-0}"
 RESUME="${RESUME:-0}"
+PANO_COUNT_POLICY="${PANO_COUNT_POLICY:-auto}"
+if [[ "$PANO_COUNT_POLICY" == "auto" ]]; then
+  if [[ "$CHECKPOINT" =~ _10p/ ]]; then
+    PANO_COUNT_POLICY=panovggt
+  else
+    PANO_COUNT_POLICY=config
+  fi
+fi
+if [[ "$PANO_COUNT_POLICY" != "config" && "$PANO_COUNT_POLICY" != "panovggt" ]]; then
+  echo "[naive-fullerp-eval] invalid PANO_COUNT_POLICY=$PANO_COUNT_POLICY" >&2
+  exit 2
+fi
+OUT="${EVAL_OUT:-$RUN_OUT/eval_naive_fullerp_${PANO_COUNT_POLICY}_384}"
 mkdir -p "$OUT"
 
 cmd=(
@@ -72,7 +68,7 @@ cmd=(
   --datasets "$DATASETS"
   --limit-per-dataset "$LIMIT_PER_DATASET"
   --sample-policy anchor
-  --pano-count-policy panovggt
+  --pano-count-policy "$PANO_COUNT_POLICY"
   --img-size "$EVAL_IMG_SIZE"
   --camera-eval-max-panos 0
   --device auto
@@ -106,7 +102,11 @@ echo "[naive-fullerp-eval] checkpoint=$CHECKPOINT"
 echo "[naive-fullerp-eval] dataset_root=$DATASET_ROOT"
 echo "[naive-fullerp-eval] output=$OUT"
 echo "[naive-fullerp-eval] representation=full_erp_no_window_split img=${EVAL_IMG_SIZE}x$((EVAL_IMG_SIZE / 2))"
-echo "[naive-fullerp-eval] pano_counts=panocity:10,matterport3d:3,stanford2d3ds:3,structured3d:3"
+if [[ "$PANO_COUNT_POLICY" == "panovggt" ]]; then
+  echo "[naive-fullerp-eval] pano_counts=panocity:10,matterport3d:3,stanford2d3ds:3,structured3d:3"
+else
+  echo "[naive-fullerp-eval] pano_counts=2/2/2/2 (matched to the legacy 2-pano training checkpoint)"
+fi
 if [[ "$FOREGROUND" == "1" ]]; then
   "${cmd[@]}" 2>&1 | tee "$OUT/eval_console.log"
 else

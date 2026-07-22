@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASELINE="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-EXP_NAME="${EXP_NAME:-server_naive_fullerp_vggtomega_2p_12h_$(date +%Y%m%d_%H%M%S)}"
+EXP_NAME="${EXP_NAME:-server_naive_fullerp_vggtomega_2to10p_12h_$(date +%Y%m%d_%H%M%S)}"
 OUT="${OUT:-$BASELINE/logs/$EXP_NAME}"
 NOHUP_LOG="${NOHUP_LOG:-$BASELINE/logs/nohup_${EXP_NAME}.log}"
 PID_FILE="$OUT/runner.pid"
@@ -27,8 +27,8 @@ nohup env \
   NAIVE_FULLERP_CONFIG="${NAIVE_FULLERP_CONFIG:-mixed4_naive_fullerp_vggtomega_scalealigned_2pano}" \
   EXP_NAME="$EXP_NAME" \
   OUT="$OUT" \
-  RESOLUTIONS="${RESOLUTIONS:-384,512,1024,2048}" \
-  STAGE_DURATION_MINUTES="${STAGE_DURATION_MINUTES:-180}" \
+  STAGE_PLAN="${STAGE_PLAN:-384:2,512:6,1024:10}" \
+  STAGE_DURATION_MINUTES="${STAGE_DURATION_MINUTES:-240}" \
   BUILD_INDEXES="${BUILD_INDEXES:-1}" \
   RUN_EVAL="${RUN_EVAL:-1}" \
   EVAL_IMG_SIZE="${EVAL_IMG_SIZE:-384}" \
