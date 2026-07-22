@@ -43,18 +43,27 @@ EVAL_IMG_SIZE="${EVAL_IMG_SIZE:-384}"
 FOREGROUND="${FOREGROUND:-0}"
 RESUME="${RESUME:-0}"
 PANO_COUNT_POLICY="${PANO_COUNT_POLICY:-auto}"
+DATASET_PANO_COUNTS_OVERRIDE="${DATASET_PANO_COUNTS_OVERRIDE:-}"
+PANO_PROTOCOL_LABEL=""
 if [[ "$PANO_COUNT_POLICY" == "auto" ]]; then
   if [[ "$CHECKPOINT" =~ _10p/ ]]; then
     PANO_COUNT_POLICY=panovggt
+    PANO_PROTOCOL_LABEL=panovggt_counts
+  elif [[ "$CHECKPOINT" =~ _6p/ ]]; then
+    PANO_COUNT_POLICY=config
+    DATASET_PANO_COUNTS_OVERRIDE=panocity:6,matterport3d:3,stanford2d3ds:3,structured3d:3
+    PANO_PROTOCOL_LABEL=6p3p_counts
   else
     PANO_COUNT_POLICY=config
+    PANO_PROTOCOL_LABEL=legacy_2p_counts
   fi
 fi
 if [[ "$PANO_COUNT_POLICY" != "config" && "$PANO_COUNT_POLICY" != "panovggt" ]]; then
   echo "[naive-fullerp-eval] invalid PANO_COUNT_POLICY=$PANO_COUNT_POLICY" >&2
   exit 2
 fi
-OUT="${EVAL_OUT:-$RUN_OUT/eval_naive_fullerp_${PANO_COUNT_POLICY}_384}"
+PANO_PROTOCOL_LABEL="${PANO_PROTOCOL_LABEL:-$PANO_COUNT_POLICY}"
+OUT="${EVAL_OUT:-$RUN_OUT/eval_naive_fullerp_${PANO_PROTOCOL_LABEL}_384}"
 mkdir -p "$OUT"
 
 cmd=(
@@ -75,6 +84,9 @@ cmd=(
   --amp-dtype bfloat16
   --fail-fast
 )
+if [[ -n "$DATASET_PANO_COUNTS_OVERRIDE" ]]; then
+  cmd+=(--dataset-pano-counts "$DATASET_PANO_COUNTS_OVERRIDE")
+fi
 if [[ "$RESUME" == "1" ]]; then
   cmd+=(--resume)
 else
@@ -102,7 +114,9 @@ echo "[naive-fullerp-eval] checkpoint=$CHECKPOINT"
 echo "[naive-fullerp-eval] dataset_root=$DATASET_ROOT"
 echo "[naive-fullerp-eval] output=$OUT"
 echo "[naive-fullerp-eval] representation=full_erp_no_window_split img=${EVAL_IMG_SIZE}x$((EVAL_IMG_SIZE / 2))"
-if [[ "$PANO_COUNT_POLICY" == "panovggt" ]]; then
+if [[ -n "$DATASET_PANO_COUNTS_OVERRIDE" ]]; then
+  echo "[naive-fullerp-eval] pano_counts=$DATASET_PANO_COUNTS_OVERRIDE"
+elif [[ "$PANO_COUNT_POLICY" == "panovggt" ]]; then
   echo "[naive-fullerp-eval] pano_counts=panocity:10,matterport3d:3,stanford2d3ds:3,structured3d:3"
 else
   echo "[naive-fullerp-eval] pano_counts=2/2/2/2 (matched to the legacy 2-pano training checkpoint)"

@@ -199,7 +199,6 @@ if [[ "$RUN_EVAL" == "1" && -n "$previous_checkpoint" ]]; then
   VGGT_OMEGA_CKPT="$VGGT_OMEGA_CKPT" \
   EVAL_IMG_SIZE="$EVAL_IMG_SIZE" \
   LIMIT_PER_DATASET="$EVAL_LIMIT_PER_DATASET" \
-  PANO_COUNT_POLICY=panovggt \
   FOREGROUND=1 \
     bash "$SCRIPT_DIR/run_eval_naive_fullerp.sh" 2>&1 | tee -a "$OUT/run_manifest.log"
 fi
