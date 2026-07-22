@@ -43,6 +43,7 @@ for path in (str(GIT_ROOT), str(REPO_ROOT), str(TRAINING_ROOT)):
 from evaluation_common.erp_depth import splat_window_z_depth_to_erp  # noqa: E402
 
 from data.datasets.pano_minimal import (  # noqa: E402
+    PanoMinimalMultiPanoFullERPDataset,
     PanoMinimalMultiPanoPinholeDataset,
     PanoMinimalPinholeDataset,
 )
@@ -208,6 +209,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--train-loss-csv", type=Path, default=None)
     parser.add_argument("--dataset-root", type=Path, default=None, help="Override mixed4 dataset root.")
+    parser.add_argument(
+        "--img-size",
+        type=int,
+        default=0,
+        help="Override evaluation width. Full-ERP height remains width/2; 0 keeps the config value.",
+    )
     parser.add_argument("--datasets", default="all", help="Comma list or all.")
     parser.add_argument("--limit-per-dataset", type=int, default=100, help="0 means full split.")
     parser.add_argument("--seed", type=int, default=123)
@@ -258,6 +265,9 @@ def main() -> None:
     os.chdir(REPO_ROOT)
     set_seed(args.seed)
     cfg, config_label = load_hydra_config(args.config)
+    if int(args.img_size) > 0:
+        cfg.img_size = int(args.img_size)
+        cfg.data.train.common_config.img_size = int(args.img_size)
     device = resolve_device(args.device)
     amp_dtype = args.amp_dtype or str(cfg.optim.amp.amp_dtype if cfg.optim.amp.enabled else "none")
 
@@ -455,7 +465,7 @@ def build_eval_dataset(
     eval_max_panos: int = 0,
     dataset_pano_count: int | None = None,
     windows_per_pano: int = 0,
-) -> PanoMinimalPinholeDataset | PanoMinimalMultiPanoPinholeDataset:
+) -> PanoMinimalPinholeDataset | PanoMinimalMultiPanoPinholeDataset | PanoMinimalMultiPanoFullERPDataset:
     ds_conf = cfg.data.train.dataset.dataset_configs[0]
     common_conf = OmegaConf.create(OmegaConf.to_container(cfg.data.train.common_config, resolve=True))
     common_conf.training = False
@@ -463,12 +473,14 @@ def build_eval_dataset(
 
     root = resolve_dataset_root(cfg, dataset_root)
     target = str(ds_conf.get("_target_", ""))
-    if target.endswith("PanoMinimalMultiPanoPinholeDataset"):
+    is_full_erp = target.endswith("PanoMinimalMultiPanoFullERPDataset")
+    if target.endswith("PanoMinimalMultiPanoPinholeDataset") or is_full_erp:
         pano_max_count = int(dataset_pano_count or ds_conf.get("pano_max_count", 2))
         if int(eval_max_panos or 0) > 0:
             pano_max_count = max(1, min(pano_max_count, int(eval_max_panos)))
         pano_min_count = pano_max_count if dataset_pano_count else min(int(ds_conf.get("pano_min_count", pano_max_count)), pano_max_count)
-        return PanoMinimalMultiPanoPinholeDataset(
+        dataset_cls = PanoMinimalMultiPanoFullERPDataset if is_full_erp else PanoMinimalMultiPanoPinholeDataset
+        dataset_kwargs = dict(
             common_conf=common_conf,
             split=split,
             root=str(root),
@@ -479,9 +491,6 @@ def build_eval_dataset(
             output_depth_scale=float(ds_conf.get("output_depth_scale", 1000.0)),
             invalid_depth_value=ds_conf.get("invalid_depth_value", 65535.0),
             depth_max_m=float(ds_conf.get("depth_max_m", 80.0)),
-            windows_per_pano=int(windows_per_pano or ds_conf.get("windows_per_pano", 4)),
-            pitch_degrees=float(ds_conf.get("pitch_degrees", -15.0)),
-            fov_degrees=float(ds_conf.get("fov_degrees", 75.0)),
             train_split_fraction=float(ds_conf.get("train_split_fraction", 0.95)),
             split_seed=int(ds_conf.get("split_seed", 42)),
             bad_sample_list=ds_conf.get("bad_sample_list", None),
@@ -493,6 +502,13 @@ def build_eval_dataset(
             camera_supervised_datasets=ds_conf.get("camera_supervised_datasets", "panocity,stanford2d3ds"),
             main_dataset_path=ds_conf.get("main_dataset_path", None),
         )
+        if not is_full_erp:
+            dataset_kwargs.update(
+                windows_per_pano=int(windows_per_pano or ds_conf.get("windows_per_pano", 4)),
+                pitch_degrees=float(ds_conf.get("pitch_degrees", -15.0)),
+                fov_degrees=float(ds_conf.get("fov_degrees", 75.0)),
+            )
+        return dataset_cls(**dataset_kwargs)
     return PanoMinimalPinholeDataset(
         common_conf=common_conf,
         split=split,
@@ -597,10 +613,12 @@ def evaluate_dataset(
     ]
     ds_conf = cfg.data.train.dataset.dataset_configs[0]
     target = str(ds_conf.get("_target_", ""))
-    if target.endswith("PanoMinimalMultiPanoPinholeDataset"):
-        img_per_seq = int(getattr(dataset, "pano_max_count", ds_conf.get("pano_max_count", 2))) * int(
+    is_full_erp = target.endswith("PanoMinimalMultiPanoFullERPDataset")
+    if target.endswith("PanoMinimalMultiPanoPinholeDataset") or is_full_erp:
+        windows_per_pano = 1 if is_full_erp else int(
             getattr(dataset, "windows_per_pano", ds_conf.get("windows_per_pano", 4))
         )
+        img_per_seq = int(getattr(dataset, "pano_max_count", ds_conf.get("pano_max_count", 2))) * windows_per_pano
     else:
         img_per_seq = int(ds_conf.get("num_yaw", 8))
     expected_pano_count = int(getattr(dataset, "pano_max_count", 1))
@@ -633,7 +651,7 @@ def evaluate_dataset(
                 sample = dataset.get_data(
                     seq_index=int(index),
                     img_per_seq=img_per_seq,
-                    aspect_ratio=1.0,
+                    aspect_ratio=0.5 if is_full_erp else 1.0,
                 )
                 batch = sample_to_batch(sample, device, normalize_scene_scale=normalize_scene_scale)
                 with torch.autocast(device_type=device.type, dtype=torch_amp_dtype, enabled=amp_enabled):

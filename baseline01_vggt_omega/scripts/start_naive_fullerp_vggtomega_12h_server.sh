@@ -30,6 +30,9 @@ nohup env \
   RESOLUTIONS="${RESOLUTIONS:-384,512,1024,2048}" \
   STAGE_DURATION_MINUTES="${STAGE_DURATION_MINUTES:-180}" \
   BUILD_INDEXES="${BUILD_INDEXES:-1}" \
+  RUN_EVAL="${RUN_EVAL:-1}" \
+  EVAL_IMG_SIZE="${EVAL_IMG_SIZE:-384}" \
+  EVAL_LIMIT_PER_DATASET="${EVAL_LIMIT_PER_DATASET:-0}" \
   bash "$SCRIPT_DIR/run_naive_fullerp_vggtomega_progressive.sh" \
   >"$NOHUP_LOG" 2>&1 &
 pid=$!
