@@ -7,20 +7,21 @@ RUN_ID="${RUN_ID:-local0716_no_camera_geora_20260724_001}"
 RUN_OUT="${RUN_OUT:-$PROJECT_ROOT/logs/$RUN_ID}"
 NOHUP_LOG="${NOHUP_LOG:-$PROJECT_ROOT/logs/nohup_${RUN_ID}.log}"
 PID_FILE="${PID_FILE:-$RUN_OUT/launcher.pid}"
+TMUX_SESSION="${TMUX_SESSION:-camera_geora_ablation_0716}"
 
 if [[ "${1:-}" == "--background" ]]; then
   mkdir -p "$RUN_OUT"
-  if [[ -s "$PID_FILE" ]]; then
-    existing_pid="$(cat "$PID_FILE")"
-    if [[ "$existing_pid" =~ ^[0-9]+$ ]] && kill -0 "$existing_pid" 2>/dev/null; then
-      echo "already running: pid=$existing_pid log=$NOHUP_LOG"
-      exit 0
-    fi
+  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    existing_pid="$(tmux display-message -p -t "$TMUX_SESSION" '#{pane_pid}')"
+    echo "already running: session=$TMUX_SESSION pid=$existing_pid log=$NOHUP_LOG"
+    exit 0
   fi
-  nohup "$0" >"$NOHUP_LOG" 2>&1 </dev/null &
-  launcher_pid=$!
+  : >"$NOHUP_LOG"
+  tmux new-session -d -s "$TMUX_SESSION" "$0"
+  tmux pipe-pane -o -t "$TMUX_SESSION" "cat >> '$NOHUP_LOG'"
+  launcher_pid="$(tmux display-message -p -t "$TMUX_SESSION" '#{pane_pid}')"
   echo "$launcher_pid" >"$PID_FILE"
-  echo "started: pid=$launcher_pid log=$NOHUP_LOG output=$RUN_OUT"
+  echo "started: session=$TMUX_SESSION pid=$launcher_pid log=$NOHUP_LOG output=$RUN_OUT"
   exit 0
 fi
 
