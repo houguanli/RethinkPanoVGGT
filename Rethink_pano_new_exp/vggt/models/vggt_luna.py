@@ -26,8 +26,6 @@ class VGGT_LUNA(VGGT):
         luna_sphere_dim=7,
         luna_camera_meta_dim=16,
         luna_hidden_dim=None,
-        luna_patch_bank_mode="aligned",
-        luna_patch_bank_shuffle_seed=None,
         sampler=None,
         aggregator_kwargs=None,
         lora=None,
@@ -48,8 +46,6 @@ class VGGT_LUNA(VGGT):
             luna_sphere_dim=luna_sphere_dim,
             luna_camera_meta_dim=luna_camera_meta_dim,
             luna_hidden_dim=luna_hidden_dim,
-            luna_patch_bank_mode=luna_patch_bank_mode,
-            luna_patch_bank_shuffle_seed=luna_patch_bank_shuffle_seed,
             aggregator_kwargs=aggregator_kwargs,
             lora=lora,
         )

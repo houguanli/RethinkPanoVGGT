@@ -1,0 +1,18 @@
+# Geometry-correspondence control. Patch Bank features are aggregated exactly
+# as in the full model and then permuted within each panorama before lookup.
+base_config: multipano_rtx5000x4_mixed4_pano_low_to_high_luna_after_full_warmup_9h.yaml
+
+data:
+  dataset_root: /mnt/e/PanoVGGT_minimal_datasets/datasets
+  randomize_pano_order: false
+
+sampler:
+  luna_patch_bank_mode: shuffled
+  luna_patch_bank_shuffle_seed: 43
+
+runtime:
+  debug_dir: logs/ablation_rtx5000x4_shuffle_patch_bank/debug
+  tensorboard_dir: logs/ablation_rtx5000x4_shuffle_patch_bank/tensorboard
+
+output:
+  output_dir: logs/ablation_rtx5000x4_shuffle_patch_bank

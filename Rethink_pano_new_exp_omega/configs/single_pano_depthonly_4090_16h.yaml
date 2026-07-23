@@ -1,0 +1,57 @@
+# RTX 4090 profile for single-pano reconstruction.
+# In single-pano mode, virtual windows share a known center and known sampling
+# geometry, so camera supervision is disabled and reconstruction uses the known
+# window geometry path for evaluation.
+data:
+  dataset_root: /home/aoki/RethinkPanoVGGT_omega/dataset/converted_pano4vggt_omega_range_v2
+  checkpoint: /home/aoki/RethinkPanoVGGT_omega/ckpt/vggt_omega_1b_512.pt
+  pano_sample_mode: single
+  pano_min_count: 1
+  pano_max_count: 1
+  pano_grouping: nearest
+
+sampler:
+  patch_size: 16
+  window_size: 512
+  num_yaw: 8
+  pitch_degrees: "0"
+  fov_degrees: 75.0
+  pano_height: 0
+  pano_width: 0
+
+supervision:
+  gt_depth_semantics: range
+  depth_max_m: 80.0
+  pred_depth_scale: 21.137727657535685
+  enable_camera_head: true
+  camera_supervision_mode: none
+  camera_loss_weight: 0.0
+  camera_translation_weight: 0.0
+  camera_rotation_weight: 0.0
+  camera_fov_weight: 0.0
+  camera_position_mode: local_zero
+
+optimization:
+  trainable: luna_dense
+  lr: 5.0e-5
+  weight_decay: 0.05
+  grad_clip: 1.0
+  batch_size: 1
+
+runtime:
+  device: cuda
+  distributed: auto
+  dist_backend: nccl
+  find_unused_parameters: true
+  amp_dtype: bfloat16
+  epochs: 100000
+  max_steps: 1000000
+  num_workers: 2
+  seed: 42
+  max_duration_minutes: 960.0
+  save_every_steps: 0
+  save_last: true
+  checkpoint_format: trainable_delta
+
+output:
+  output_dir: /home/aoki/RethinkPanoVGGT_omega/outputs/single_pano_depthonly_16h

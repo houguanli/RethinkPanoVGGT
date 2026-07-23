@@ -5,4 +5,5 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 /ckpt/
+/Rethink_pano_new_exp_omega/logs/
 *:Zone.Identifier
