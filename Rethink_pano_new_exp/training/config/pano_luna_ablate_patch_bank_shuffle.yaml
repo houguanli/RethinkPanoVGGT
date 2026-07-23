@@ -1,0 +1,13 @@
+defaults:
+  - pano_luna.yaml
+  - _self_
+
+# Correspondence control. Occupied Patch Bank cells are permuted independently
+# inside each panorama before lookup. Bank size, features, and adapter parameters
+# are identical to the aligned full model.
+exp_name: pano_luna_ablate_patch_bank_shuffle
+
+model:
+  enable_luna: True
+  luna_patch_bank_mode: shuffled
+  luna_patch_bank_shuffle_seed: ${seed_value}

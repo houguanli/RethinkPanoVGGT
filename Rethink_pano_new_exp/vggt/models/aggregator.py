@@ -78,6 +78,8 @@ class Aggregator(nn.Module):
         luna_sphere_dim=7,
         luna_camera_meta_dim=16,
         luna_hidden_dim=None,
+        luna_patch_bank_mode="aligned",
+        luna_patch_bank_shuffle_seed=None,
     ):
         super().__init__()
 
@@ -127,6 +129,8 @@ class Aggregator(nn.Module):
         self.aa_block_size = aa_block_size
         self.enable_pano_global_token = enable_pano_global_token
         self.enable_luna = enable_luna
+        self.luna_patch_bank_mode = luna_patch_bank_mode
+        self.luna_patch_bank_shuffle_seed = luna_patch_bank_shuffle_seed
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -158,6 +162,12 @@ class Aggregator(nn.Module):
                     dim=embed_dim,
                     sphere_dim=luna_sphere_dim,
                     hidden_dim=luna_hidden_dim,
+                    patch_bank_mode=luna_patch_bank_mode,
+                    patch_bank_shuffle_seed=(
+                        None
+                        if luna_patch_bank_shuffle_seed is None
+                        else int(luna_patch_bank_shuffle_seed) + layer_idx
+                    ),
                 )
                 for layer_idx in sorted(self.luna_patch_layers)
             }

@@ -10,6 +10,8 @@ class LunaConfig:
     sphere_dim: int = 7
     camera_meta_dim: int = 16
     hidden_dim: Optional[int] = None
+    patch_bank_mode: str = "aligned"
+    patch_bank_shuffle_seed: Optional[int] = None
 
 
 def default_luna_config() -> LunaConfig:

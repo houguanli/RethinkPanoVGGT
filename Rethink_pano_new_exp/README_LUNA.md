@@ -10,6 +10,9 @@ This experiment starts from `VGGT_pano_b2_baseline` and adds an MVP LUNA path:
 
 The default training config uses `vggt.models.vggt_luna.VGGT_LUNA`, keeps VGGT's local RoPE unchanged, and inserts LUNA adapters in the second half of the aggregator blocks.
 
+The three Patch Bank/GeoRA controls and their launch commands are documented
+in [`ABLATIONS.md`](ABLATIONS.md).
+
 ## Pano Data Chain
 
 Remake raw MatrixCity-style panoramas into the numbered pano format:
@@ -37,8 +40,8 @@ The checkpoint path defaults to `ckpt/model.pt` under this experiment folder.
 Useful smoke commands from this directory:
 
 ```bash
-python tests/test_pano_sampler_luna.py
-python tests/test_luna_loss.py
-python tests/test_pano_geometry.py
-python tests/test_pano_loss.py
+PYTHONPATH=.:training python tests/test_pano_sampler_luna.py
+PYTHONPATH=.:training python tests/test_luna_loss.py
+PYTHONPATH=.:training python tests/test_pano_geometry.py
+PYTHONPATH=.:training python tests/test_pano_loss.py
 ```

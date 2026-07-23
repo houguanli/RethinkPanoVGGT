@@ -204,6 +204,8 @@ model:
   luna_camera_layers: last_half
   luna_sphere_dim: 7
   luna_camera_meta_dim: 16
+  luna_patch_bank_mode: aligned
+  luna_patch_bank_shuffle_seed: null
   sampler:
     fov_degrees: 75.0
     num_yaw: 8

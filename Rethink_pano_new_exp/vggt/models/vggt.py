@@ -20,6 +20,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  enable_pano_global_token=False, pano_geom_dim=6,
                  enable_luna=False, luna_patch_layers=None, luna_camera_layers=None,
                  luna_sphere_dim=7, luna_camera_meta_dim=16, luna_hidden_dim=None,
+                 luna_patch_bank_mode="aligned", luna_patch_bank_shuffle_seed=None,
                  aggregator_kwargs=None, lora=None):
         super().__init__()
 
@@ -36,6 +37,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             luna_sphere_dim=luna_sphere_dim,
             luna_camera_meta_dim=luna_camera_meta_dim,
             luna_hidden_dim=luna_hidden_dim,
+            luna_patch_bank_mode=luna_patch_bank_mode,
+            luna_patch_bank_shuffle_seed=luna_patch_bank_shuffle_seed,
             **aggregator_kwargs,
         )
 
