@@ -3,7 +3,7 @@ set -euo pipefail
 
 VARIANT="${1:-}"
 if [[ -z "$VARIANT" ]]; then
-  echo "usage: $0 {full|no_patch_bank|no_geora|shuffle_patch_bank}" >&2
+  echo "usage: $0 {full|no_patch_bank|no_geora|shuffle_patch_bank|no_camera_geora}" >&2
   exit 2
 fi
 
@@ -27,6 +27,10 @@ case "$VARIANT" in
   shuffle_patch_bank)
     CONFIG="configs/ablation_rtx5000x4_shuffle_patch_bank.yaml"
     RUN_NAME="ablation_rtx5000x4_shuffle_patch_bank"
+    ;;
+  no_camera_geora)
+    CONFIG="configs/ablation_4090_local0716_no_camera_geora.yaml"
+    RUN_NAME="local0716_no_camera_geora_20260724_001"
     ;;
   *)
     echo "unknown variant: $VARIANT" >&2

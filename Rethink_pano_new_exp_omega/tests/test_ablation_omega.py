@@ -9,6 +9,7 @@ from vggt_omega.models.layers.luna_patch import LunaPatchAdapter, scatter_mean_b
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = PROJECT_ROOT / "configs"
 BASE_CONFIG = CONFIG_DIR / "multipano_rtx5000x4_mixed4_pano_low_to_high_luna_after_full_warmup_9h.yaml"
+ALL384_CONFIG = CONFIG_DIR / "multipano_rtx5000x4_mixed4_pano_all384_luna_after_full_warmup_9h.yaml"
 
 
 def _config(name: str):
@@ -42,6 +43,23 @@ def test_ablation_configs_inherit_original_4x5000_schedule():
     assert configs["shuffle"].luna_patch_bank_mode == "shuffled"
     assert configs["shuffle"].luna_patch_bank_shuffle_seed == 43
     assert configs["no_geora"].disable_geora is True
+
+
+def test_local_camera_ablation_only_disables_camera_geora():
+    base = parse_args(["--config", str(ALL384_CONFIG)])
+    camera_ablation = _config("ablation_4090_local0716_no_camera_geora.yaml")
+
+    assert camera_ablation.dataset_root == Path("/mnt/e/PanoVGGT_minimal_datasets/datasets")
+    assert camera_ablation.dataset_format == base.dataset_format == "pano_minimal"
+    assert camera_ablation.dataset_sampling_weights == base.dataset_sampling_weights
+    assert camera_ablation.training_stages == base.training_stages
+    assert camera_ablation.window_size == base.window_size == 384
+    assert camera_ablation.pano_min_count == base.pano_min_count == 2
+    assert camera_ablation.pano_max_count == base.pano_max_count == 8
+    assert camera_ablation.luna_patch_layers == base.luna_patch_layers
+    assert camera_ablation.luna_camera_layers == "none"
+    assert camera_ablation.luna_patch_bank_mode == "aligned"
+    assert camera_ablation.disable_geora is False
 
 
 def test_patch_bank_never_aggregates_across_panoramas():
@@ -121,6 +139,7 @@ def test_all_patch_bank_modes_support_backward():
 
 if __name__ == "__main__":
     test_ablation_configs_inherit_original_4x5000_schedule()
+    test_local_camera_ablation_only_disables_camera_geora()
     test_patch_bank_never_aggregates_across_panoramas()
     test_shuffled_patch_bank_preserves_each_pano_feature_set()
     test_no_patch_bank_is_parameter_matched()
