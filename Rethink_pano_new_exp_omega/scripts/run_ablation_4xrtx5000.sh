@@ -3,7 +3,22 @@ set -euo pipefail
 
 VARIANT="${1:-}"
 if [[ -z "$VARIANT" ]]; then
-  echo "usage: $0 {full|no_patch_bank|no_geora|shuffle_patch_bank|no_camera_geora}" >&2
+  echo "usage: $0 {full|no_patch_bank|no_geora|shuffle_patch_bank|no_camera_geora} [--no-auto-eval]" >&2
+  exit 2
+fi
+case "${2:-}" in
+  "")
+    ;;
+  --no-auto-eval)
+    AUTO_FULL_EVAL=0
+    ;;
+  *)
+    echo "unknown option: ${2}" >&2
+    exit 2
+    ;;
+esac
+if [[ "$#" -gt 2 ]]; then
+  echo "too many arguments" >&2
   exit 2
 fi
 
@@ -77,6 +92,10 @@ WARMUP_CONFIG="${WARMUP_CONFIG:-configs/multipano_rtx5000x4_mixed4_pano_omega_wa
 WARMUP_OUT="${WARMUP_OUT:-$PROJECT_ROOT/logs/ablation_rtx5000x4_shared_warmup}"
 WARMUP_CHECKPOINT="${WARMUP_CHECKPOINT:-$WARMUP_OUT/last.pt}"
 RUN_OUT="${RUN_OUT:-$PROJECT_ROOT/logs/$RUN_NAME}"
+AUTO_FULL_EVAL="${AUTO_FULL_EVAL:-1}"
+FULL_EVAL_CONFIG="${FULL_EVAL_CONFIG:-$PROJECT_ROOT/configs/ablation_mixed4_full_eval.yaml}"
+EVAL_OUT="${EVAL_OUT:-$RUN_OUT/eval}"
+POST_TRAINING_STATUS="${POST_TRAINING_STATUS:-$RUN_OUT/post_training_eval_status.json}"
 EXTRA_TRAIN_ARGS_ARRAY=()
 if [[ -n "${EXTRA_TRAIN_ARGS:-}" ]]; then
   # shellcheck disable=SC2206
@@ -129,20 +148,30 @@ ABLATION_DURATION_ARGS=()
 if [[ -n "${ABLATION_MAX_DURATION_MINUTES:-}" ]]; then
   ABLATION_DURATION_ARGS=(--max-duration-minutes "$ABLATION_MAX_DURATION_MINUTES")
 fi
+TRAIN_COMMAND=(
+  "$PYTHON" -m torch.distributed.run
+  --standalone
+  --nproc_per_node="$NPROC_PER_NODE"
+  training/train_pano_omega.py
+  --config "$CONFIG"
+  "${ABLATION_DURATION_ARGS[@]}"
+  --dataset-root "$PANOVGGT_ROOT"
+  --base-checkpoint "$BASE_CHECKPOINT"
+  --checkpoint "$WARMUP_CHECKPOINT"
+  --output-dir "$RUN_OUT"
+  --tensorboard-dir "$RUN_OUT/tensorboard"
+  --debug-dir "$RUN_OUT/debug"
+  --pred-depth-scale "$PRED_DEPTH_SCALE"
+  --no-inherit-checkpoint-training-defaults
+  "${EXTRA_TRAIN_ARGS_ARRAY[@]}"
+)
 PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  "$PYTHON" -m torch.distributed.run \
-  --standalone \
-  --nproc_per_node="$NPROC_PER_NODE" \
-  training/train_pano_omega.py \
-  --config "$CONFIG" \
-  "${ABLATION_DURATION_ARGS[@]}" \
-  --dataset-root "$PANOVGGT_ROOT" \
-  --base-checkpoint "$BASE_CHECKPOINT" \
-  --checkpoint "$WARMUP_CHECKPOINT" \
-  --output-dir "$RUN_OUT" \
-  --tensorboard-dir "$RUN_OUT/tensorboard" \
-  --debug-dir "$RUN_OUT/debug" \
-  --pred-depth-scale "$PRED_DEPTH_SCALE" \
-  --no-inherit-checkpoint-training-defaults \
-  "${EXTRA_TRAIN_ARGS_ARRAY[@]}" \
-  2>&1 | tee -a "$RUN_OUT/train.log"
+  "$PYTHON" scripts/run_ablation_train_then_eval.py \
+  --checkpoint "$RUN_OUT/last.pt" \
+  --eval-output "$EVAL_OUT" \
+  --train-log "$RUN_OUT/train.log" \
+  --status-json "$POST_TRAINING_STATUS" \
+  --auto-eval "$AUTO_FULL_EVAL" \
+  --eval-config "$FULL_EVAL_CONFIG" \
+  --python "$PYTHON" \
+  -- "${TRAIN_COMMAND[@]}"

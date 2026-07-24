@@ -74,6 +74,27 @@ bash scripts/run_ablation_4xrtx5000.sh no_geora
 bash scripts/run_ablation_4xrtx5000.sh shuffle_patch_bank
 ```
 
+After the ablation training command returns success and writes `last.pt`, the
+wrapper immediately starts the full mixed4 evaluation. Evaluation settings
+come from `configs/ablation_mixed4_full_eval.yaml`, and outputs default to
+`$RUN_OUT/eval`. The lifecycle state is recorded in
+`$RUN_OUT/post_training_eval_status.json`.
+
+To train without starting evaluation:
+
+```bash
+bash scripts/run_ablation_4xrtx5000.sh no_patch_bank --no-auto-eval
+
+# Equivalent environment switch:
+AUTO_FULL_EVAL=0 bash scripts/run_ablation_4xrtx5000.sh no_patch_bank
+```
+
+The standalone evaluation interface remains compatible:
+
+```bash
+python scripts/run_ablation_full_eval.py /path/to/last.pt /path/to/eval_output
+```
+
 If a shared warmup already exists:
 
 ```bash
@@ -88,6 +109,8 @@ Useful optional overrides:
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export ABLATION_MAX_DURATION_MINUTES=540
 export EXTRA_TRAIN_ARGS="--save-every-steps 1000"
+export FULL_EVAL_CONFIG=configs/ablation_mixed4_full_eval.yaml
+export EVAL_OUT=/path/to/run/eval
 ```
 
 ## Direct torchrun
@@ -110,6 +133,7 @@ above. Use the same warmup checkpoint and `pred_depth_scale` for every run.
 
 ```bash
 PYTHONPATH=. python tests/test_ablation_omega.py
+PYTHONPATH=. python tests/test_ablation_train_then_eval.py
 PYTHONPATH=. python training/train_pano_omega.py \
   --config configs/ablation_rtx5000x4_shuffle_patch_bank.yaml \
   --smoke
