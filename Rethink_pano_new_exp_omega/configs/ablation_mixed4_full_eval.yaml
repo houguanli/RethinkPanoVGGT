@@ -1,0 +1,35 @@
+# Full mixed4 test-set evaluation shared by every ablation.
+#
+# The launcher recovers the exact training config and dataset root saved in
+# the input checkpoint, so the same file works on both the 4xRTX5000 server
+# and the local RTX4090 machine without path-specific command-line flags.
+model:
+  training_config: checkpoint
+
+data:
+  dataset_root: checkpoint
+  datasets: all
+  limit_per_dataset: 0
+  sample_policy: anchor
+
+geometry:
+  # PanoVGGT comparison protocol: Panocity=10 panos, indoor datasets=3.
+  pano_count_policy: panovggt
+  dataset_pano_counts: ""
+  camera_eval_max_panos: 3
+  num_yaw: 8
+  erp_latitude_limit_deg: 75
+
+runtime:
+  gpus: auto
+  # A 10-pano x 8-yaw Panocity sample nearly fills a 24GB card. Evaluating
+  # in the main process avoids worker-prefetch copies exhausting host memory.
+  num_workers_per_gpu: 0
+  amp_dtype: bfloat16
+  seed: 123
+  progress_every: 10
+  progress_interval_seconds: 30
+  show_progress: true
+  progress_style: bar
+  progress_bar_width: 32
+  show_gpu_processes: false
