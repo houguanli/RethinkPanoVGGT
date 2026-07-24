@@ -18,6 +18,7 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EVAL_CONFIG = PROJECT_ROOT / "configs" / "ablation_mixed4_full_eval.yaml"
 EVAL_SCRIPT = PROJECT_ROOT / "scripts" / "run_multipano_mixed4_eval_4gpu.sh"
+MERGE_SCRIPT = PROJECT_ROOT / "scripts" / "merge_mixed4_eval_shards.py"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,6 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Resolve and validate all settings without starting evaluation.",
+    )
+    parser.add_argument(
+        "--merge-only",
+        action="store_true",
+        help="Reuse completed shard JSON/CSV files and only rebuild merged outputs.",
     )
     return parser
 
@@ -219,11 +225,110 @@ def public_settings(env: dict[str, str], eval_config: Path) -> dict[str, Any]:
     return {"eval_config": str(eval_config), **{key: env[key] for key in keys}}
 
 
+def completed_shard_files(output_dir: Path) -> tuple[list[Path], list[Path], list[Path]]:
+    shard_dir = output_dir / "shards"
+    shard_json = sorted(shard_dir.glob("shard_[0-9]*.json"))
+    shard_csv = sorted(
+        path
+        for path in shard_dir.glob("shard_[0-9]*.csv")
+        if not path.name.endswith("_camera_pairs.csv")
+    )
+    shard_camera_csv = sorted(shard_dir.glob("shard_[0-9]*_camera_pairs.csv"))
+    if not shard_json or not shard_csv:
+        raise FileNotFoundError(f"Completed shard JSON/CSV files were not found under: {shard_dir}")
+    if len(shard_json) != len(shard_csv):
+        raise RuntimeError(
+            f"Shard count mismatch: json={len(shard_json)} per_sample_csv={len(shard_csv)}"
+        )
+    empty = [path for path in [*shard_json, *shard_csv] if path.stat().st_size == 0]
+    if empty:
+        raise RuntimeError(f"Empty shard files: {', '.join(str(path) for path in empty)}")
+    return shard_json, shard_csv, shard_camera_csv
+
+
+def run_merge_only(output_dir: Path, train_loss_csv: Path, env: dict[str, str]) -> None:
+    shard_json, shard_csv, shard_camera_csv = completed_shard_files(output_dir)
+    summary = output_dir / "validation_mixed4_by_dataset_valtestfull_summary.json"
+    per_sample = output_dir / "validation_mixed4_by_dataset_valtestfull_per_sample.csv"
+    camera_pairs = output_dir / "validation_mixed4_by_dataset_valtestfull_camera_pairs.csv"
+    console_log = output_dir / "validation_mixed4_by_dataset_valtestfull_console.log"
+    command = [
+        sys.executable,
+        str(MERGE_SCRIPT),
+        "--shard-json",
+        *(str(path) for path in shard_json),
+        "--shard-csv",
+        *(str(path) for path in shard_csv),
+    ]
+    if shard_camera_csv:
+        command.extend(["--shard-camera-csv", *(str(path) for path in shard_camera_csv)])
+    command.extend(
+        [
+            "--output",
+            str(summary),
+            "--per-sample-csv",
+            str(per_sample),
+            "--camera-pair-csv",
+            str(camera_pairs),
+            "--train-loss-csv",
+            str(train_loss_csv),
+        ]
+    )
+    merge_env = env.copy()
+    merge_env["PYTHONPATH"] = (
+        f"{PROJECT_ROOT}{os.pathsep}{merge_env['PYTHONPATH']}"
+        if merge_env.get("PYTHONPATH")
+        else str(PROJECT_ROOT)
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with console_log.open("w", encoding="utf-8") as handle:
+        completed = subprocess.run(
+            command,
+            cwd=PROJECT_ROOT,
+            env=merge_env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    if completed.returncode != 0:
+        tail = console_log.read_text(encoding="utf-8", errors="replace").splitlines()[-100:]
+        if tail:
+            print("\n".join(f"[merge] {line}" for line in tail), file=sys.stderr)
+        raise subprocess.CalledProcessError(completed.returncode, command)
+    if not summary.is_file() or not per_sample.is_file():
+        raise RuntimeError(f"Merge returned success but required outputs are missing under: {output_dir}")
+    payload = json.loads(summary.read_text(encoding="utf-8"))
+    datasets = {str(run.get("dataset")) for run in payload.get("runs", [])}
+    expected = {"Panocity", "Matterport3D", "Stanford2D3DS", "Structured3D"}
+    if datasets != expected:
+        raise RuntimeError(
+            f"Merged summary dataset mismatch: expected={sorted(expected)} actual={sorted(datasets)}"
+        )
+    print(f"[full-eval] merge-only completed: {summary}")
+
+
 def main() -> None:
     args = build_parser().parse_args()
     checkpoint = args.checkpoint.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     eval_config_path = args.eval_config.expanduser().resolve()
+    if args.merge_only:
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+        print(
+            json.dumps(
+                {
+                    "mode": "merge-only",
+                    "checkpoint": str(checkpoint),
+                    "train_loss_csv": str(checkpoint.parent / "loss.csv"),
+                    "eval_out": str(output_dir),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        run_merge_only(output_dir, checkpoint.parent / "loss.csv", os.environ.copy())
+        return
     eval_config = load_yaml(eval_config_path)
     payload = load_checkpoint_payload(checkpoint)
     validate_delta_dependencies(checkpoint, payload)
@@ -245,4 +350,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -270,12 +270,15 @@ def coerce_row(row: dict[str, str]) -> dict[str, Any]:
     for key in NUMERIC_FIELDS:
         value = out.get(key)
         if value in (None, ""):
+            out.pop(key, None)
             continue
         try:
             number = float(value)
         except (TypeError, ValueError):
+            out.pop(key, None)
             continue
         if not math.isfinite(number):
+            out.pop(key, None)
             continue
         out[key] = int(number) if key in {"dataset_index", "depth_valid_pixels", "erp_depth_valid_pixels"} else number
     return out

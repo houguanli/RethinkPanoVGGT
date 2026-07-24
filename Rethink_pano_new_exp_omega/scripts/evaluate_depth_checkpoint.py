@@ -1283,7 +1283,7 @@ def summarize_by_key(rows: list[dict[str, Any]], key: str, value_key: str) -> di
 def summarize_metric_rows(rows: list[dict[str, Any]], keys: list[str]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     for key in keys:
-        values = [float(row[key]) for row in rows if key in row and math.isfinite(float(row[key]))]
+        values = finite_row_values(rows, key)
         if values:
             summary[key] = summarize_values(values)
     return summary
@@ -1373,7 +1373,17 @@ def summarize_panovggt_micro(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def rank_samples(rows: list[dict[str, Any]], key: str, reverse: bool, limit: int = 10) -> list[dict[str, Any]]:
-    candidates = [row for row in rows if key in row and math.isfinite(float(row[key]))]
+    candidates = []
+    for row in rows:
+        raw = row.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            candidates.append(row)
     ranked = sorted(candidates, key=lambda row: float(row[key]), reverse=reverse)[:limit]
     fields = [
         "dataset",

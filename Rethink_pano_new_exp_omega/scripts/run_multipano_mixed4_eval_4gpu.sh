@@ -293,15 +293,29 @@ if [[ "$status" -ne 0 ]]; then
 fi
 
 echo "[eval-4gpu] merging shards $(date --iso-8601=seconds)" | tee -a "$EVAL_OUT/eval_4gpu.log"
+MERGE_CONSOLE_LOG="$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_console.log"
+SHARD_JSON_FILES=("$EVAL_OUT"/shards/shard_[0-9]*.json)
+SHARD_CSV_FILES=()
+for shard_csv in "$EVAL_OUT"/shards/shard_[0-9]*.csv; do
+  [[ "$shard_csv" == *_camera_pairs.csv ]] && continue
+  SHARD_CSV_FILES+=("$shard_csv")
+done
+SHARD_CAMERA_CSV_FILES=("$EVAL_OUT"/shards/shard_[0-9]*_camera_pairs.csv)
+merge_status=0
 PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/merge_mixed4_eval_shards.py \
-  --shard-json "$EVAL_OUT"/shards/shard_*.json \
-  --shard-csv "$EVAL_OUT"/shards/shard_*.csv \
-  --shard-camera-csv "$EVAL_OUT"/shards/shard_*_camera_pairs.csv \
+  --shard-json "${SHARD_JSON_FILES[@]}" \
+  --shard-csv "${SHARD_CSV_FILES[@]}" \
+  --shard-camera-csv "${SHARD_CAMERA_CSV_FILES[@]}" \
   --output "$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_summary.json" \
   --per-sample-csv "$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_per_sample.csv" \
   --camera-pair-csv "$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_camera_pairs.csv" \
   --train-loss-csv "$TRAIN_LOSS_CSV" \
-  > "$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_console.log" 2>&1
+  > "$MERGE_CONSOLE_LOG" 2>&1 || merge_status=$?
+if [[ "$merge_status" -ne 0 ]]; then
+  echo "[eval-4gpu] shard merge failed with status=$merge_status; tail of $MERGE_CONSOLE_LOG:" | tee -a "$EVAL_OUT/eval_4gpu.log"
+  tail -n 100 "$MERGE_CONSOLE_LOG" | sed 's/^/[eval-4gpu][merge] /' | tee -a "$EVAL_OUT/eval_4gpu.log"
+  exit "$merge_status"
+fi
 
 SUMMARY_JSON="$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_summary.json"
 PER_SAMPLE_CSV="$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_per_sample.csv"
