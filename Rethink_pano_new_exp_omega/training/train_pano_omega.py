@@ -4597,6 +4597,53 @@ def build_target_translation(rotations_w2c: torch.Tensor, batch: Dict, position_
     return (-(rotations_w2c @ center_world)[..., 0]).contiguous()
 
 
+def resolve_checkpoint_reference(reference: str | Path, owner_checkpoint: Path) -> Path:
+    """Resolve checkpoint links after moving a run between local and server roots.
+
+    Training checkpoints store their parent checkpoint paths verbatim.  The
+    local workstation uses ``/home/aoki`` while the RTX5000 server mirrors the
+    same directory layout below ``/whitehole/AOKI``.  Setting
+    ``AOKI_STORAGE_ROOT`` enables that prefix rewrite without changing local
+    behavior.  Relative links are also checked from the current project root,
+    so evaluation does not depend on the caller's working directory.
+    """
+
+    original = Path(reference).expanduser()
+    candidates: list[Path] = []
+    storage_root = os.environ.get("AOKI_STORAGE_ROOT", "").strip()
+    if storage_root and original.is_absolute():
+        try:
+            relative = original.relative_to("/home/aoki")
+        except ValueError:
+            pass
+        else:
+            candidates.append(Path(storage_root).expanduser() / relative)
+    candidates.append(original)
+    if not original.is_absolute():
+        project_root = Path(__file__).resolve().parents[1]
+        candidates.extend(
+            (
+                Path.cwd() / original,
+                project_root / original,
+                owner_checkpoint.parent / original,
+            )
+        )
+
+    unique_candidates: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.abspath(os.fspath(candidate))
+        if key not in seen:
+            seen.add(key)
+            unique_candidates.append(candidate)
+    for candidate in unique_candidates:
+        if candidate.exists():
+            if candidate != original:
+                print(f"[INFO] relocated checkpoint reference: {original} -> {candidate}")
+            return candidate
+    return unique_candidates[0]
+
+
 def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path, strict: bool) -> None:
     if not checkpoint_path.exists():
         raise FileNotFoundError(
@@ -4613,7 +4660,10 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path, strict: bool)
         if foundation_checkpoint is None:
             foundation_checkpoint = checkpoint.get("args", {}).get("base_checkpoint")
         if foundation_checkpoint:
-            foundation_checkpoint_path = Path(foundation_checkpoint)
+            foundation_checkpoint_path = resolve_checkpoint_reference(
+                foundation_checkpoint,
+                checkpoint_path,
+            )
             if foundation_checkpoint_path.exists() and foundation_checkpoint_path.resolve() != checkpoint_path.resolve():
                 load_checkpoint(model, foundation_checkpoint_path, strict=False)
             else:
@@ -4622,7 +4672,10 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path, strict: bool)
         if base_checkpoint is None:
             base_checkpoint = checkpoint.get("args", {}).get("checkpoint")
         if base_checkpoint:
-            base_checkpoint_path = Path(base_checkpoint)
+            base_checkpoint_path = resolve_checkpoint_reference(
+                base_checkpoint,
+                checkpoint_path,
+            )
             if base_checkpoint_path.exists() and base_checkpoint_path.resolve() != checkpoint_path.resolve():
                 load_checkpoint(model, base_checkpoint_path, strict=False)
             else:
