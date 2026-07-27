@@ -5,7 +5,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PYTHON="${PYTHON:-/home/aoki/miniconda3/envs/RethinkPanoVGGT_omega/bin/python}"
-CONFIG="${CONFIG:-configs/multipano_rtx5000x4_panocity_luna_memory_probe_10p_8w384_fov90_pitch30_erp1024x512.yaml}"
+# Do not honor the generic CONFIG variable: long-running server shells often
+# retain it from another experiment. Use the probe-specific override instead.
+CONFIG="${MEMORY_PROBE_CONFIG:-configs/multipano_rtx5000x4_panocity_luna_memory_probe_10p_8w384_fov90_pitch30_erp1024x512.yaml}"
 DATASET_ROOT="${DATASET_ROOT:-/whitehole/AOKI/panovggt}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 WARMUP_CHECKPOINT="${1:-${WARMUP_CHECKPOINT:-}}"
@@ -25,6 +27,34 @@ if [[ -z "$PYTHON" || ! -x "$PYTHON" ]]; then
   echo "[memory-probe] python executable not found; activate the conda environment or set PYTHON=/absolute/path/to/python" >&2
   exit 2
 fi
+
+$PYTHON - "$CONFIG" <<'PY'
+import sys
+import yaml
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as handle:
+    config = yaml.safe_load(handle)
+data = config.get("data") or {}
+sampler = config.get("sampler") or {}
+stages = (config.get("optimization") or {}).get("training_stages") or []
+stage = stages[0] if len(stages) == 1 else {}
+pitch_values = [value.strip() for value in str(sampler.get("pitch_degrees", "")).split(",") if value.strip()]
+checks = {
+    "data.pano_min_count": (data.get("pano_min_count"), 10),
+    "data.pano_max_count": (data.get("pano_max_count"), 10),
+    "sampler.window_size": (sampler.get("window_size"), 384),
+    "sampler.num_yaw": (sampler.get("num_yaw"), 4),
+    "sampler.pitch_count": (len(pitch_values), 2),
+    "stage.pano_min_count": (stage.get("pano_min_count"), 10),
+    "stage.pano_max_count": (stage.get("pano_max_count"), 10),
+    "stage.window_size": (stage.get("window_size"), 384),
+}
+errors = [f"{key}={actual!r}, expected {expected!r}" for key, (actual, expected) in checks.items() if actual != expected]
+if errors:
+    raise SystemExit("[memory-probe] invalid 10p/8-window probe config: " + "; ".join(errors))
+print(f"[memory-probe] preflight verified: 10 panos x {sampler['num_yaw']} yaw x {len(pitch_values)} pitch = 80 views/sample")
+PY
 
 # Warmup checkpoints use trainable_delta format. Read the recorded foundation
 # reference so a relocated server checkout can resolve it automatically.
