@@ -18,8 +18,11 @@ if [[ -z "$WARMUP_CHECKPOINT" || ! -s "$WARMUP_CHECKPOINT" ]]; then
   echo "usage: bash scripts/run_server_luna_memory_probe_10p8w384.sh /absolute/path/to/warmup/last.pt" >&2
   exit 2
 fi
-if [[ ! -x "$PYTHON" ]]; then
-  echo "[memory-probe] python not executable: $PYTHON" >&2
+if [[ "$PYTHON" != */* ]]; then
+  PYTHON="$(command -v "$PYTHON" || true)"
+fi
+if [[ -z "$PYTHON" || ! -x "$PYTHON" ]]; then
+  echo "[memory-probe] python executable not found; activate the conda environment or set PYTHON=/absolute/path/to/python" >&2
   exit 2
 fi
 
