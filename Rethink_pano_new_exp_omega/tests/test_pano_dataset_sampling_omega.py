@@ -14,7 +14,12 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(THIS_DIR))
 
 from training.data import PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E402
-from training.data.pano_minimal import _item, _read_pose_position_rotation, _read_structured3d_position  # noqa: E402
+from training.data.pano_minimal import (  # noqa: E402
+    _item,
+    _parse_dataset_pano_max_counts,
+    _read_pose_position_rotation,
+    _read_structured3d_position,
+)
 from training.train_pano_omega import write_smoke_dataset  # noqa: E402
 from scripts.evaluate_depth_checkpoint import apply_eval_max_panos, select_eval_indices  # noqa: E402
 
@@ -70,6 +75,36 @@ def test_minimal_multipano_groups_stay_inside_scene():
             assert len(scene_keys) == 1
         sample = dataset[0]
         assert all(name.startswith("scan_a_room0_") for name in sample["scene_name"].split("|"))
+
+
+def test_minimal_dataset_specific_pano_caps_limit_groups():
+    expected = {
+        "panocity": 8,
+        "matterport3d": 3,
+        "stanford2d3ds": 3,
+        "structured3d": 3,
+    }
+    for dataset_name, expected_max in expected.items():
+        dataset = object.__new__(PanoMinimalDataset)
+        dataset.pano_sample_mode = "variable_neighborhood"
+        dataset.pano_min_count = 2
+        dataset.pano_max_count = 8
+        dataset.grouping = "nearest"
+        dataset.dataset_pano_max_counts = _parse_dataset_pano_max_counts(
+            "panocity:8,matterport3d:3,stanford2d3ds:3,structured3d:3"
+        )
+        dataset.items = [
+            {
+                "dataset": dataset_name,
+                "sequence_name": dataset_name,
+                "scene_group_key": "scene",
+                "pano_position_m": [float(index), 0.0, 0.0],
+            }
+            for index in range(12)
+        ]
+        dataset.sample_indices = list(range(len(dataset.items)))
+        dataset.indices_by_scene = {"scene": list(range(len(dataset.items)))}
+        assert max(len(group) for group in dataset._build_groups()) == expected_max
 
 
 def test_minimal_multipano_fallback_stays_inside_scene():

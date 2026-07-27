@@ -101,6 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pano-min-count", type=int, default=1)
     parser.add_argument("--pano-max-count", type=int, default=1)
     parser.add_argument(
+        "--dataset-pano-max-counts",
+        type=str,
+        default=None,
+        help="Optional per-dataset pano caps, e.g. panocity:8,matterport3d:3,stanford2d3ds:3,structured3d:3.",
+    )
+    parser.add_argument(
         "--randomize-pano-order",
         action="store_true",
         default=False,
@@ -736,6 +742,9 @@ def train(args: argparse.Namespace) -> None:
         sampling_summary = getattr(dataset, "dataset_sampling_summary", None)
         if sampling_summary is not None:
             rank0_print(f"[INFO] dataset_sampling = {json.dumps(sampling_summary, sort_keys=True)}", dist_state)
+        dataset_pano_caps = getattr(dataset, "dataset_pano_max_counts", None)
+        if dataset_pano_caps:
+            rank0_print(f"[INFO] dataset_pano_max_counts = {json.dumps(dataset_pano_caps, sort_keys=True)}", dist_state)
         rank0_print(
         "[INFO] pano_sampling = "
         f"{args.pano_sample_mode} min={args.pano_min_count} max={args.pano_max_count} grouping={args.pano_grouping}",
@@ -1161,6 +1170,7 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
             train_split_fraction=args.train_split_fraction,
             split_seed=args.split_seed,
             datasets=args.minimal_datasets,
+            dataset_pano_max_counts=args.dataset_pano_max_counts,
             bad_sample_list=args.bad_sample_list,
             dataset_sampling_weights=args.dataset_sampling_weights,
             output_depth_scale=args.output_depth_scale,
@@ -1196,6 +1206,7 @@ def build_dataset(args: argparse.Namespace, pano_size: Tuple[int, int] | None):
                         train_split_fraction=args.train_split_fraction,
                         split_seed=args.split_seed,
                         datasets=args.minimal_datasets,
+                        dataset_pano_max_counts=args.dataset_pano_max_counts,
                         bad_sample_list=args.bad_sample_list,
                         dataset_sampling_weights=args.dataset_sampling_weights,
                         output_depth_scale=args.output_depth_scale,

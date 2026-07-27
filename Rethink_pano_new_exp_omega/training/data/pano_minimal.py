@@ -108,6 +108,7 @@ class PanoMinimalDataset(Dataset):
         train_split_fraction: float = 0.95,
         split_seed: int = 42,
         datasets: Optional[str | Iterable[str]] = None,
+        dataset_pano_max_counts: Optional[str | Dict[str, int]] = None,
         bad_sample_list: Optional[str | Path] = None,
         dataset_sampling_weights: Optional[str | Dict[str, float]] = None,
         output_depth_scale: float = 1000.0,
@@ -137,6 +138,7 @@ class PanoMinimalDataset(Dataset):
         self.train_split_fraction = float(train_split_fraction)
         self.split_seed = int(split_seed)
         self.dataset_names = _parse_dataset_names(datasets)
+        self.dataset_pano_max_counts = _parse_dataset_pano_max_counts(dataset_pano_max_counts)
         self.bad_samples = _load_bad_samples(bad_sample_list, self.root)
         self.dataset_sampling_weights = _parse_dataset_sampling_weights(dataset_sampling_weights)
         self.output_depth_scale = float(output_depth_scale)
@@ -305,10 +307,14 @@ class PanoMinimalDataset(Dataset):
         for idx in sample_indices:
             item = self.items[idx]
             scene_indices = self.indices_by_scene.get(_scene_group_key(item), [idx])
-            if len(scene_indices) < self.pano_min_count:
+            dataset_key = _dataset_key(item.get("dataset") or item.get("sequence_name"))
+            dataset_max_count = self.dataset_pano_max_counts.get(dataset_key, self.pano_max_count)
+            group_max_count = min(self.pano_max_count, dataset_max_count)
+            group_min_count = min(self.pano_min_count, group_max_count)
+            if len(scene_indices) < group_min_count:
                 continue
             anchor_offset = offset_by_index.get(idx, 0)
-            radius = max(self.pano_max_count * 4, self.pano_min_count)
+            radius = max(group_max_count * 4, group_min_count)
             start = max(0, anchor_offset - radius)
             end = min(len(scene_indices), anchor_offset + radius + 1)
             candidates = scene_indices[start:end]
@@ -323,7 +329,7 @@ class PanoMinimalDataset(Dataset):
                 )
             else:
                 candidates.sort(key=lambda candidate: (abs(candidate - idx), candidate != idx, candidate))
-            group = candidates[: self.pano_max_count]
+            group = candidates[:group_max_count]
             groups.append(group)
         return groups
 
@@ -520,6 +526,30 @@ def _parse_dataset_sampling_weights(raw: Optional[str | Dict[str, float]]) -> Op
             raise ValueError(f"Dataset sampling weight must be non-negative, got {name}:{value}")
         weights[key] = weights.get(key, 0.0) + weight
     return weights or None
+
+
+def _parse_dataset_pano_max_counts(raw: Optional[str | Dict[str, int]]) -> Dict[str, int]:
+    if raw in (None, "", "none"):
+        return {}
+    if isinstance(raw, dict):
+        pairs = raw.items()
+    else:
+        pairs = []
+        for part in str(raw).split(","):
+            if not part.strip():
+                continue
+            if ":" not in part:
+                raise ValueError(f"Dataset pano maximum must be name:count, got {part!r}")
+            name, value = part.split(":", 1)
+            pairs.append((name, value))
+    counts: Dict[str, int] = {}
+    for name, value in pairs:
+        key = _dataset_key(name)
+        count = int(value)
+        if count < 1:
+            raise ValueError(f"Dataset pano maximum must be positive, got {name}:{value}")
+        counts[key] = count
+    return counts
 
 
 def _build_balanced_sample_indices(
