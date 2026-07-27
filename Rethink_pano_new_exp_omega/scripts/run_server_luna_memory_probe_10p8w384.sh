@@ -5,17 +5,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PYTHON="${PYTHON:-/home/aoki/miniconda3/envs/RethinkPanoVGGT_omega/bin/python}"
-CONFIG="${CONFIG:-configs/multipano_rtx5000x4_panocity_luna_memory_probe_10p_8w_fov120_erp1024x512.yaml}"
+CONFIG="${CONFIG:-configs/multipano_rtx5000x4_panocity_luna_memory_probe_10p_8w384_fov90_pitch30_erp1024x512.yaml}"
 DATASET_ROOT="${DATASET_ROOT:-/whitehole/AOKI/panovggt}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 WARMUP_CHECKPOINT="${1:-${WARMUP_CHECKPOINT:-}}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-OUTPUT_DIR="${OUTPUT_DIR:-logs/server_luna_memory_probe_10p_8w_fov120_erp1024x512_${RUN_TAG}}"
+OUTPUT_DIR="${OUTPUT_DIR:-logs/server_luna_memory_probe_10p_8w384_fov90_pitch30_erp1024x512_${RUN_TAG}}"
 BASE_CHECKPOINT="${BASE_CHECKPOINT:-}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 if [[ -z "$WARMUP_CHECKPOINT" || ! -s "$WARMUP_CHECKPOINT" ]]; then
-  echo "usage: bash scripts/run_server_luna_memory_probe_10p8w512.sh /absolute/path/to/warmup/last.pt" >&2
+  echo "usage: bash scripts/run_server_luna_memory_probe_10p8w384.sh /absolute/path/to/warmup/last.pt" >&2
   exit 2
 fi
 if [[ -z "$BASE_CHECKPOINT" ]]; then
@@ -53,7 +53,7 @@ LOG="$OUTPUT_DIR/train_console.log"
   echo "[memory-probe] output_dir=$OUTPUT_DIR"
   echo "[memory-probe] nproc_per_node=$NPROC_PER_NODE"
   echo "[memory-probe] input=10 panos x ERP 1024x512"
-  echo "[memory-probe] sampler=8 windows/pano x 512x512, FoV=120deg; total=80 windows/sample"
+  echo "[memory-probe] sampler=4 yaw x pitch(-30,+30), 384x384, FoV=90deg; total=8 windows/pano, 80 windows/sample"
   echo "[memory-probe] duration_minutes=${DURATION_MINUTES:-10}"
 } | tee "$LOG"
 

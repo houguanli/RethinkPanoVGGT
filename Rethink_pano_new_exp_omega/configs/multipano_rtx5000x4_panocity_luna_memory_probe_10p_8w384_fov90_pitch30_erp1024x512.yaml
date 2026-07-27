@@ -1,5 +1,5 @@
 # Memory probe: load an existing full-warmup checkpoint and enter LUNA directly.
-# Every sample is fixed at 10 panoramas x 8 windows = 80 VGGT views.
+# Every sample is fixed at 10 panoramas x (4 yaw x 2 pitch) = 80 VGGT views.
 data:
   dataset_root: ../../panovggt
   dataset_format: pano_minimal
@@ -24,10 +24,10 @@ data:
 
 sampler:
   patch_size: 16
-  window_size: 512
-  num_yaw: 8
-  pitch_degrees: "-15"
-  fov_degrees: 120.0
+  window_size: 384
+  num_yaw: 4
+  pitch_degrees: "30,-30"
+  fov_degrees: 90.0
   pano_height: 512
   pano_width: 1024
   luna_patch_layers: last3
@@ -99,11 +99,11 @@ optimization:
   optimizer_type: adafactor
   batch_size: 1
   training_stages:
-    - name: luna_memory_probe_10p_8w_fov120_512
-      window_size: 512
-      num_yaw: 8
-      pitch_degrees: "-15"
-      fov_degrees: 120.0
+    - name: luna_memory_probe_10p_8w384_fov90_pitch30
+      window_size: 384
+      num_yaw: 4
+      pitch_degrees: "30,-30"
+      fov_degrees: 90.0
       dense_head_frames_chunk_size: 1
       pano_min_count: 10
       pano_max_count: 10
@@ -137,11 +137,11 @@ runtime:
   debug_depth_dump: false
   debug_depth_threshold: 0.3
   debug_depth_max_dumps_per_step: 0
-  debug_dir: logs/debug_luna_memory_probe_10p_8w_fov120_erp1024x512
+  debug_dir: logs/debug_luna_memory_probe_10p_8w384_fov90_pitch30_erp1024x512
   progress_bar: true
   progress_log_every: 1
   tensorboard: true
-  tensorboard_dir: logs/luna_memory_probe_10p_8w_fov120_erp1024x512/tensorboard
+  tensorboard_dir: logs/luna_memory_probe_10p_8w384_fov90_pitch30_erp1024x512/tensorboard
 
 output:
-  output_dir: logs/luna_memory_probe_10p_8w_fov120_erp1024x512
+  output_dir: logs/luna_memory_probe_10p_8w384_fov90_pitch30_erp1024x512
