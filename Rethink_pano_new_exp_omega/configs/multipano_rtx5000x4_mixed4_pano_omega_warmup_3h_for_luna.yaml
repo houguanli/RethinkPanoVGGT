@@ -149,11 +149,11 @@ runtime:
   debug_depth_dump: false
   debug_depth_threshold: 0.3
   debug_depth_max_dumps_per_step: 0
-  debug_dir: logs/debug_mixed4_pano_omega_multipano_warmup_3h_for_luna
+  debug_dir: logs/debug_mixed4_pano_omega_multipano_warmup_3h_fixed8window_for_luna
   progress_bar: true
   progress_log_every: 50
   tensorboard: true
-  tensorboard_dir: logs/mixed4_pano_omega_multipano_warmup_3h_for_luna/tensorboard
+  tensorboard_dir: logs/mixed4_pano_omega_multipano_warmup_3h_fixed8window_for_luna/tensorboard
 
 output:
-  output_dir: logs/mixed4_pano_omega_multipano_warmup_3h_for_luna
+  output_dir: logs/mixed4_pano_omega_multipano_warmup_3h_fixed8window_for_luna

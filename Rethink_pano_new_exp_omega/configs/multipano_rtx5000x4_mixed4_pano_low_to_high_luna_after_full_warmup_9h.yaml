@@ -13,7 +13,7 @@ data:
   bad_sample_list: configs/structured3d_bad_scenes.txt
   curriculum_bins: null
   use_metadata_weights: false
-  checkpoint: logs/mixed4_pano_omega_multipano_warmup_3h_for_luna/last.pt
+  checkpoint: logs/mixed4_pano_omega_multipano_warmup_3h_fixed8window_for_luna/last.pt
   pano_sample_mode: variable_neighborhood
   pano_min_count: 2
   pano_max_count: 8
@@ -198,11 +198,11 @@ runtime:
   debug_depth_dump: false
   debug_depth_threshold: 0.3
   debug_depth_max_dumps_per_step: 0
-  debug_dir: logs/debug_mixed4_pano_low_to_high_4xrtx5000_multipano_after_full_warmup_9h
+  debug_dir: logs/debug_mixed4_pano_fixed8window_4xrtx5000_multipano_after_full_warmup_9h
   progress_bar: true
   progress_log_every: 50
   tensorboard: true
-  tensorboard_dir: logs/mixed4_pano_low_to_high_4xrtx5000_multipano_after_full_warmup_9h/tensorboard
+  tensorboard_dir: logs/mixed4_pano_fixed8window_4xrtx5000_multipano_after_full_warmup_9h/tensorboard
 
 output:
-  output_dir: logs/mixed4_pano_low_to_high_4xrtx5000_multipano_after_full_warmup_9h
+  output_dir: logs/mixed4_pano_fixed8window_4xrtx5000_multipano_after_full_warmup_9h

@@ -39,7 +39,7 @@ USE_SINGLE_DEPTH_SCALE_INIT="${USE_SINGLE_DEPTH_SCALE_INIT:-1}"
 SINGLE_WEIGHTED_PRED_DEPTH_SCALE="${SINGLE_WEIGHTED_PRED_DEPTH_SCALE:-2.827019691467285}"
 
 WARMUP_CONFIG="${WARMUP_CONFIG:-configs/multipano_rtx5000x4_mixed4_pano_omega_warmup_3h_for_luna.yaml}"
-WARMUP_OUT="${WARMUP_OUT:-$LUNA/logs/mixed4_pano_omega_multipano_warmup_3h_for_luna}"
+WARMUP_OUT="${WARMUP_OUT:-$LUNA/logs/mixed4_pano_omega_multipano_warmup_3h_fixed8window_for_luna}"
 WARMUP_CKPT="$WARMUP_OUT/last.pt"
 CALIB_JSON="$WARMUP_OUT/depth_scale_calibration.json"
 CALIB_LOG="$WARMUP_OUT/depth_scale_calibration.log"
@@ -51,8 +51,8 @@ FOV_DEGREES="${FOV_DEGREES:-90}"
 DATASET_PANO_MAX_COUNTS="${DATASET_PANO_MAX_COUNTS:-panocity:8,matterport3d:3,stanford2d3ds:3,structured3d:3}"
 
 LUNA_CONFIG="${LUNA_CONFIG:-configs/multipano_rtx5000x4_mixed4_pano_all384_luna_after_full_warmup_9h.yaml}"
-LUNA_OUT="${LUNA_OUT:-$LUNA/logs/mixed4_pano_all384_4xrtx5000_multipano_after_full_warmup_9h}"
-SEQ_LOG="${SEQ_LOG:-$LUNA/logs/mixed4_pano_all384_4xrtx5000_multipano_stage_12h_sequence.log}"
+LUNA_OUT="${LUNA_OUT:-$LUNA/logs/mixed4_pano_all384_fixed8window_4xrtx5000_multipano_after_full_warmup_9h}"
+SEQ_LOG="${SEQ_LOG:-$LUNA/logs/mixed4_pano_all384_fixed8window_4xrtx5000_multipano_stage_12h_sequence.log}"
 EXTRA_TRAIN_ARGS_ARRAY=()
 if [[ -n "${EXTRA_TRAIN_ARGS:-}" ]]; then
   # shellcheck disable=SC2206
@@ -61,7 +61,7 @@ fi
 
 mkdir -p "$(dirname "$SEQ_LOG")"
 if [[ "${CLEAN_OUTPUT:-0}" == "1" ]]; then
-  rm -rf "$WARMUP_OUT" "$LUNA_OUT" "$SEQ_LOG" "$LUNA/logs/debug_mixed4_pano_all384_4xrtx5000_multipano_after_full_warmup_9h"
+  rm -rf "$WARMUP_OUT" "$LUNA_OUT" "$SEQ_LOG" "$LUNA/logs/debug_mixed4_pano_all384_fixed8window_4xrtx5000_multipano_after_full_warmup_9h"
 fi
 mkdir -p "$WARMUP_OUT" "$LUNA_OUT"
 
