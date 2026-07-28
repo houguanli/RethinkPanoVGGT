@@ -402,7 +402,11 @@ def main() -> None:
             ),
             "uses_pano_or_luna_structure": False,
             "uses_camera_supervision": True,
-            "loss": "VGGT-Omega depth/camera losses on pano-cropped multi-view groups",
+            "loss": (
+                "VGGT-Omega depth loss restricted to the configured full-ERP latitude band"
+                if full_erp_eval
+                else "VGGT-Omega depth/camera losses on pano-cropped multi-view groups"
+            ),
             "pred_depth_scale": float(depth_conf.get("pred_depth_scale", 1.0)),
             "normalize_scene_scale": bool(cfg.get("normalize_scene_scale", False)),
         },
@@ -745,14 +749,23 @@ def evaluate_dataset(
                     aspect_ratio=0.5 if is_full_erp else 1.0,
                 )
                 batch = sample_to_batch(sample, device, normalize_scene_scale=normalize_scene_scale)
+                depth_loss_batch = batch
+                if is_full_erp:
+                    loss_latitude_mask = latitude_band_mask_like_depth(
+                        batch["depths"][..., None],
+                        latitude_min_deg=latitude_min_deg,
+                        latitude_max_deg=latitude_max_deg,
+                    ).squeeze(-1)
+                    depth_loss_batch = dict(batch)
+                    depth_loss_batch["point_masks"] = batch["point_masks"] & loss_latitude_mask
                 with torch.autocast(device_type=device.type, dtype=torch_amp_dtype, enabled=amp_enabled):
                     predictions = model(images=batch["images"])
-                    loss_dict = compute_depth_loss(predictions, batch, **depth_conf)
+                    loss_dict = compute_depth_loss(predictions, depth_loss_batch, **depth_conf)
                     camera_loss_dict = compute_camera_loss(predictions, batch)
                 pred_scale = float(depth_conf.get("pred_depth_scale", 1.0))
                 pred_depth = predictions["depth"].detach().float() * pred_scale
                 target_depth = batch["depths"].detach().float()[..., None]
-                target_valid = batch["point_masks"].detach().bool()[..., None]
+                target_valid = depth_loss_batch["point_masks"].detach().bool()[..., None]
                 metric_domain_mask = torch.ones_like(target_valid)
                 if is_full_erp:
                     metric_domain_mask = latitude_band_mask_like_depth(
