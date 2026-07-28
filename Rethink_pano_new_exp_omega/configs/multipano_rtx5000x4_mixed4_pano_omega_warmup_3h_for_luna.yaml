@@ -22,7 +22,7 @@ data:
   pano_min_count: 2
   pano_max_count: 2
   pano_grouping: nearest
-  randomize_pano_order: true
+  randomize_pano_order: false
   output_depth_scale: 1000.0
   invalid_depth_value: 65535.0
   pano_position_step_m: 1.0
@@ -30,9 +30,11 @@ data:
 sampler:
   patch_size: 16
   window_size: 384
+  # Fixed for the complete train/eval pipeline: four yaw directions at each
+  # of two pitch rings produce eight windows per panorama.
   num_yaw: 4
-  pitch_degrees: "-15"
-  fov_degrees: 75.0
+  pitch_degrees: "-30,30"
+  fov_degrees: 90.0
   pano_height: 0
   pano_width: 0
   luna_patch_layers: last3
@@ -62,7 +64,7 @@ supervision:
   sample_weight_min: 0.25
   sample_weight_max: 1.25
   # Raw adjacent-window edge comparisons are not geometrically valid across
-  # pano boundaries (and 4x75-degree windows have no edge overlap).
+  # pano boundaries or between the two pitch rings.
   overlap_consistency_weight: 0.0
   global_point_loss_weight: 0.0
   global_point_stride: 16
@@ -110,6 +112,8 @@ optimization:
       until_minutes: 180.0
       window_size: 384
       num_yaw: 4
+      pitch_degrees: "-30,30"
+      fov_degrees: 90.0
       dense_head_frames_chunk_size: 1
       trainable: all
       lr: 1.0e-5

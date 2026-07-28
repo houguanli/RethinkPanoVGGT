@@ -1,4 +1,4 @@
-# 4x RTX 5000: multi-pano mixed PanoVGGT bundle, low384 to high512.
+# Compatibility config: fixed 384/8-window geometry with pano-count curriculum.
 data:
   dataset_root: ../../panovggt
   dataset_format: pano_minimal
@@ -18,7 +18,7 @@ data:
   pano_min_count: 2
   pano_max_count: 8
   pano_grouping: nearest
-  randomize_pano_order: true
+  randomize_pano_order: false
   output_depth_scale: 1000.0
   invalid_depth_value: 65535.0
   pano_position_step_m: 1.0
@@ -26,10 +26,10 @@ data:
 sampler:
   patch_size: 16
   window_size: 384
-  # 2..8 panos x 4 yaw windows stress-tests up to 32 VGGT views at 384.
+  # Identical to warmup: 4 yaw x 2 pitch rings = 8 windows per panorama.
   num_yaw: 4
-  pitch_degrees: "-15"
-  fov_degrees: 75.0
+  pitch_degrees: "-30,30"
+  fov_degrees: 90.0
   pano_height: 0
   pano_width: 0
   luna_patch_layers: last3
@@ -39,8 +39,8 @@ model:
   enable_pano_global_token: true
   enable_pano_geometry_residual: false
   aggregator_use_checkpoint: true
-  # Decode dense depth in smaller frame chunks so the final high-res
-  # 8-pano x 8-yaw stage fits on 32GB RTX5000 cards.
+  # Decode dense depth in smaller frame chunks so the final 8-pano x
+  # 8-window stage fits on 32GB RTX5000 cards.
   dense_head_frames_chunk_size: 1
   dense_head_use_checkpoint: true
   dense_head_return_confidence: false
@@ -61,7 +61,7 @@ supervision:
   sample_weight_min: 0.25
   sample_weight_max: 1.25
   # Raw adjacent-window edge comparisons are not geometrically valid across
-  # pano boundaries (and 4x75-degree windows have no edge overlap).
+  # pano boundaries or between the two pitch rings.
   overlap_consistency_weight: 0.0
   global_point_loss_weight: 0.10
   global_point_stride: 16
@@ -162,9 +162,8 @@ optimization:
       train_depth_residual: false
       learn_pred_depth_scale: false
       learn_dataset_depth_scale: false
-    - name: multipano_camera_high512_8p_8yaw
-      window_size: 512
-      num_yaw: 8
+    - name: multipano_camera_full_8p_fixed8window
+      window_size: 384
       dense_head_frames_chunk_size: 1
       pano_max_count: 8
       trainable: luna_residual_tail_heads

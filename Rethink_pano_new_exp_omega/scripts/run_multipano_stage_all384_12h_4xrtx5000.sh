@@ -46,6 +46,9 @@ CALIB_LOG="$WARMUP_OUT/depth_scale_calibration.log"
 CALIB_SAMPLES_PER_DATASET="${CALIB_SAMPLES_PER_DATASET:-8}"
 CALIB_MAX_PIXELS_PER_SAMPLE="${CALIB_MAX_PIXELS_PER_SAMPLE:-50000}"
 NUM_YAW="${NUM_YAW:-4}"
+PITCH_DEGREES="${PITCH_DEGREES:--30,30}"
+FOV_DEGREES="${FOV_DEGREES:-90}"
+DATASET_PANO_MAX_COUNTS="${DATASET_PANO_MAX_COUNTS:-panocity:8,matterport3d:3,stanford2d3ds:3,structured3d:3}"
 
 LUNA_CONFIG="${LUNA_CONFIG:-configs/multipano_rtx5000x4_mixed4_pano_all384_luna_after_full_warmup_9h.yaml}"
 LUNA_OUT="${LUNA_OUT:-$LUNA/logs/mixed4_pano_all384_4xrtx5000_multipano_after_full_warmup_9h}"
@@ -77,6 +80,10 @@ mkdir -p "$WARMUP_OUT" "$LUNA_OUT"
   echo "[sequence] use_single_depth_scale_init=$USE_SINGLE_DEPTH_SCALE_INIT"
   echo "[sequence] calibration_samples_per_dataset=$CALIB_SAMPLES_PER_DATASET"
   echo "[sequence] num_yaw=$NUM_YAW"
+  echo "[sequence] pitch_degrees=$PITCH_DEGREES"
+  echo "[sequence] fov_degrees=$FOV_DEGREES"
+  echo "[sequence] fixed_windows_per_pano=8"
+  echo "[sequence] dataset_pano_max_counts=$DATASET_PANO_MAX_COUNTS"
   echo "[sequence] extra_train_args=${EXTRA_TRAIN_ARGS:-}"
 } | tee -a "$SEQ_LOG"
 
@@ -109,8 +116,8 @@ if [[ "${SKIP_CALIBRATION:-0}" != "1" ]]; then
     --image-size 384 \
     --patch-size 16 \
     --num-yaw "$NUM_YAW" \
-    --pitch-degrees -15.0 \
-    --fov-degrees 75.0 \
+    --pitch-degrees="$PITCH_DEGREES" \
+    --fov-degrees "$FOV_DEGREES" \
     --depth-max-m 80.0 \
     --device cuda \
     --print-scale \
@@ -161,6 +168,11 @@ else
     --debug-dir "$WARMUP_OUT/debug" \
     --dataset-root "$PANOVGGT_ROOT" \
     --checkpoint "$WARMUP_INIT_CHECKPOINT" \
+    --dataset-pano-max-counts "$DATASET_PANO_MAX_COUNTS" \
+    --window-size 384 \
+    --num-yaw "$NUM_YAW" \
+    --pitch-degrees="$PITCH_DEGREES" \
+    --fov-degrees "$FOV_DEGREES" \
     --pred-depth-scale "$PRED_DEPTH_SCALE" \
     --depth-loss-mode log_huber \
     --depth-scale-alignment none \
@@ -206,6 +218,11 @@ PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   --debug-dir "$LUNA_OUT/debug" \
   --dataset-root "$PANOVGGT_ROOT" \
   --checkpoint "$WARMUP_CKPT" \
+  --dataset-pano-max-counts "$DATASET_PANO_MAX_COUNTS" \
+  --window-size 384 \
+  --num-yaw "$NUM_YAW" \
+  --pitch-degrees="$PITCH_DEGREES" \
+  --fov-degrees "$FOV_DEGREES" \
   --pred-depth-scale "$PRED_DEPTH_SCALE" \
   --depth-loss-mode log_huber \
   --depth-scale-alignment none \
