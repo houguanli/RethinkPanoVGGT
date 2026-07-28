@@ -26,7 +26,7 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(THIS_DIR))
 
 from vggt_omega.data.pano_sampler import PanoWindowSampler  # noqa: E402
-from vggt_omega.models.aggregator import Aggregator  # noqa: E402
+from vggt_omega.models.aggregator import Aggregator, _resolve_luna_layers  # noqa: E402
 from vggt_omega.models.layers import LunaCameraAdapter, LunaPatchAdapter, PatchEmbed  # noqa: E402
 from vggt_omega.models.layers.luna_patch import scatter_mean_by_global_id  # noqa: E402
 from vggt_omega.models.vggt_omega_luna import VGGTOmega_LUNA  # noqa: E402
@@ -149,10 +149,16 @@ def test_luna_wrapper_can_skip_default_checkpoint_load():
     assert model.pano_sampler.window_size == 512
 
 
+def test_luna_tail_layer_count_supports_full_depth():
+    assert _resolve_luna_layers("last3", 24) == {21, 22, 23}
+    assert _resolve_luna_layers("last24", 24) == set(range(24))
+
+
 if __name__ == "__main__":
     test_pano_window_sampler_shapes()
     test_luna_adapters_are_zero_init_residuals()
     test_luna_patch_pooling_is_isolated_by_pano_id()
     test_luna_aggregator_smoke()
     test_luna_wrapper_can_skip_default_checkpoint_load()
+    test_luna_tail_layer_count_supports_full_depth()
     print("pano sampler + LUNA aggregator smoke (omega) ok")

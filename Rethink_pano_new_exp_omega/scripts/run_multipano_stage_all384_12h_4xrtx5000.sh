@@ -58,6 +58,11 @@ if [[ -n "${EXTRA_TRAIN_ARGS:-}" ]]; then
   # shellcheck disable=SC2206
   EXTRA_TRAIN_ARGS_ARRAY=($EXTRA_TRAIN_ARGS)
 fi
+LUNA_EXTRA_TRAIN_ARGS_ARRAY=()
+if [[ -n "${LUNA_EXTRA_TRAIN_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  LUNA_EXTRA_TRAIN_ARGS_ARRAY=($LUNA_EXTRA_TRAIN_ARGS)
+fi
 
 mkdir -p "$(dirname "$SEQ_LOG")"
 if [[ "${CLEAN_OUTPUT:-0}" == "1" ]]; then
@@ -88,6 +93,7 @@ mkdir -p "$WARMUP_OUT" "$LUNA_OUT"
   echo "[sequence] pano_curriculum=warmup:3,luna:0-2h:3,2-5h:6,5-10h:9"
   echo "[sequence] dataset_pano_max_counts=$DATASET_PANO_MAX_COUNTS"
   echo "[sequence] extra_train_args=${EXTRA_TRAIN_ARGS:-}"
+  echo "[sequence] luna_extra_train_args=${LUNA_EXTRA_TRAIN_ARGS:-}"
 } | tee -a "$SEQ_LOG"
 
 if [[ "${SKIP_INDEX_BUILD:-0}" != "1" ]]; then
@@ -238,6 +244,7 @@ PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   --depth-scale-alignment-max 1000000.0 \
   --no-inherit-checkpoint-training-defaults \
   "${EXTRA_TRAIN_ARGS_ARRAY[@]}" \
+  "${LUNA_EXTRA_TRAIN_ARGS_ARRAY[@]}" \
   2>&1 | tee -a "$LUNA_OUT/train_luna.log"
 echo "[sequence] stage2/3 multi-pano LUNA all384 finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 

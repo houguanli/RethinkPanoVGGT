@@ -38,8 +38,8 @@ sampler:
   fov_degrees: 90.0
   pano_height: 512
   pano_width: 1024
-  luna_patch_layers: last3
-  luna_camera_layers: "23"
+  luna_patch_layer_count: 12
+  luna_camera_layer_count: 1
 
 model:
   enable_pano_global_token: true

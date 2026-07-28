@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from training.data import PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E4
 from training.data.pano_minimal import (  # noqa: E402
     _item,
     _parse_dataset_pano_max_counts,
+    _rgb_depth_common_valid_mask,
     _read_pose_position_rotation,
     _read_structured3d_position,
 )
@@ -105,6 +107,21 @@ def test_minimal_dataset_specific_pano_caps_limit_groups():
         dataset.sample_indices = list(range(len(dataset.items)))
         dataset.indices_by_scene = {"scene": list(range(len(dataset.items)))}
         assert max(len(group) for group in dataset._build_groups()) == expected_max
+
+
+def test_stanford_common_mask_excludes_only_black_polar_fill():
+    image = torch.full((3, 16, 32), 0.5)
+    image[:, :4] = 0.0
+    image[:, -4:] = 0.0
+    depth = torch.ones(1, 16, 32)
+
+    stanford_mask = _rgb_depth_common_valid_mask(image, depth, "Stanford2D3DS")
+    matterport_mask = _rgb_depth_common_valid_mask(image, depth, "Matterport3D")
+
+    assert not bool(stanford_mask[:, :4].any())
+    assert not bool(stanford_mask[:, -4:].any())
+    assert bool(stanford_mask[:, 6:10].all())
+    assert bool(matterport_mask.all())
 
 
 def test_minimal_multipano_fallback_stays_inside_scene():

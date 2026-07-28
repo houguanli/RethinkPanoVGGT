@@ -32,8 +32,11 @@ sampler:
   fov_degrees: 90.0
   pano_height: 512
   pano_width: 1024
-  luna_patch_layers: last3
-  luna_camera_layers: "23"
+  # The 2026-07-18 result was run from the 2026-07-17 configuration:
+  # Patch GeoRA in the second half (12 layers), Camera GeoRA in the final layer.
+  # Set either count to 24 for all-layer ablations.
+  luna_patch_layer_count: 12
+  luna_camera_layer_count: 1
 
 model:
   enable_pano_global_token: true

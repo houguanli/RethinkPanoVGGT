@@ -599,6 +599,7 @@ def evaluate_run(
                 source_depth_semantics=eval_args.gt_depth_semantics,
                 max_range_depth=eval_args.depth_max_m,
                 return_camera_meta=True,
+                source_valid_mask=moved.get("pano_rgb_depth_common_mask"),
             )
             spherical_weights = build_covered_sphere_weights(
                 target_camera_meta,

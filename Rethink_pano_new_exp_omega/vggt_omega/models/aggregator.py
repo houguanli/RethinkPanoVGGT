@@ -32,6 +32,7 @@ omega-specific differences:
     is a residual MLP adapter on the tokens themselves.
 """
 
+import re
 from typing import Dict, Iterable, Optional, Sequence, Set, Tuple
 
 import torch
@@ -504,13 +505,18 @@ def _resolve_luna_layers(layers, depth: int) -> Set[int]:
             return set()
         if normalized in {"last_half", "second_half"}:
             return set(range(depth // 2, depth))
-        if normalized in {"last2", "final2", "tail2"}:
-            return set(range(max(depth - 2, 0), depth))
-        if normalized in {"last3", "final3", "tail3"}:
-            return set(range(max(depth - 3, 0), depth))
-        if normalized in {"last4", "final4", "tail4"}:
-            return set(range(max(depth - 4, 0), depth))
         if normalized in {"last", "final"}:
             return {depth - 1}
-        return {int(item.strip()) for item in normalized.split(",") if item.strip()}
-    return {int(layer_idx) for layer_idx in layers}
+        tail_match = re.fullmatch(r"(?:last|final|tail)(\d+)", normalized)
+        if tail_match is not None:
+            count = int(tail_match.group(1))
+            if count < 0 or count > depth:
+                raise ValueError(f"LUNA tail layer count must be in [0, {depth}], got {count}")
+            return set(range(depth - count, depth))
+        resolved = {int(item.strip()) for item in normalized.split(",") if item.strip()}
+    else:
+        resolved = {int(layer_idx) for layer_idx in layers}
+    invalid = sorted(layer_idx for layer_idx in resolved if layer_idx < 0 or layer_idx >= depth)
+    if invalid:
+        raise ValueError(f"LUNA layer indices must be in [0, {depth - 1}], got {invalid}")
+    return resolved

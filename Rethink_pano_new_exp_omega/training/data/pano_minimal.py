@@ -175,6 +175,9 @@ class PanoMinimalDataset(Dataset):
         return {
             "pano_image": torch.stack([sample["pano_image"] for sample in samples], dim=0),
             "pano_depth": torch.stack([sample["pano_depth"] for sample in samples], dim=0),
+            "pano_rgb_depth_common_mask": torch.stack(
+                [sample["pano_rgb_depth_common_mask"] for sample in samples], dim=0
+            ),
             "sequence_name": [sample["sequence_name"] for sample in samples],
             "scene_name": "|".join(sample["scene_name"] for sample in samples),
             "rgb_path": [sample["rgb_path"] for sample in samples],
@@ -272,9 +275,15 @@ class PanoMinimalDataset(Dataset):
             height, width = self.pano_size
             image = F.interpolate(image[None], size=(height, width), mode="bilinear", align_corners=False)[0]
             depth = F.interpolate(depth[None], size=(height, width), mode="nearest")[0]
+        rgb_depth_common_mask = _rgb_depth_common_valid_mask(
+            image=image,
+            depth=depth,
+            dataset=item.get("dataset") or item.get("sequence_name"),
+        )
         return {
             "pano_image": image,
             "pano_depth": depth,
+            "pano_rgb_depth_common_mask": rgb_depth_common_mask,
             "sequence_name": item["sequence_name"],
             "scene_name": item["scene_name"],
             "rgb_path": str(item["rgb_path"]),
@@ -1197,3 +1206,25 @@ def _read_depth_tensor(path: Path, output_depth_scale: float, invalid_depth_valu
         depth_m[depth.astype(np.float32) >= float(invalid_depth_value)] = np.inf
     depth_m[depth_m <= 0] = np.inf
     return torch.from_numpy(depth_m)[None].contiguous()
+
+
+def _rgb_depth_common_valid_mask(image: torch.Tensor, depth: torch.Tensor, dataset: object) -> torch.Tensor:
+    """Exclude Stanford's artificial black polar fill from depth supervision."""
+    common_valid = torch.isfinite(depth) & (depth > 0)
+    if _dataset_key(dataset) != "stanford2d3ds":
+        return common_valid
+
+    height, width = depth.shape[-2:]
+    rows = torch.arange(height, device=image.device)
+    polar_rows = (rows < int(np.ceil(height * 0.25))) | (rows >= int(np.floor(height * 0.75)))
+    polar_mask = polar_rows.view(1, height, 1).expand(1, height, width)
+    near_black = image.amax(dim=0, keepdim=True) <= (8.0 / 255.0)
+    artificial_fill = near_black & polar_mask
+    if height >= 3 and width >= 3:
+        artificial_fill = F.max_pool2d(
+            artificial_fill.to(dtype=torch.float32)[None],
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )[0] > 0.5
+    return common_valid & ~artificial_fill

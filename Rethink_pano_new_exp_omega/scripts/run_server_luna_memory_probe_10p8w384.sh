@@ -15,6 +15,11 @@ RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-logs/server_luna_memory_probe_9p_8w384_fov90_pitch30_erp1024x512_${RUN_TAG}}"
 BASE_CHECKPOINT="${BASE_CHECKPOINT:-}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+EXTRA_TRAIN_ARGS_ARRAY=()
+if [[ -n "${EXTRA_TRAIN_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  EXTRA_TRAIN_ARGS_ARRAY=($EXTRA_TRAIN_ARGS)
+fi
 
 if [[ -z "$WARMUP_CHECKPOINT" || ! -s "$WARMUP_CHECKPOINT" ]]; then
   echo "usage: bash scripts/run_server_luna_memory_probe_10p8w384.sh /absolute/path/to/warmup/last.pt" >&2
@@ -40,7 +45,8 @@ sampler = config.get("sampler") or {}
 stages = (config.get("optimization") or {}).get("training_stages") or []
 pitch_values = [value.strip() for value in str(sampler.get("pitch_degrees", "")).split(",") if value.strip()]
 checks = {
-    "data.pano_min_count": (data.get("pano_min_count"), 3),
+    "data.pano_sample_mode": (data.get("pano_sample_mode"), "fixed_neighborhood"),
+    "data.pano_min_count": (data.get("pano_min_count"), 9),
     "data.pano_max_count": (data.get("pano_max_count"), 9),
     "sampler.window_size": (sampler.get("window_size"), 384),
     "sampler.num_yaw": (sampler.get("num_yaw"), 4),
@@ -146,6 +152,7 @@ LOG="$OUTPUT_DIR/train_console.log"
   echo "[memory-probe] sampler=4 yaw x pitch(-30,+30), 384x384, FoV=90deg; total=8 windows/pano, max 72 windows/sample"
   echo "[memory-probe] smoke_curriculum=0-0.20m:3p,0.20-0.45m:6p,0.45m+:9p"
   echo "[memory-probe] duration_minutes=${DURATION_MINUTES:-1}"
+  echo "[memory-probe] extra_train_args=${EXTRA_TRAIN_ARGS:-}"
 } | tee "$LOG"
 
 set +e
@@ -163,6 +170,7 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   --debug-dir "$OUTPUT_DIR/debug" \
   --max-duration-minutes "${DURATION_MINUTES:-1}" \
   --no-inherit-checkpoint-training-defaults \
+  "${EXTRA_TRAIN_ARGS_ARRAY[@]}" \
   2>&1 | tee -a "$LOG"
 status=${PIPESTATUS[0]}
 set -e

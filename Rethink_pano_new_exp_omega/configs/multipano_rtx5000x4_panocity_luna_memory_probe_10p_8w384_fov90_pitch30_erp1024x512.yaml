@@ -14,8 +14,9 @@ data:
   curriculum_bins: null
   use_metadata_weights: false
   checkpoint: null
-  pano_sample_mode: variable_neighborhood
-  pano_min_count: 3
+  # Build fixed 9-pano groups once; stage caps then exercise exactly 3, 6, 9.
+  pano_sample_mode: fixed_neighborhood
+  pano_min_count: 9
   pano_max_count: 9
   pano_grouping: nearest
   randomize_pano_order: false
@@ -31,8 +32,8 @@ sampler:
   fov_degrees: 90.0
   pano_height: 512
   pano_width: 1024
-  luna_patch_layers: last3
-  luna_camera_layers: "23"
+  luna_patch_layer_count: 12
+  luna_camera_layer_count: 1
 
 model:
   enable_pano_global_token: true

@@ -172,6 +172,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="23",
         help="LUNA camera adapter layers: final, none, or comma-separated layer indices.",
     )
+    parser.add_argument(
+        "--luna-patch-layer-count",
+        type=int,
+        default=None,
+        help="Inject patch adapters into the final N Omega layers; overrides --luna-patch-layers.",
+    )
+    parser.add_argument(
+        "--luna-camera-layer-count",
+        type=int,
+        default=None,
+        help="Inject camera adapters into the final N Omega layers; overrides --luna-camera-layers.",
+    )
     parser.add_argument("--enable-pano-global-token", dest="enable_pano_global_token", action="store_true", default=True)
     parser.add_argument("--disable-pano-global-token", dest="enable_pano_global_token", action="store_false")
     parser.add_argument(
@@ -601,7 +613,24 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     if config_args.config is not None:
         parser.set_defaults(**load_config_defaults(config_args.config, parser))
-    return parser.parse_args(argv_list)
+    args = parser.parse_args(argv_list)
+    normalize_luna_layer_args(args)
+    return args
+
+
+def normalize_luna_layer_args(args: argparse.Namespace, depth: int = 24) -> None:
+    """Convert numeric tail-layer counts into checkpoint-stable selectors."""
+    for count_key, selector_key in (
+        ("luna_patch_layer_count", "luna_patch_layers"),
+        ("luna_camera_layer_count", "luna_camera_layers"),
+    ):
+        count = getattr(args, count_key, None)
+        if count is None:
+            continue
+        count = int(count)
+        if count < 0 or count > depth:
+            raise ValueError(f"{count_key} must be in [0, {depth}], got {count}")
+        setattr(args, selector_key, "none" if count == 0 else f"last{count}")
 
 
 def load_config_defaults(path: Path, parser: argparse.ArgumentParser) -> Dict:
@@ -994,6 +1023,9 @@ def train(args: argparse.Namespace) -> None:
                     ),
                     "pano_count": float(loss_dict.get("pano_count", torch.tensor(1.0)).item()),
                     "depth_valid_ratio": float(loss_dict.get("depth_valid_ratio", torch.tensor(0.0)).item()),
+                    "rgb_depth_common_mask_keep_ratio": float(
+                        loss_dict.get("rgb_depth_common_mask_keep_ratio", torch.tensor(1.0)).item()
+                    ),
                     "depth_window_keep_ratio": float(
                         loss_dict.get("depth_window_keep_ratio", torch.tensor(0.0)).item()
                     ),
@@ -2023,6 +2055,12 @@ def train_step(
     optimizer.zero_grad(set_to_none=True)
     pano_images = batch["pano_image"]
     pano_depths = batch["pano_depth"]
+    source_common_mask = batch.get("pano_rgb_depth_common_mask")
+    common_mask_keep_ratio = (
+        source_common_mask.to(dtype=torch.float32).mean()
+        if torch.is_tensor(source_common_mask)
+        else pano_depths.new_tensor(1.0)
+    )
     sampler_model = unwrap_model(model)
 
     sampled_depth_targets = sample_depth_targets(
@@ -2031,6 +2069,7 @@ def train_step(
         source_depth_semantics=args.gt_depth_semantics,
         max_range_depth=args.depth_max_m,
         return_camera_meta=bool(args.normalize_scene_scale),
+        source_valid_mask=source_common_mask,
     )
     if args.normalize_scene_scale:
         target_depth, target_valid, target_camera_meta = sampled_depth_targets
@@ -2278,6 +2317,7 @@ def train_step(
         "loss_camera_weighted": (float(args.camera_loss_weight) * loss_camera).detach(),
         "pano_count": loss_depth.new_tensor(float(pano_images.shape[1] if pano_images.ndim == 5 else 1)),
         "depth_valid_ratio": depth_valid_ratio.detach(),
+        "rgb_depth_common_mask_keep_ratio": common_mask_keep_ratio.detach(),
         "depth_window_keep_ratio": depth_window_keep_ratio.detach(),
         "depth_loss_valid_ratio": depth_loss_valid.detach(),
         "depth_loss_window_keep_ratio": depth_loss_window_keep_ratio.detach(),
@@ -2429,9 +2469,17 @@ def sample_depth_targets(
     source_depth_semantics: str = "range",
     max_range_depth: float | None = None,
     return_camera_meta: bool = False,
+    source_valid_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
     """Decode source ERP depth to radial range, sample it, and convert to window Z-depth."""
     source_valid_bool = torch.isfinite(pano_depths) & (pano_depths > 0)
+    if source_valid_mask is not None:
+        if source_valid_mask.shape != pano_depths.shape:
+            raise ValueError(
+                "source_valid_mask must match pano_depths shape, got "
+                f"{tuple(source_valid_mask.shape)} vs {tuple(pano_depths.shape)}"
+            )
+        source_valid_bool &= source_valid_mask.to(device=pano_depths.device, dtype=torch.bool)
     source_valid = source_valid_bool.to(dtype=pano_depths.dtype)
     range_depth_erp = erp_depth_to_range_depth(pano_depths, source_depth_semantics)
     source_valid_bool &= torch.isfinite(range_depth_erp) & (range_depth_erp > 0)
@@ -2688,6 +2736,7 @@ def write_tensorboard_metrics(writer, metrics: Dict[str, Any]) -> None:
         "loss/camera_consistency": "loss_camera_consistency",
         "loss/depth_unfiltered": "loss_depth_unfiltered",
         "data/depth_valid_ratio": "depth_valid_ratio",
+        "data/rgb_depth_common_mask_keep_ratio": "rgb_depth_common_mask_keep_ratio",
         "data/depth_window_keep_ratio": "depth_window_keep_ratio",
         "data/depth_loss_valid_ratio": "depth_loss_valid_ratio",
         "data/depth_loss_window_keep_ratio": "depth_loss_window_keep_ratio",
