@@ -35,6 +35,7 @@ class Structured3DDataset(BaseDataset):
             expand_ratio: int = 3,
             augmentation: dict = None,
             get_nearby: bool = None,  # If None, use common_conf.get_nearby
+            require_mixed4_cache: bool = False,
     ):
         super().__init__(common_conf=common_conf)
 
@@ -54,6 +55,7 @@ class Structured3DDataset(BaseDataset):
         self.min_num_rooms = min_num_rooms
         self.augmentation = augmentation if augmentation is not None else common_conf.augs
         self.split = split
+        self.require_mixed4_cache = bool(require_mixed4_cache)
 
         if split == "train":
             self.dataset_length = len_train
@@ -78,7 +80,10 @@ class Structured3DDataset(BaseDataset):
 
         
         t0 = time.time()
-        self._load_scenes()
+        if self.require_mixed4_cache:
+            self.scenes = []
+        else:
+            self._load_scenes()
         self._scan_or_load_scenes_cache()
         logging.info(f"Structured3D index ready in {time.time()-t0:.1f}s")
 
@@ -144,7 +149,15 @@ class Structured3DDataset(BaseDataset):
                 serializable.append([scene, list(valid_rooms), [res[0], res[1]]])
             return serializable
 
-        if osp.exists(cache_path):
+        if self.require_mixed4_cache:
+            if not osp.exists(cache_path):
+                raise FileNotFoundError(
+                    "Required mixed4 Structured3D cache is missing: "
+                    f"{cache_path}. "
+                    "Expected a mixed4 index built by scripts/build_mixed4_official_indexes.py."
+                )
+            data = load_or_build_json_cache(cache_path, build_fn)
+        elif osp.exists(cache_path):
             data = load_or_build_json_cache(cache_path, build_fn)
         else:
             data = self._load_project_split_index()

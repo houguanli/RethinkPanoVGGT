@@ -43,6 +43,7 @@ class Stanford2D3DSDataset(BaseDataset):
             test_areas: list = None,
             test_final_areas: list = None,
             get_nearby: bool = None,
+            require_mixed4_cache: bool = False,
     ):
         super().__init__(common_conf=common_conf)
 
@@ -62,6 +63,7 @@ class Stanford2D3DSDataset(BaseDataset):
         self.min_num_images = min_num_images
         self.augmentation = augmentation if augmentation is not None else common_conf.augs
         self.split = split
+        self.require_mixed4_cache = bool(require_mixed4_cache)
 
         if train_areas is None:
             train_areas = ['area_1', 'area_2', 'area_3', 'area_4', 'area_6']
@@ -131,7 +133,15 @@ class Stanford2D3DSDataset(BaseDataset):
                 serializable.append([area, region_id, room_name, list(panorama_list), [res[0], res[1]]])
             return serializable
 
-        if osp.exists(cache_path):
+        if self.require_mixed4_cache:
+            if not osp.exists(cache_path):
+                raise FileNotFoundError(
+                    "Required mixed4 Stanford2D3DS cache is missing: "
+                    f"{cache_path}. "
+                    "Expected a mixed4 index built by scripts/build_mixed4_official_indexes.py."
+                )
+            data = load_or_build_json_cache(cache_path, build_fn)
+        elif osp.exists(cache_path):
             data = load_or_build_json_cache(cache_path, build_fn)
         else:
             data = self._load_project_split_index()

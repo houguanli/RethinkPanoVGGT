@@ -39,6 +39,7 @@ class PanoCityDataset(BaseDataset):
             split_seed: int = 42,
             use_official_splits: bool = True,
             official_split_dir: str = None,
+            require_mixed4_cache: bool = False,
     ):
         super().__init__(common_conf=common_conf)
 
@@ -61,6 +62,7 @@ class PanoCityDataset(BaseDataset):
         self.split_seed = int(split_seed)
         self.use_official_splits = bool(use_official_splits)
         self.official_split_dir = official_split_dir
+        self.require_mixed4_cache = bool(require_mixed4_cache)
 
         # Split semantics:
         # - split="train"      -> mode="train" (90%)
@@ -109,6 +111,20 @@ class PanoCityDataset(BaseDataset):
     # ------------------------- cache / indexing -------------------------
     def _load_splits_cache(self):
         """Load split index from cache, or build once and cache it."""
+        if self.require_mixed4_cache:
+            flat_cache = self._load_flat_cache_split_index()
+            if flat_cache is None:
+                raise FileNotFoundError(
+                    "Required mixed4 PanoCity cache is missing or invalid: "
+                    f"{self._flat_cache_path()}. "
+                    "Expected a mixed4 index built by scripts/build_mixed4_official_indexes.py."
+                )
+            self.trajectories = flat_cache
+            self.sequence_list_len = len(self.trajectories)
+            if self.trajectories:
+                self.base_resolution = tuple(self.trajectories[0]['resolution'])
+            return
+
         official = self._load_official_split_index()
         if official is not None:
             self.trajectories = official

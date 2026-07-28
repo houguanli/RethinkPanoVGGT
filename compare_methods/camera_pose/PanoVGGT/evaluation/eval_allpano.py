@@ -79,7 +79,7 @@ DATASET_KEYS = {
 }
 
 DATASET_ROOT_ALIASES = {
-    "PanoCity": ("PanoCity", "Panocity", "PanoCity_paired"),
+    "PanoCity": ("Panocity", "PanoCity", "PanoCity_paired"),
     "Matterport3D": ("Matterport3D",),
     "Stanford2D3DS": ("Stanford2D3DS", "2D3DS"),
     "Structured3D": ("Structured3D", "Structured3D_Dataset/Structured3D"),
@@ -610,8 +610,10 @@ def parse_args():
                    help="JSON string of model constructor kwargs")
     p.add_argument("--model_kwargs_file", type=str, default=None,
                    help="Path to a JSON file with model constructor kwargs")
-    p.add_argument("--split", type=str, default="test",
+    p.add_argument("--split", type=str, default="test_final",
                    choices=["train", "val", "test", "test_final"])
+    p.add_argument("--allow_legacy_splits", action="store_true",
+                   help="Allow fallback to project split JSONs or on-the-fly scans. By default eval requires mixed4 cache indexes.")
 
     # per-dataset sequence counts (-1 = all)
     p.add_argument("--num_seqs_panocity",       type=int, default=-1)
@@ -682,6 +684,13 @@ def main():
     mixed4_summary = _load_mixed4_summary(args.datasets_root)
     if mixed4_summary is not None:
         print(f"Mixed4 summary: {mixed4_summary['_path']}")
+    elif not args.allow_legacy_splits:
+        raise FileNotFoundError(
+            "mixed4_index_summary.json not found under "
+            f"{Path(args.datasets_root).expanduser()}. "
+            "Build/copy the mixed4 indexes first, or pass --allow_legacy_splits "
+            "to use the old project split/scanning paths."
+        )
 
     panocity_root = args.panocity_root or _dataset_root_from_base(args.datasets_root, "PanoCity")
     matterport_root = args.matterport_root or _dataset_root_from_base(args.datasets_root, "Matterport3D")
@@ -692,21 +701,25 @@ def main():
         ("PanoCity", PanoCityDataset, {
             "PanoCity_DIR": _normalize_dataset_root("PanoCity", panocity_root),
             "min_num_images": max(2, args.frames_panocity),
+            "require_mixed4_cache": not args.allow_legacy_splits,
         }, args.num_seqs_panocity, args.frames_panocity),
 
         ("Matterport3D", Matterport3DDataset, {
             "Matterport3D_DIR": _normalize_dataset_root("Matterport3D", matterport_root),
             "min_num_images": max(2, args.frames_matterport),
+            "require_mixed4_cache": not args.allow_legacy_splits,
         }, args.num_seqs_matterport, args.frames_matterport),
 
         ("Stanford2D3DS", Stanford2D3DSDataset, {
             "Stanford2D3DS_DIR": _normalize_dataset_root("Stanford2D3DS", stanford_root),
             "min_num_images": max(2, args.frames_stanford),
+            "require_mixed4_cache": not args.allow_legacy_splits,
         }, args.num_seqs_stanford, args.frames_stanford),
 
         ("Structured3D", Structured3DDataset, {
             "Structured3D_DIR": _normalize_dataset_root("Structured3D", structured3d_root),
             "min_num_rooms": max(2, args.frames_structured3d),
+            "require_mixed4_cache": not args.allow_legacy_splits,
         }, args.num_seqs_structured3d, args.frames_structured3d),
     ]
 
