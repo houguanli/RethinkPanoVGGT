@@ -50,11 +50,18 @@ from training.train_pano_omega import (  # noqa: E402
 
 
 DATASETS = [
-    ("Panocity", "panocity", "test"),
-    ("Matterport3D", "matterport3d", "test"),
     ("Stanford2D3DS", "stanford2d3ds", "test"),
+    ("Matterport3D", "matterport3d", "test"),
     ("Structured3D", "structured3d", "test"),
+    ("Panocity", "panocity", "test"),
 ]
+
+DATASET_SEED_OFFSETS = {
+    "panocity": 0,
+    "matterport3d": 1,
+    "stanford2d3ds": 2,
+    "structured3d": 3,
+}
 
 PANOVGGT_TABLE3_MONOCULAR = {
     "Matterport3D": {"abs_rel": 0.0884, "delta_1p25": 0.9157},
@@ -144,6 +151,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-progress", dest="progress", action="store_false")
     parser.add_argument("--print-each-sample", dest="print_each_sample", action="store_true", default=True)
     parser.add_argument("--no-print-each-sample", dest="print_each_sample", action="store_false")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse completed run+dataset_index rows from the streaming CSV and evaluate only missing samples.",
+    )
     return parser
 
 
@@ -189,9 +201,11 @@ def main() -> None:
     camera_pair_csv = args.camera_pair_csv
     if camera_pair_csv is None and args.per_sample_csv is not None:
         camera_pair_csv = args.per_sample_csv.with_name(f"{args.per_sample_csv.stem}_camera_pairs.csv")
-    if args.per_sample_csv is not None:
+    per_sample_rows = read_csv_rows(args.per_sample_csv) if args.resume else []
+    camera_pair_rows = read_csv_rows(camera_pair_csv) if args.resume else []
+    if args.per_sample_csv is not None and not (args.resume and args.per_sample_csv.exists()):
         initialize_csv(args.per_sample_csv, PER_SAMPLE_CSV_FIELDS)
-    if camera_pair_csv is not None:
+    if camera_pair_csv is not None and not (args.resume and camera_pair_csv.exists()):
         initialize_csv(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS)
 
     selected_datasets = select_datasets(args.datasets)
@@ -211,8 +225,6 @@ def main() -> None:
         },
     )
     runs: list[dict[str, Any]] = []
-    per_sample_rows: list[dict[str, Any]] = []
-    camera_pair_rows: list[dict[str, Any]] = []
     for dataset_index, (display_name, minimal_name, split) in enumerate(DATASETS):
         if minimal_name not in selected_datasets:
             continue
@@ -239,7 +251,7 @@ def main() -> None:
             curriculum_bins="all",
             limit=args.limit_per_dataset,
             limit_fraction=args.limit_fraction,
-            seed=args.seed + dataset_index * 1009,
+            seed=args.seed + DATASET_SEED_OFFSETS[minimal_name] * 1009,
             sample_policy=args.sample_policy,
             num_workers=args.num_workers,
             progress=args.progress,
@@ -262,6 +274,7 @@ def main() -> None:
             camera_eval_max_panos=args.camera_eval_max_panos,
             print_each_sample=args.print_each_sample,
             exact_group_manifest=manifest_rows_for_dataset(manifest_rows, display_name, minimal_name),
+            resume=args.resume,
         )
         run["dataset"] = display_name
         run["minimal_dataset"] = minimal_name
@@ -296,6 +309,7 @@ def main() -> None:
         "dataset_root": str(train_args.dataset_root),
         "sample_policy": str(args.sample_policy),
         "sample_manifest": str(args.sample_manifest) if args.sample_manifest is not None else None,
+        "resume": bool(args.resume),
         "split_policy": {
             "Panocity": "test (PanoVGGT official split when cache was built with official split JSONs)",
             "Matterport3D": "test",
@@ -329,6 +343,22 @@ def load_sample_manifest(path: Path | None) -> list[dict[str, str]] | None:
         rows = list(csv.DictReader(handle))
     if not rows:
         raise ValueError(f"Sample manifest is empty: {path}")
+    return rows
+
+
+def read_csv_rows(path: Path | None) -> list[dict[str, Any]]:
+    if path is None or not path.exists() or path.stat().st_size == 0:
+        return []
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    for row in rows:
+        for key, value in row.items():
+            if value in (None, ""):
+                continue
+            try:
+                row[key] = float(value)
+            except (TypeError, ValueError):
+                pass
     return rows
 
 

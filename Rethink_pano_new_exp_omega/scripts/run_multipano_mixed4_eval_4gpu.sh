@@ -30,6 +30,7 @@ CAMERA_EVAL_MAX_PANOS="${CAMERA_EVAL_MAX_PANOS:-3}"
 WINDOW_SIZE="${WINDOW_SIZE:-384}"
 NUM_YAW="${NUM_YAW:-4}"
 PRINT_EACH_SAMPLE="${PRINT_EACH_SAMPLE:-1}"
+RESUME="${RESUME:-1}"
 
 mkdir -p "$EVAL_OUT/shards" "$EVAL_OUT/progress"
 rm -f "$EVAL_OUT"/progress/shard_*.json
@@ -80,6 +81,7 @@ fi
   echo "[eval-4gpu] window_size=$WINDOW_SIZE"
   echo "[eval-4gpu] num_yaw=$NUM_YAW"
   echo "[eval-4gpu] print_each_sample=$PRINT_EACH_SAMPLE"
+  echo "[eval-4gpu] resume=$RESUME"
   echo "[eval-4gpu] progress_interval_seconds=$PROGRESS_INTERVAL_SECONDS"
   echo "[eval-4gpu] progress_style=$PROGRESS_STYLE"
 } | tee "$EVAL_OUT/eval_4gpu.log"
@@ -92,6 +94,10 @@ PIDS=()
 sample_output_args=(--print-each-sample)
 if [[ "$PRINT_EACH_SAMPLE" != "1" ]]; then
   sample_output_args=(--no-print-each-sample)
+fi
+resume_args=()
+if [[ "$RESUME" == "1" ]]; then
+  resume_args=(--resume)
 fi
 trap 'echo "[eval-4gpu] interrupted; terminating shard processes" | tee -a "$EVAL_OUT/eval_4gpu.log"; for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done' INT TERM
 for rank in "${!GPU_LIST[@]}"; do
@@ -152,6 +158,7 @@ PY
       --shard-rank "$rank" \
       --progress-file "$progress_file" \
       --progress-every "$PROGRESS_EVERY" \
+      "${resume_args[@]}" \
       "${sample_output_args[@]}" \
       --no-progress
   ) > >(

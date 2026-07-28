@@ -451,6 +451,7 @@ def evaluate_run(
     camera_eval_max_panos: int = 3,
     print_each_sample: bool = True,
     exact_group_manifest: list[dict[str, Any]] | None = None,
+    resume: bool = False,
 ) -> dict[str, Any]:
     if int(num_shards) < 1:
         raise ValueError(f"num_shards must be >= 1, got {num_shards}")
@@ -467,6 +468,18 @@ def evaluate_run(
         apply_exact_group_manifest(dataset, exact_group_manifest)
     indices, sampling_info = select_eval_indices(dataset, limit, seed, sample_policy, limit_fraction=limit_fraction)
     selected_indices = indices[int(shard_rank) :: int(num_shards)]
+    selected_index_set = set(selected_indices)
+    existing_rows = [
+        row
+        for row in per_sample_rows
+        if str(row.get("run", "")) == name
+        and parse_int(row.get("dataset_index"), default=-1) in selected_index_set
+    ] if resume else []
+    completed_indices = {
+        parse_int(row.get("dataset_index"), default=-1)
+        for row in existing_rows
+    }
+    pending_indices = [index for index in selected_indices if index not in completed_indices]
     write_eval_progress(
         progress_file,
         {
@@ -478,13 +491,14 @@ def evaluate_run(
             "candidate_samples": len(indices),
             "sample_policy": sampling_info,
             "shard_samples": len(selected_indices),
-            "processed_samples": 0,
+            "processed_samples": len(existing_rows),
+            "resumed_samples": len(existing_rows),
             "shard_rank": int(shard_rank),
             "num_shards": int(num_shards),
             "updated_at": time.time(),
         },
     )
-    subset = Subset(dataset, selected_indices)
+    subset = Subset(dataset, pending_indices)
     loader = DataLoader(
         subset,
         batch_size=1,
@@ -494,8 +508,7 @@ def evaluate_run(
         drop_last=False,
     )
 
-    rows: list[dict[str, Any]] = []
-    camera_pair_start = len(camera_pair_rows) if camera_pair_rows is not None else 0
+    rows: list[dict[str, Any]] = list(existing_rows)
     amp_enabled = device.type == "cuda" and eval_args.amp_dtype != "none"
     amp_dtype = torch.bfloat16 if eval_args.amp_dtype == "bfloat16" else torch.float32
     iterator = tqdm(loader, desc=f"validate {name}", dynamic_ncols=True) if progress else loader
@@ -626,7 +639,7 @@ def evaluate_run(
             row = {
                 **(row_context or {}),
                 "run": name,
-                "dataset_index": int(selected_indices[local_index]),
+                "dataset_index": int(pending_indices[local_index]),
                 "seq_name": scalar_string(batch.get("scene_name") or batch.get("sequence_name")),
                 "rgb_path": scalar_string(batch.get("rgb_path")),
                 "depth_path": scalar_string(batch.get("depth_path")),
@@ -666,7 +679,7 @@ def evaluate_run(
                     {
                         **(row_context or {}),
                         "run": name,
-                        "dataset_index": int(selected_indices[local_index]),
+                        "dataset_index": int(pending_indices[local_index]),
                         "seq_name": row["seq_name"],
                         "rgb_path": row["rgb_path"],
                         "depth_path": row["depth_path"],
@@ -680,7 +693,7 @@ def evaluate_run(
                 camera_pair_rows.extend(pose_pair_rows)
             if camera_pair_csv is not None:
                 append_csv_rows(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS, pose_pair_rows)
-            processed = local_index + 1
+            processed = len(existing_rows) + local_index + 1
             if print_each_sample:
                 print(
                     format_eval_sample_line(
@@ -726,9 +739,12 @@ def evaluate_run(
                     },
                 )
 
-    run_camera_pair_rows = (
-        camera_pair_rows[camera_pair_start:] if camera_pair_rows is not None else []
-    )
+    run_camera_pair_rows = [
+        row
+        for row in (camera_pair_rows or [])
+        if str(row.get("run", "")) == name
+        and parse_int(row.get("dataset_index"), default=-1) in selected_index_set
+    ]
     result = {
         "name": name,
         "split": split,
@@ -884,7 +900,13 @@ def format_eval_number(value: Any) -> str:
 def compute_depth_metrics(pred_depth: torch.Tensor, target_depth: torch.Tensor, target_valid: torch.Tensor) -> dict[str, float]:
     pred = pred_depth.detach().float()
     target = target_depth.detach().float()
-    valid = target_valid.detach().bool() & torch.isfinite(pred) & torch.isfinite(target) & (target > 0)
+    valid = (
+        target_valid.detach().bool()
+        & torch.isfinite(pred)
+        & torch.isfinite(target)
+        & (pred > 0)
+        & (target > 0)
+    )
     if valid.sum().item() == 0:
         return {
             "depth_mae": 0.0,
@@ -1506,6 +1528,13 @@ def scalar_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def parse_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def normalize_bins_label(value: str | None) -> str:
