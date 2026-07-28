@@ -100,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit-per-dataset", type=int, default=100, help="Held-out samples per dataset. Use 0 for the full split.")
     parser.add_argument("--limit-fraction", type=float, default=0.0, help="Fraction of scene groups per dataset when --limit-per-dataset <= 0.")
     parser.add_argument("--eval-max-panos", type=int, default=0, help="Clamp eval multi-pano input length for all datasets. Use 0 to keep config pano_max_count.")
+    parser.add_argument("--window-size", type=int, default=0, help="Override square window resolution; 0 keeps checkpoint/config.")
     parser.add_argument("--num-yaw", type=int, default=0, help="Override yaw windows per pano; 0 keeps checkpoint/config.")
     parser.add_argument("--panocity-max-panos", type=int, default=0, help="Optional Panocity-specific eval pano cap, overriding --eval-max-panos for Panocity.")
     parser.add_argument(
@@ -115,6 +116,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument(
+        "--sample-manifest",
+        type=Path,
+        default=None,
+        help="Optional CSV containing exact pano_id_0..N groups. Rows are filtered by dataset when present.",
+    )
+    parser.add_argument(
         "--sample-policy",
         choices=["scene_neighborhood", "anchor"],
         default="scene_neighborhood",
@@ -126,12 +133,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-pair-csv", type=Path, default=None, help="Optional streaming PanoVGGT-style camera pair CSV path.")
     parser.add_argument("--camera-pose-trans-norm-thresh", type=float, default=1e-2, help="GT baseline threshold for PanoVGGT-style camera translation-angle eval.")
     parser.add_argument("--camera-eval-max-panos", type=int, default=3, help="Maximum pano views used for PanoVGGT Table-2 camera metrics.")
-    parser.add_argument(
-        "--erp-latitude-limit-deg",
-        type=float,
-        default=75.0,
-        help="Covered-ERP metric latitude limit; polar caps outside +/- this value are excluded.",
-    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default=None)
@@ -141,6 +142,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--progress-every", type=int, default=25, help="Samples between progress-file updates.")
     parser.add_argument("--progress", action="store_true", default=True)
     parser.add_argument("--no-progress", dest="progress", action="store_false")
+    parser.add_argument("--print-each-sample", dest="print_each_sample", action="store_true", default=True)
+    parser.add_argument("--no-print-each-sample", dest="print_each_sample", action="store_false")
     return parser
 
 
@@ -176,6 +179,8 @@ def main() -> None:
 
     checkpoint_payload = load_checkpoint_payload(args.checkpoint)
     apply_checkpoint_eval_defaults(train_args, checkpoint_payload)
+    if args.window_size > 0:
+        train_args.window_size = int(args.window_size)
     if args.num_yaw > 0:
         train_args.num_yaw = int(args.num_yaw)
     model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
@@ -190,6 +195,7 @@ def main() -> None:
         initialize_csv(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS)
 
     selected_datasets = select_datasets(args.datasets)
+    manifest_rows = load_sample_manifest(args.sample_manifest)
     dataset_pano_counts = resolve_dataset_pano_counts(args.pano_count_policy, args.dataset_pano_counts)
     write_eval_progress(
         args.progress_file,
@@ -254,7 +260,8 @@ def main() -> None:
             },
             camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
             camera_eval_max_panos=args.camera_eval_max_panos,
-            erp_latitude_limit_deg=args.erp_latitude_limit_deg,
+            print_each_sample=args.print_each_sample,
+            exact_group_manifest=manifest_rows_for_dataset(manifest_rows, display_name, minimal_name),
         )
         run["dataset"] = display_name
         run["minimal_dataset"] = minimal_name
@@ -274,17 +281,21 @@ def main() -> None:
         "limit_per_dataset": int(args.limit_per_dataset),
         "limit_fraction": float(args.limit_fraction or 0.0),
         "eval_max_panos": int(args.eval_max_panos or 0),
+        "window_size": int(train_args.window_size),
         "num_yaw": int(train_args.num_yaw),
+        "pitch_degrees": str(train_args.pitch_degrees),
+        "fov_degrees": float(train_args.fov_degrees),
+        "depth_evaluation_domain": "sampled_pinhole_windows",
         "panocity_max_panos": int(args.panocity_max_panos or 0),
         "pano_count_policy": str(args.pano_count_policy),
         "dataset_pano_counts": {key: int(value) for key, value in sorted(dataset_pano_counts.items())},
         "camera_eval_max_panos": int(args.camera_eval_max_panos),
-        "erp_latitude_limit_deg": float(args.erp_latitude_limit_deg),
         "datasets": sorted(selected_datasets),
         "shard_rank": int(args.shard_rank),
         "num_shards": int(args.num_shards),
         "dataset_root": str(train_args.dataset_root),
         "sample_policy": str(args.sample_policy),
+        "sample_manifest": str(args.sample_manifest) if args.sample_manifest is not None else None,
         "split_policy": {
             "Panocity": "test (PanoVGGT official split when cache was built with official split JSONs)",
             "Matterport3D": "test",
@@ -295,7 +306,6 @@ def main() -> None:
         "runs": runs,
         "overall": summarize_runs(runs),
         "panovggt_depth_benchmark": summarize_panovggt_benchmark(runs, per_sample_rows),
-        "panovggt_covered_erp_depth_benchmark": summarize_erp_panovggt_benchmark(runs, per_sample_rows),
         "panovggt_camera_benchmark": summarize_panovggt_camera_benchmark(runs, camera_pair_rows),
         "case_rankings": {
             "best_by_depth_irls_abs_rel": rank_samples(per_sample_rows, "depth_irls_abs_rel", reverse=False, limit=20),
@@ -310,6 +320,37 @@ def main() -> None:
     if args.per_sample_csv is not None:
         write_per_sample_csv(args.per_sample_csv, per_sample_rows)
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def load_sample_manifest(path: Path | None) -> list[dict[str, str]] | None:
+    if path is None:
+        return None
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise ValueError(f"Sample manifest is empty: {path}")
+    return rows
+
+
+def manifest_rows_for_dataset(
+    rows: list[dict[str, str]] | None,
+    display_name: str,
+    minimal_name: str,
+) -> list[dict[str, str]] | None:
+    if rows is None:
+        return None
+    dataset_columns = ("dataset", "dataset_name", "minimal_dataset")
+    if not any(any(row.get(key) for key in dataset_columns) for row in rows):
+        return rows
+    aliases = {display_name.lower(), minimal_name.lower()}
+    selected = [
+        row
+        for row in rows
+        if str(next((row.get(key) for key in dataset_columns if row.get(key)), "")).lower() in aliases
+    ]
+    if not selected:
+        raise ValueError(f"Sample manifest contains no rows for {display_name}")
+    return selected
 
 
 def select_datasets(raw: str) -> set[str]:
@@ -463,8 +504,8 @@ def summarize_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str
     return {
         "paper_protocol_note": (
             "PanoVGGT Table 3 reports Abs Rel and delta<1.25 after IRLS scale normalization. "
-            "This legacy block is computed on sampled pinhole windows. Prefer "
-            "panovggt_covered_erp_depth_benchmark for the ERP-splat common-mask result."
+            "Metrics here are computed directly on the sampled pinhole windows; raw-scale metrics "
+            "are also retained."
         ),
         "per_dataset": per_dataset,
         "overall_micro_irls_scale_aligned": summarize_panovggt_rows(rows).get("micro_by_valid_pixel", {}),
@@ -472,35 +513,6 @@ def summarize_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str
         "panovggt_table3_monocular_macro_reference": macro_reference(PANOVGGT_TABLE3_MONOCULAR),
         "panovggt_table3_multiview_macro_reference": macro_reference(PANOVGGT_TABLE3_MULTIVIEW),
     }
-
-
-def summarize_erp_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str, Any]]) -> dict[str, Any]:
-    def unprefix(row: dict[str, Any]) -> dict[str, Any]:
-        converted = dict(row)
-        for key, value in row.items():
-            if key.startswith("erp_depth_"):
-                converted[key[4:]] = value
-        return converted
-
-    converted_rows = [unprefix(row) for row in rows]
-    converted_runs = []
-    for run in runs:
-        converted = dict(run)
-        dataset = str(run.get("dataset", "unknown"))
-        dataset_rows = [
-            row for row in converted_rows if str(row.get("dataset", "unknown")) == dataset
-        ]
-        converted["panovggt_metric_summary"] = summarize_panovggt_rows(dataset_rows)
-        converted_runs.append(converted)
-    result = summarize_panovggt_benchmark(converted_runs, converted_rows)
-    result["paper_protocol_note"] = (
-        "Window Z-depth is converted to radial depth and splatted back to ERP. Metrics use the "
-        "intersection of deterministic window coverage, valid GT, and the configured "
-        "non-polar latitude band. Coverage is reported separately; this is a covered-ERP common-mask "
-        "protocol, not a claim of polar/full-sphere prediction."
-    )
-    result["coverage"] = summarize_metric_rows(rows, ["erp_coverage_fraction", "erp_common_valid_fraction"])
-    return result
 
 
 def summarize_panovggt_camera_benchmark(runs: list[dict[str, Any]], pair_rows: list[dict[str, Any]]) -> dict[str, Any]:

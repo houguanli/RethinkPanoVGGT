@@ -22,8 +22,9 @@ SAMPLE_POLICY="${SAMPLE_POLICY:-anchor}"
 PANO_COUNT_POLICY="${PANO_COUNT_POLICY:-panovggt}"
 DATASET_PANO_COUNTS="${DATASET_PANO_COUNTS:-}"
 CAMERA_EVAL_MAX_PANOS="${CAMERA_EVAL_MAX_PANOS:-3}"
-NUM_YAW="${NUM_YAW:-8}"
-ERP_LATITUDE_LIMIT_DEG="${ERP_LATITUDE_LIMIT_DEG:-75}"
+WINDOW_SIZE="${WINDOW_SIZE:-384}"
+NUM_YAW="${NUM_YAW:-4}"
+PRINT_EACH_SAMPLE="${PRINT_EACH_SAMPLE:-1}"
 
 SUMMARY_JSON="$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_summary.json"
 
@@ -55,8 +56,9 @@ mkdir -p "$EVAL_OUT"
   echo "[eval-after-training] sample_policy=$SAMPLE_POLICY"
   echo "[eval-after-training] pano_count_policy=$PANO_COUNT_POLICY"
   echo "[eval-after-training] camera_eval_max_panos=$CAMERA_EVAL_MAX_PANOS"
+  echo "[eval-after-training] window_size=$WINDOW_SIZE"
   echo "[eval-after-training] num_yaw=$NUM_YAW"
-  echo "[eval-after-training] erp_latitude_limit_deg=$ERP_LATITUDE_LIMIT_DEG"
+  echo "[eval-after-training] print_each_sample=$PRINT_EACH_SAMPLE"
 } | tee "$EVAL_OUT/eval_after_training.log"
 
 if [[ -z "$GPUS" ]]; then
@@ -102,8 +104,9 @@ env \
   PANO_COUNT_POLICY="$PANO_COUNT_POLICY" \
   DATASET_PANO_COUNTS="$DATASET_PANO_COUNTS" \
   CAMERA_EVAL_MAX_PANOS="$CAMERA_EVAL_MAX_PANOS" \
+  WINDOW_SIZE="$WINDOW_SIZE" \
   NUM_YAW="$NUM_YAW" \
-  ERP_LATITUDE_LIMIT_DEG="$ERP_LATITUDE_LIMIT_DEG" \
+  PRINT_EACH_SAMPLE="$PRINT_EACH_SAMPLE" \
   bash "$LUNA/scripts/run_multipano_mixed4_eval_4gpu.sh" \
   2>&1 | tee -a "$EVAL_OUT/eval_after_training.log"
 

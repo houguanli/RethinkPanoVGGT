@@ -27,6 +27,7 @@ fi
 CONFIG="configs/multipano_rtx5000x4_mixed4_pano_all384_luna_after_full_warmup_9h.yaml"
 DATASET_ROOT="${DATASET_ROOT:-/whitehole/AOKI/panovggt}"
 POSTTRAIN_RUN_VALIDATION="${POSTTRAIN_RUN_VALIDATION:-1}"
+EVAL_PRINT_EACH_SAMPLE="${EVAL_PRINT_EACH_SAMPLE:-1}"
 BASE_CHECKPOINT="${BASE_CHECKPOINT:-}"
 if [[ -z "$BASE_CHECKPOINT" ]]; then
   for candidate in \
@@ -89,6 +90,6 @@ env \
   CAMERA_EVAL_MAX_PANOS=8 \
   WINDOW_SIZE=384 \
   NUM_YAW=4 \
-  PRINT_EACH_SAMPLE="${PRINT_EACH_SAMPLE:-1}" \
+  PRINT_EACH_SAMPLE="$EVAL_PRINT_EACH_SAMPLE" \
   BASE_CHECKPOINT_OVERRIDE="$BASE_CHECKPOINT" \
   bash scripts/run_multipano_eval_after_training.sh

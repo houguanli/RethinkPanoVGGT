@@ -9,6 +9,7 @@ import csv
 import json
 import math
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -27,8 +28,6 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(GIT_ROOT) not in sys.path:
     sys.path.insert(0, str(GIT_ROOT))
 
-from evaluation_common.erp_depth import splat_window_z_depth_to_erp  # noqa: E402
-
 from training.train_pano_omega import (  # noqa: E402
     DepthPredictionAdapter,
     adjacent_edge_overlap_loss,
@@ -37,7 +36,6 @@ from training.train_pano_omega import (  # noqa: E402
     build_relative_pano_pose_targets,
     camera_alignment_loss,
     estimate_sample_depth_alignment_scale,
-    erp_depth_to_range_depth,
     expand_sample_scale_like,
     load_checkpoint,
     masked_depth_loss,
@@ -90,10 +88,6 @@ DEPTH_ACCUMULATOR_KEYS = [
     "depth_irls_delta_1p25_2_count",
     "depth_irls_delta_1p25_3_count",
 ]
-
-ERP_DEPTH_METRIC_KEYS = [f"erp_{key}" for key in DEPTH_METRIC_KEYS]
-ERP_DEPTH_ACCUMULATOR_KEYS = [f"erp_{key}" for key in DEPTH_ACCUMULATOR_KEYS]
-ERP_COVERAGE_KEYS = ["erp_coverage_fraction", "erp_common_valid_fraction"]
 
 PANOVGGT_PRIMARY_METRICS = [
     "depth_irls_abs_rel",
@@ -151,9 +145,6 @@ PER_SAMPLE_CSV_FIELDS = [
     "sample_weight",
     *DEPTH_METRIC_KEYS,
     *DEPTH_ACCUMULATOR_KEYS,
-    *ERP_COVERAGE_KEYS,
-    *ERP_DEPTH_METRIC_KEYS,
-    *ERP_DEPTH_ACCUMULATOR_KEYS,
 ]
 
 CAMERA_PAIR_CSV_FIELDS = [
@@ -187,6 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=100, help="Number of samples for the main validation run.")
     parser.add_argument("--limit-fraction", type=float, default=0.0, help="Fraction of scene groups/samples to evaluate when --limit <= 0.")
     parser.add_argument("--eval-max-panos", type=int, default=0, help="Clamp eval multi-pano input length. Use 0 to keep config pano_max_count.")
+    parser.add_argument("--window-size", type=int, default=0, help="Override square window resolution; 0 keeps checkpoint/config.")
     parser.add_argument("--num-yaw", type=int, default=0, help="Override yaw windows per pano; 0 keeps checkpoint/config.")
     parser.add_argument("--hard-limit", type=int, default=100, help="Extra hard-bin val samples. Use 0 to disable.")
     parser.add_argument("--seed", type=int, default=123, help="Deterministic sample seed.")
@@ -203,17 +195,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-pair-csv", type=Path, default=None, help="Optional streaming PanoVGGT-style camera pair CSV path.")
     parser.add_argument("--camera-pose-trans-norm-thresh", type=float, default=1e-2, help="GT baseline threshold for PanoVGGT-style camera translation-angle eval.")
     parser.add_argument("--camera-eval-max-panos", type=int, default=3, help="Maximum pano views used for PanoVGGT Table-2 camera metrics.")
-    parser.add_argument(
-        "--erp-latitude-limit-deg",
-        type=float,
-        default=75.0,
-        help="Evaluate covered ERP pixels inside +/- this latitude; polar caps are excluded.",
-    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--amp-dtype", choices=["none", "bfloat16"], default=None)
     parser.add_argument("--progress", action="store_true", default=True)
     parser.add_argument("--no-progress", dest="progress", action="store_false")
+    parser.add_argument("--print-each-sample", dest="print_each_sample", action="store_true", default=True)
+    parser.add_argument("--no-print-each-sample", dest="print_each_sample", action="store_false")
     return parser
 
 
@@ -234,6 +222,8 @@ def main() -> None:
 
     checkpoint_payload = load_checkpoint_payload(args.checkpoint)
     apply_checkpoint_eval_defaults(train_args, checkpoint_payload)
+    if args.window_size > 0:
+        train_args.window_size = int(args.window_size)
     if args.num_yaw > 0:
         train_args.num_yaw = int(args.num_yaw)
     apply_eval_max_panos(train_args, args.eval_max_panos)
@@ -272,7 +262,7 @@ def main() -> None:
             row_context={"split": args.split},
             camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
             camera_eval_max_panos=args.camera_eval_max_panos,
-            erp_latitude_limit_deg=args.erp_latitude_limit_deg,
+            print_each_sample=args.print_each_sample,
         )
     )
     if args.hard_limit > 0:
@@ -296,7 +286,7 @@ def main() -> None:
                 camera_pair_csv=camera_pair_csv,
                 row_context={"split": args.split},
                 camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
-                erp_latitude_limit_deg=args.erp_latitude_limit_deg,
+                print_each_sample=args.print_each_sample,
             )
         )
 
@@ -348,7 +338,29 @@ def apply_checkpoint_eval_defaults(args: argparse.Namespace, payload: dict[str, 
         args.pred_depth_scale = float(payload["pred_depth_scale"])
     elif ckpt_args.get("pred_depth_scale") is not None:
         args.pred_depth_scale = float(ckpt_args["pred_depth_scale"])
-    for key in ("learn_pred_depth_scale", "depth_residual_mode", "depth_residual_hidden", "depth_residual_max_log"):
+    # Restore fields that determine module topology before loading a trainable-delta
+    # checkpoint. Training configs can evolve after a run; rebuilding from a newer
+    # config would otherwise drop learned LUNA layers or create adapter size
+    # mismatches. Runtime sampling overrides are applied by the caller afterwards.
+    for key in (
+        "learn_pred_depth_scale",
+        "dataset_depth_scale_mode",
+        "dataset_depth_scales",
+        "depth_residual_mode",
+        "depth_residual_hidden",
+        "depth_residual_max_log",
+        "depth_residual_frames_chunk_size",
+        "depth_residual_use_checkpoint",
+        "store_depth_residual_debug",
+        "luna_patch_layers",
+        "luna_camera_layers",
+        "enable_pano_global_token",
+        "enable_pano_geometry_residual",
+        "enable_camera_head",
+        "dense_head_frames_chunk_size",
+        "dense_head_use_checkpoint",
+        "dense_head_return_confidence",
+    ):
         if key in ckpt_args and ckpt_args[key] is not None:
             setattr(args, key, ckpt_args[key])
     for key in ("window_size", "patch_size", "num_yaw", "pitch_degrees", "fov_degrees"):
@@ -437,7 +449,8 @@ def evaluate_run(
     progress_context: dict[str, Any] | None = None,
     camera_pose_trans_norm_thresh: float = 1e-2,
     camera_eval_max_panos: int = 3,
-    erp_latitude_limit_deg: float = 75.0,
+    print_each_sample: bool = True,
+    exact_group_manifest: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if int(num_shards) < 1:
         raise ValueError(f"num_shards must be >= 1, got {num_shards}")
@@ -450,6 +463,8 @@ def evaluate_run(
     eval_args.dataset_max_samples = None
     pano_size = (eval_args.pano_height, eval_args.pano_width) if eval_args.pano_height > 0 and eval_args.pano_width > 0 else None
     dataset = build_dataset(eval_args, pano_size)
+    if exact_group_manifest is not None:
+        apply_exact_group_manifest(dataset, exact_group_manifest)
     indices, sampling_info = select_eval_indices(dataset, limit, seed, sample_policy, limit_fraction=limit_fraction)
     selected_indices = indices[int(shard_rank) :: int(num_shards)]
     write_eval_progress(
@@ -543,16 +558,6 @@ def evaluate_run(
                     band_fraction=eval_args.overlap_band_fraction,
                 )
                 depth_metrics = compute_depth_metrics(pred_depth_base, target_depth, target_valid)
-                erp_metrics = compute_covered_erp_depth_metrics(
-                    pred_window_z=pred_depth_base,
-                    gt_erp_depth=moved["pano_depth"],
-                    source_depth_semantics=eval_args.gt_depth_semantics,
-                    max_range_depth=eval_args.depth_max_m,
-                    camera_meta=predictions["pano_camera_meta"],
-                    token_meta=predictions["pano_token_meta"],
-                    latitude_limit_deg=float(erp_latitude_limit_deg),
-                    align_corners=True,
-                )
                 camera_scale = base_depth_scale.detach() * sample_depth_scale
                 with torch.autocast(device_type=device.type, enabled=False):
                     camera_losses = camera_alignment_loss(
@@ -655,7 +660,6 @@ def evaluate_run(
                 "sample_weight": scalar_float(batch.get("sample_weight"), default=1.0),
                 **pose_metrics,
                 **depth_metrics,
-                **erp_metrics,
             }
             for pair_row in pose_pair_rows:
                 pair_row.update(
@@ -677,6 +681,16 @@ def evaluate_run(
             if camera_pair_csv is not None:
                 append_csv_rows(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS, pose_pair_rows)
             processed = local_index + 1
+            if print_each_sample:
+                print(
+                    format_eval_sample_line(
+                        row,
+                        processed=processed,
+                        total=len(selected_indices),
+                        shard_rank=int(shard_rank),
+                    ),
+                    flush=True,
+                )
             if progress_file is not None and (processed == 1 or processed == len(selected_indices) or processed % max(int(progress_every), 1) == 0):
                 partial_camera_pose_summary = summarize_camera_pose_pairs(camera_pair_rows or [])
                 write_eval_progress(
@@ -691,10 +705,16 @@ def evaluate_run(
                         "shard_samples": len(selected_indices),
                         "processed_samples": processed,
                         "last_dataset_index": int(selected_indices[local_index]),
+                        "last_seq_name": row["seq_name"],
                         "last_loss": row["loss"],
+                        "last_loss_depth": row["loss_depth"],
+                        "last_loss_camera": row["loss_camera"],
+                        "last_depth_abs_rel": row["depth_abs_rel"],
+                        "last_depth_delta_1p25": row["depth_delta_1p25"],
+                        "last_depth_irls_scale": row["depth_irls_scale"],
                         "last_depth_irls_abs_rel": row["depth_irls_abs_rel"],
-                        "last_erp_depth_irls_abs_rel": row["erp_depth_irls_abs_rel"],
-                        "last_erp_coverage_fraction": row["erp_coverage_fraction"],
+                        "last_depth_irls_delta_1p25": row["depth_irls_delta_1p25"],
+                        "last_depth_irls_rmse": row["depth_irls_rmse"],
                         "last_camera_pose_pair_count": row["camera_pose_pair_count"],
                         "last_camera_pose_translation_deg_median": row["camera_pose_translation_deg_median"],
                         "last_camera_pose_rotation_deg_median": row["camera_pose_rotation_deg_median"],
@@ -737,8 +757,6 @@ def evaluate_run(
         ),
         "valid_fraction_summary": summarize_values([row["valid_fraction"] for row in rows]),
         "depth_metric_summary": summarize_metric_rows(rows, DEPTH_METRIC_KEYS),
-        "erp_depth_metric_summary": summarize_metric_rows(rows, ERP_DEPTH_METRIC_KEYS),
-        "erp_coverage_summary": summarize_metric_rows(rows, ERP_COVERAGE_KEYS),
         "panovggt_metric_summary": summarize_panovggt_rows(rows),
         "panovggt_camera_pose_summary": summarize_camera_pose_pairs(run_camera_pair_rows),
         "by_quality_bin": summarize_by_key(rows, "quality_bin", "loss"),
@@ -746,13 +764,11 @@ def evaluate_run(
             "by_loss": rank_samples(rows, "loss", reverse=False),
             "by_depth_irls_abs_rel": rank_samples(rows, "depth_irls_abs_rel", reverse=False),
             "by_depth_irls_delta_1p25": rank_samples(rows, "depth_irls_delta_1p25", reverse=True),
-            "by_erp_depth_irls_abs_rel": rank_samples(rows, "erp_depth_irls_abs_rel", reverse=False),
         },
         "worst_samples": {
             "by_loss": rank_samples(rows, "loss", reverse=True),
             "by_depth_irls_abs_rel": rank_samples(rows, "depth_irls_abs_rel", reverse=True),
             "by_depth_irls_delta_1p25": rank_samples(rows, "depth_irls_delta_1p25", reverse=False),
-            "by_erp_depth_irls_abs_rel": rank_samples(rows, "erp_depth_irls_abs_rel", reverse=True),
         },
     }
     write_eval_progress(
@@ -774,6 +790,44 @@ def evaluate_run(
     return result
 
 
+def apply_exact_group_manifest(dataset: Any, rows: list[dict[str, Any]]) -> None:
+    """Replace generated groups with the exact pano IDs listed in a CSV manifest."""
+    groups = getattr(dataset, "groups", None)
+    items = getattr(dataset, "items", None)
+    if groups is None or items is None:
+        raise TypeError("Exact group manifests require a dataset exposing items and groups")
+
+    pano_to_item: dict[str, int] = {}
+    for item_index, item in enumerate(items):
+        rgb_name = Path(str(item.get("rgb_path", ""))).name
+        match = re.search(r"camera_([0-9a-fA-F]{32})_", rgb_name)
+        if match:
+            pano_to_item[match.group(1).lower()] = item_index
+
+    exact_groups: list[list[int]] = []
+    for row_index, row in enumerate(rows):
+        pano_columns = sorted(
+            (key for key in row if key.startswith("pano_id_") and row.get(key)),
+            key=lambda key: int(key.rsplit("_", 1)[1]),
+        )
+        if not pano_columns:
+            raise ValueError(f"Manifest row {row_index} has no pano_id_N columns")
+        pano_ids = [str(row[key]).strip().lower() for key in pano_columns]
+        missing = [pano_id for pano_id in pano_ids if pano_id not in pano_to_item]
+        if missing:
+            raise KeyError(f"Manifest row {row_index} references missing pano IDs: {missing}")
+        group = [pano_to_item[pano_id] for pano_id in pano_ids]
+        scene_keys = {_item_scene_group_key(items[item_index]) for item_index in group}
+        if len(scene_keys) != 1:
+            raise RuntimeError(
+                f"Manifest row {row_index} crosses scenes: pano_ids={pano_ids} scene_keys={sorted(scene_keys)}"
+            )
+        exact_groups.append(group)
+
+    dataset.groups = exact_groups
+    dataset.preserve_exact_group_duplicates = True
+
+
 def write_eval_progress(path: Path | None, payload: dict[str, Any]) -> None:
     if path is None:
         return
@@ -790,71 +844,41 @@ def write_eval_progress(path: Path | None, payload: dict[str, Any]) -> None:
     tmp_path.replace(path)
 
 
-def compute_covered_erp_depth_metrics(
+def format_eval_sample_line(
+    row: dict[str, Any],
     *,
-    pred_window_z: torch.Tensor,
-    gt_erp_depth: torch.Tensor,
-    source_depth_semantics: str,
-    max_range_depth: float,
-    camera_meta: dict[str, torch.Tensor],
-    token_meta: dict[str, torch.Tensor],
-    latitude_limit_deg: float,
-    align_corners: bool,
-) -> dict[str, float]:
-    """Compute ERP metrics on the deterministic window-coverage common mask."""
-    gt_range = erp_depth_to_range_depth(gt_erp_depth.detach().float(), source_depth_semantics)
-    if gt_range.ndim == 5 and gt_range.shape[2] == 1:
-        gt_range = gt_range[:, :, 0]
-    if gt_range.ndim != 4:
-        raise ValueError(f"Expected GT ERP depth [B,N,H,W], got {tuple(gt_range.shape)}")
-    batch, num_panos, erp_height, erp_width = gt_range.shape
-    pano_ids = token_meta.get("pano_id")
-    if pano_ids is None:
-        views = pred_window_z.shape[1]
-        if views % num_panos != 0:
-            raise ValueError(f"Cannot infer view-to-pano mapping for {views} views and {num_panos} panos")
-        pano_ids = (
-            torch.arange(num_panos, device=pred_window_z.device)
-            .repeat_interleave(views // num_panos)
-            .unsqueeze(0)
-            .expand(batch, -1)
-        )
-    elif pano_ids.ndim == 3:
-        pano_ids = pano_ids[..., 0]
-
-    splatted = splat_window_z_depth_to_erp(
-        pred_window_z,
-        yaw=camera_meta["yaw"],
-        pitch=camera_meta["pitch"],
-        fov_x=camera_meta["fov_x"],
-        fov_y=camera_meta["fov_y"],
-        view_pano_index=pano_ids,
-        num_panos=num_panos,
-        erp_height=erp_height,
-        erp_width=erp_width,
-        align_corners=align_corners,
+    processed: int,
+    total: int,
+    shard_rank: int,
+) -> str:
+    pair_count = int(float(row.get("camera_pose_pair_count", 0) or 0))
+    t_deg = format_eval_number(row.get("camera_pose_translation_deg_median")) if pair_count else "NA"
+    r_deg = format_eval_number(row.get("camera_pose_rotation_deg_median")) if pair_count else "NA"
+    seq_name = "_".join(str(row.get("seq_name", "unknown")).split())
+    return (
+        f"[EVAL-SAMPLE] shard={shard_rank} run={row.get('run', 'unknown')} "
+        f"step={processed}/{total} index={row.get('dataset_index', -1)} "
+        f"panos={row.get('input_pano_count', 0)} "
+        f"loss={format_eval_number(row.get('loss'))} "
+        f"depth_loss={format_eval_number(row.get('loss_depth'))} "
+        f"camera_loss={format_eval_number(row.get('loss_camera'))} "
+        f"raw_absrel={format_eval_number(row.get('depth_abs_rel'))} "
+        f"raw_delta1={format_eval_number(row.get('depth_delta_1p25'))} "
+        f"irls_scale={format_eval_number(row.get('depth_irls_scale'))} "
+        f"irls_absrel={format_eval_number(row.get('depth_irls_abs_rel'))} "
+        f"irls_delta1={format_eval_number(row.get('depth_irls_delta_1p25'))} "
+        f"irls_rmse={format_eval_number(row.get('depth_irls_rmse'))} "
+        f"pose_pairs={pair_count} t_med_deg={t_deg} r_med_deg={r_deg} "
+        f"seq={seq_name}"
     )
-    lat_limit = min(max(float(latitude_limit_deg), 0.0), 90.0)
-    row_latitudes = 90.0 - (torch.arange(erp_height, device=gt_range.device) + 0.5) * 180.0 / erp_height
-    latitude_mask = (row_latitudes.abs() <= lat_limit).reshape(1, 1, erp_height, 1)
-    latitude_mask = latitude_mask.expand(batch, num_panos, erp_height, erp_width)
-    gt_valid = torch.isfinite(gt_range) & (gt_range > 0.0)
-    if float(max_range_depth) > 0:
-        gt_valid &= gt_range <= float(max_range_depth)
-    coverage_mask = splatted["coverage_mask"] & latitude_mask
-    # Keep the evaluation mask method-independent. Pixels covered by the fixed
-    # window geometry and valid in GT stay in the metric even when a model
-    # emits an invalid prediction; the splat represents those failures as zero.
-    common_mask = coverage_mask & gt_valid
 
-    depth_metrics = compute_depth_metrics(splatted["depth"], gt_range, common_mask)
-    latitude_pixels = latitude_mask.sum().clamp_min(1)
-    gt_eval_pixels = (gt_valid & latitude_mask).sum().clamp_min(1)
-    return {
-        "erp_coverage_fraction": float(coverage_mask.sum().float().div(latitude_pixels).cpu()),
-        "erp_common_valid_fraction": float(common_mask.sum().float().div(gt_eval_pixels).cpu()),
-        **{f"erp_{key}": value for key, value in depth_metrics.items()},
-    }
+
+def format_eval_number(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "NA"
+    return f"{number:.6g}" if math.isfinite(number) else "NA"
 
 
 def compute_depth_metrics(pred_depth: torch.Tensor, target_depth: torch.Tensor, target_valid: torch.Tensor) -> dict[str, float]:

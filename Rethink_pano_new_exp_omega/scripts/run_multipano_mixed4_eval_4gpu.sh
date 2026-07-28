@@ -17,7 +17,7 @@ EVAL_DATASETS="${EVAL_DATASETS:-all}"
 NUM_WORKERS_PER_GPU="${NUM_WORKERS_PER_GPU:-2}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
 SEED="${SEED:-123}"
-PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
+PROGRESS_EVERY="${PROGRESS_EVERY:-1}"
 PROGRESS_INTERVAL_SECONDS="${PROGRESS_INTERVAL_SECONDS:-30}"
 SHOW_PROGRESS="${SHOW_PROGRESS:-1}"
 PROGRESS_STYLE="${PROGRESS_STYLE:-bar}"
@@ -27,8 +27,9 @@ SAMPLE_POLICY="${SAMPLE_POLICY:-anchor}"
 PANO_COUNT_POLICY="${PANO_COUNT_POLICY:-panovggt}"
 DATASET_PANO_COUNTS="${DATASET_PANO_COUNTS:-}"
 CAMERA_EVAL_MAX_PANOS="${CAMERA_EVAL_MAX_PANOS:-3}"
-NUM_YAW="${NUM_YAW:-8}"
-ERP_LATITUDE_LIMIT_DEG="${ERP_LATITUDE_LIMIT_DEG:-75}"
+WINDOW_SIZE="${WINDOW_SIZE:-384}"
+NUM_YAW="${NUM_YAW:-4}"
+PRINT_EACH_SAMPLE="${PRINT_EACH_SAMPLE:-1}"
 
 mkdir -p "$EVAL_OUT/shards" "$EVAL_OUT/progress"
 rm -f "$EVAL_OUT"/progress/shard_*.json
@@ -76,8 +77,9 @@ fi
   echo "[eval-4gpu] sample_policy=$SAMPLE_POLICY"
   echo "[eval-4gpu] pano_count_policy=$PANO_COUNT_POLICY"
   echo "[eval-4gpu] camera_eval_max_panos=$CAMERA_EVAL_MAX_PANOS"
+  echo "[eval-4gpu] window_size=$WINDOW_SIZE"
   echo "[eval-4gpu] num_yaw=$NUM_YAW"
-  echo "[eval-4gpu] erp_latitude_limit_deg=$ERP_LATITUDE_LIMIT_DEG"
+  echo "[eval-4gpu] print_each_sample=$PRINT_EACH_SAMPLE"
   echo "[eval-4gpu] progress_interval_seconds=$PROGRESS_INTERVAL_SECONDS"
   echo "[eval-4gpu] progress_style=$PROGRESS_STYLE"
 } | tee "$EVAL_OUT/eval_4gpu.log"
@@ -87,6 +89,10 @@ fi
 
 cd "$LUNA"
 PIDS=()
+sample_output_args=(--print-each-sample)
+if [[ "$PRINT_EACH_SAMPLE" != "1" ]]; then
+  sample_output_args=(--no-print-each-sample)
+fi
 trap 'echo "[eval-4gpu] interrupted; terminating shard processes" | tee -a "$EVAL_OUT/eval_4gpu.log"; for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done' INT TERM
 for rank in "${!GPU_LIST[@]}"; do
   gpu="${GPU_LIST[$rank]}"
@@ -136,8 +142,8 @@ PY
       --pano-count-policy "$PANO_COUNT_POLICY" \
       --dataset-pano-counts "$DATASET_PANO_COUNTS" \
       --camera-eval-max-panos "$CAMERA_EVAL_MAX_PANOS" \
+      --window-size "$WINDOW_SIZE" \
       --num-yaw "$NUM_YAW" \
-      --erp-latitude-limit-deg "$ERP_LATITUDE_LIMIT_DEG" \
       --device cuda \
       --num-workers "$NUM_WORKERS_PER_GPU" \
       --amp-dtype "$AMP_DTYPE" \
@@ -146,8 +152,12 @@ PY
       --shard-rank "$rank" \
       --progress-file "$progress_file" \
       --progress-every "$PROGRESS_EVERY" \
+      "${sample_output_args[@]}" \
       --no-progress
-  ) >"$shard_log" 2>&1 &
+  ) > >(
+    tee "$shard_log" |
+      awk -v prefix="[eval-4gpu][shard=$rank] " '/^\[EVAL-SAMPLE\]/{print prefix $0; fflush()}'
+  ) 2>&1 &
   child_pid="$!"
   PIDS+=("$child_pid")
   "$PYTHON" - "$progress_file" "$child_pid" <<'PY'
@@ -195,8 +205,29 @@ processed_total = 0
 sample_total = 0
 active_runs = []
 started_at_values = []
-last_losses = []
+latest_samples = []
 states = []
+
+def sample_metric_text(payload):
+    fields = (
+        ("loss", "last_loss"),
+        ("depth", "last_loss_depth"),
+        ("camera", "last_loss_camera"),
+        ("raw_absrel", "last_depth_abs_rel"),
+        ("irls_absrel", "last_depth_irls_abs_rel"),
+        ("delta1", "last_depth_irls_delta_1p25"),
+        ("t_med_deg", "last_camera_pose_translation_deg_median"),
+        ("r_med_deg", "last_camera_pose_rotation_deg_median"),
+    )
+    parts = []
+    for label, key in fields:
+        if label in {"t_med_deg", "r_med_deg"} and int(payload.get("last_camera_pose_pair_count", 0) or 0) <= 0:
+            continue
+        value = payload.get(key)
+        if isinstance(value, (float, int)):
+            parts.append(f"{label}={float(value):.4g}")
+    return " ".join(parts)
+
 for rank in range(num_shards):
     path = os.path.join(progress_dir, f"shard_{rank}.json")
     if not os.path.exists(path):
@@ -213,16 +244,17 @@ for rank in range(num_shards):
     total = int(payload.get("shard_samples", 0) or 0)
     gpu = payload.get("cuda_visible_devices", "")
     pid = payload.get("pid", "")
-    age = now - float(payload.get("updated_at", now) or now)
-    loss = payload.get("last_loss")
-    loss_text = f" loss={float(loss):.4g}" if isinstance(loss, (float, int)) else ""
-    items.append(f"rank{rank}@gpu{gpu}:pid={pid} {state} {run} {done}/{total} age={age:.0f}s{loss_text}")
+    updated_at = float(payload.get("updated_at", now) or now)
+    age = now - updated_at
+    metrics_text = sample_metric_text(payload)
+    metrics_text = f" {metrics_text}" if metrics_text else ""
+    items.append(f"rank{rank}@gpu{gpu}:pid={pid} {state} {run} {done}/{total} age={age:.0f}s{metrics_text}")
     processed_total += done
     sample_total += total
     if run not in ("", "-"):
         active_runs.append(str(run))
-    if isinstance(loss, (float, int)):
-        last_losses.append(float(loss))
+    if payload.get("last_dataset_index") is not None:
+        latest_samples.append((updated_at, payload))
     states.append(str(state))
     started_at = payload.get("started_at")
     if isinstance(started_at, (float, int)):
@@ -243,11 +275,16 @@ elapsed = now - min(started_at_values) if started_at_values else 0.0
 rate = processed_total / elapsed if elapsed > 0 and processed_total > 0 else 0.0
 remaining = (sample_total - processed_total) / rate if rate > 0 and sample_total > processed_total else 0.0
 eta_text = f"{remaining/60:.1f}m" if remaining >= 60 else f"{remaining:.0f}s"
-loss_text = f", loss={last_losses[-1]:.4g}" if last_losses else ""
+latest_text = ""
+if latest_samples:
+    latest_payload = max(latest_samples, key=lambda item: item[0])[1]
+    latest_metrics = sample_metric_text(latest_payload)
+    if latest_metrics:
+        latest_text = ", " + latest_metrics.replace(" ", ", ")
 state_text = "done" if states and all(state == "done" for state in states) else ("init" if not sample_total else "running")
 print(
     f"Eval {run_label}: {percent:5.1f}%|{bar}| {processed_total}/{sample_total} "
-    f"[{elapsed/60:.1f}m<{eta_text}, {rate:.2f} samples/s, state={state_text}{loss_text}]"
+    f"[{elapsed/60:.1f}m<{eta_text}, {rate:.2f} samples/s, state={state_text}{latest_text}]"
 )
 PY
 )"
@@ -293,15 +330,38 @@ if [[ "$status" -ne 0 ]]; then
 fi
 
 echo "[eval-4gpu] merging shards $(date --iso-8601=seconds)" | tee -a "$EVAL_OUT/eval_4gpu.log"
-PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/merge_mixed4_eval_shards.py \
-  --shard-json "$EVAL_OUT"/shards/shard_*.json \
-  --shard-csv "$EVAL_OUT"/shards/shard_*.csv \
-  --shard-camera-csv "$EVAL_OUT"/shards/shard_*_camera_pairs.csv \
+SHARD_JSONS=()
+SHARD_CSVS=()
+SHARD_CAMERA_CSVS=()
+for rank in "${!GPU_LIST[@]}"; do
+  shard_json="$EVAL_OUT/shards/shard_${rank}.json"
+  shard_csv="$EVAL_OUT/shards/shard_${rank}.csv"
+  shard_camera_csv="$EVAL_OUT/shards/shard_${rank}_camera_pairs.csv"
+  for required_file in "$shard_json" "$shard_csv" "$shard_camera_csv"; do
+    if [[ ! -s "$required_file" ]]; then
+      echo "[eval-4gpu] missing shard output before merge: $required_file" | tee -a "$EVAL_OUT/eval_4gpu.log"
+      exit 1
+    fi
+  done
+  SHARD_JSONS+=("$shard_json")
+  SHARD_CSVS+=("$shard_csv")
+  SHARD_CAMERA_CSVS+=("$shard_camera_csv")
+done
+
+MERGE_LOG="$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_console.log"
+if ! PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/merge_mixed4_eval_shards.py \
+  --shard-json "${SHARD_JSONS[@]}" \
+  --shard-csv "${SHARD_CSVS[@]}" \
+  --shard-camera-csv "${SHARD_CAMERA_CSVS[@]}" \
   --output "$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_summary.json" \
   --per-sample-csv "$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_per_sample.csv" \
   --camera-pair-csv "$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_camera_pairs.csv" \
   --train-loss-csv "$TRAIN_LOSS_CSV" \
-  > "$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_console.log" 2>&1
+  > "$MERGE_LOG" 2>&1; then
+  echo "[eval-4gpu] shard merge failed; tail of $MERGE_LOG:" | tee -a "$EVAL_OUT/eval_4gpu.log"
+  tail -n 80 "$MERGE_LOG" | tee -a "$EVAL_OUT/eval_4gpu.log"
+  exit 1
+fi
 
 SUMMARY_JSON="$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_summary.json"
 PER_SAMPLE_CSV="$EVAL_OUT/validation_mixed4_by_dataset_valtestfull_per_sample.csv"
