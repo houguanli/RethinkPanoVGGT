@@ -28,6 +28,8 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(GIT_ROOT) not in sys.path:
     sys.path.insert(0, str(GIT_ROOT))
 
+from evaluation_common.erp_depth import splat_window_z_depth_to_erp  # noqa: E402
+
 from training.train_pano_omega import (  # noqa: E402
     DepthPredictionAdapter,
     adjacent_edge_overlap_loss,
@@ -47,6 +49,7 @@ from training.train_pano_omega import (  # noqa: E402
     normalize_training_stages,
     parse_dataset_depth_scales,
     parse_args as parse_training_args,
+    erp_depth_to_range_depth,
     resolve_device,
     sample_depth_targets,
     set_seed,
@@ -55,6 +58,46 @@ from training.train_pano_omega import (  # noqa: E402
     unwrap_model,
 )
 from vggt_omega.utils.rotation import mat_to_quat, quat_to_mat  # noqa: E402
+from vggt_omega.models.layers.pano_position import pinhole_rays, yaw_pitch_to_axes  # noqa: E402
+
+
+DEPTH_METRIC_PROTOCOL = "dual_covered_sphere_and_erp_polar_prior_v1"
+_SPHERICAL_WEIGHT_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
+
+# Median of per-panorama polar-cap medians from 100 deterministic samples per
+# dataset (seed 20260728, |latitude| >= 75 degrees). A missing value means the
+# cap was overwhelmingly invalid/Inf and is intentionally not imputed.
+ERP_POLAR_PRIOR_SOURCE = "mixed4_polar_depth_100_seed20260728"
+ERP_POLAR_PRIOR_LATITUDE_DEG = 75.0
+ERP_POLAR_DEPTH_PRIORS_M = {
+    "Panocity": {"north": None, "south": 10.039999961853027},
+    "Matterport3D": {"north": None, "south": None},
+    "Stanford2D3DS": {"north": 1.3974609375, "south": 1.380859375},
+    "Structured3D": {"north": 1.2009999752044678, "south": 1.543000042438507},
+}
+
+
+def canonical_eval_dataset_name(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "").replace("_", "")
+    aliases = {
+        "panocity": "Panocity",
+        "matterport3d": "Matterport3D",
+        "stanford2d3ds": "Stanford2D3DS",
+        "structured3d": "Structured3D",
+    }
+    return aliases.get(normalized, str(value or "unknown"))
+
+
+def erp_polar_prior_metadata() -> dict[str, Any]:
+    return {
+        "source": ERP_POLAR_PRIOR_SOURCE,
+        "sample_count_per_dataset": 100,
+        "latitude_threshold_degrees": ERP_POLAR_PRIOR_LATITUDE_DEG,
+        "values_m": ERP_POLAR_DEPTH_PRIORS_M,
+        "scale_fit_domain": "valid window-covered ERP pixels only",
+        "fill_domain": "uncovered GT-valid polar pixels with a non-null dataset/cap prior",
+        "pixel_weighting": "uniform ERP pixels",
+    }
 
 
 DEPTH_METRIC_KEYS = [
@@ -87,6 +130,14 @@ DEPTH_ACCUMULATOR_KEYS = [
     "depth_irls_delta_1p25_count",
     "depth_irls_delta_1p25_2_count",
     "depth_irls_delta_1p25_3_count",
+]
+
+ERP_PRIOR_DEPTH_METRIC_KEYS = [f"erp_prior_{key}" for key in DEPTH_METRIC_KEYS]
+ERP_PRIOR_DEPTH_ACCUMULATOR_KEYS = [f"erp_prior_{key}" for key in DEPTH_ACCUMULATOR_KEYS]
+ERP_PRIOR_COVERAGE_KEYS = [
+    "erp_window_coverage_fraction",
+    "erp_prior_fill_fraction",
+    "erp_evaluated_gt_fraction",
 ]
 
 PANOVGGT_PRIMARY_METRICS = [
@@ -143,8 +194,12 @@ PER_SAMPLE_CSV_FIELDS = [
     "metadata_valid_ratio",
     "metadata_structure_score",
     "sample_weight",
+    "depth_metric_protocol",
     *DEPTH_METRIC_KEYS,
     *DEPTH_ACCUMULATOR_KEYS,
+    *ERP_PRIOR_DEPTH_METRIC_KEYS,
+    *ERP_PRIOR_DEPTH_ACCUMULATOR_KEYS,
+    *ERP_PRIOR_COVERAGE_KEYS,
 ]
 
 CAMERA_PAIR_CSV_FIELDS = [
@@ -297,6 +352,14 @@ def main() -> None:
         "seed": args.seed,
         "device": str(device),
         "dataset_root": str(train_args.dataset_root),
+        "depth_evaluation_domain": "covered_sphere_sampled_pinhole_windows",
+        "depth_evaluation_domains": {
+            "covered_sphere": "sampled pinhole windows with solid-angle weights and overlap de-duplication",
+            "erp_with_polar_prior": "uniform ERP pixels after window splat and stable-cap prior completion",
+        },
+        "depth_metric_protocol": DEPTH_METRIC_PROTOCOL,
+        "depth_pixel_weighting": "pinhole_solid_angle_divided_by_same_pano_window_coverage_count",
+        "erp_polar_prior": erp_polar_prior_metadata(),
         "sampler": {
             "window_size": int(train_args.window_size),
             "patch_size": int(train_args.patch_size),
@@ -516,11 +579,18 @@ def evaluate_run(
         for local_index, batch in enumerate(iterator):
             moved = move_batch_to_device(batch, device)
             sampler_model = unwrap_model(model)
-            target_depth, target_valid = sample_depth_targets(
+            target_depth, target_valid, target_camera_meta = sample_depth_targets(
                 sampler_model,
                 moved["pano_depth"],
                 source_depth_semantics=eval_args.gt_depth_semantics,
                 max_range_depth=eval_args.depth_max_m,
+                return_camera_meta=True,
+            )
+            spherical_weights = build_covered_sphere_weights(
+                target_camera_meta,
+                height=target_depth.shape[-3],
+                width=target_depth.shape[-2],
+                num_panos=int(moved["pano_image"].shape[1]),
             )
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                 predictions = model(
@@ -570,7 +640,24 @@ def evaluate_run(
                     sample_weight=moved.get("sample_weight") if eval_args.loss_sample_weighting else None,
                     band_fraction=eval_args.overlap_band_fraction,
                 )
-                depth_metrics = compute_depth_metrics(pred_depth_base, target_depth, target_valid)
+                depth_metrics = compute_depth_metrics(
+                    pred_depth_base,
+                    target_depth,
+                    target_valid,
+                    spherical_weights=spherical_weights,
+                )
+                erp_prior_metrics = compute_erp_prior_depth_metrics(
+                    pred_window_z=pred_depth_base,
+                    gt_erp_depth=moved["pano_depth"],
+                    source_depth_semantics=eval_args.gt_depth_semantics,
+                    max_range_depth=eval_args.depth_max_m,
+                    camera_meta=target_camera_meta,
+                    dataset_name=canonical_eval_dataset_name(
+                        (row_context or {}).get("dataset")
+                        or getattr(eval_args, "minimal_datasets", "unknown")
+                    ),
+                    align_corners=False,
+                )
                 camera_scale = base_depth_scale.detach() * sample_depth_scale
                 with torch.autocast(device_type=device.type, enabled=False):
                     camera_losses = camera_alignment_loss(
@@ -671,8 +758,10 @@ def evaluate_run(
                 "metadata_valid_ratio": scalar_float(batch.get("metadata_valid_ratio")),
                 "metadata_structure_score": scalar_float(batch.get("metadata_structure_score")),
                 "sample_weight": scalar_float(batch.get("sample_weight"), default=1.0),
+                "depth_metric_protocol": DEPTH_METRIC_PROTOCOL,
                 **pose_metrics,
                 **depth_metrics,
+                **erp_prior_metrics,
             }
             for pair_row in pose_pair_rows:
                 pair_row.update(
@@ -773,6 +862,8 @@ def evaluate_run(
         ),
         "valid_fraction_summary": summarize_values([row["valid_fraction"] for row in rows]),
         "depth_metric_summary": summarize_metric_rows(rows, DEPTH_METRIC_KEYS),
+        "erp_prior_depth_metric_summary": summarize_metric_rows(rows, ERP_PRIOR_DEPTH_METRIC_KEYS),
+        "erp_prior_coverage_summary": summarize_metric_rows(rows, ERP_PRIOR_COVERAGE_KEYS),
         "panovggt_metric_summary": summarize_panovggt_rows(rows),
         "panovggt_camera_pose_summary": summarize_camera_pose_pairs(run_camera_pair_rows),
         "by_quality_bin": summarize_by_key(rows, "quality_bin", "loss"),
@@ -884,6 +975,9 @@ def format_eval_sample_line(
         f"irls_absrel={format_eval_number(row.get('depth_irls_abs_rel'))} "
         f"irls_delta1={format_eval_number(row.get('depth_irls_delta_1p25'))} "
         f"irls_rmse={format_eval_number(row.get('depth_irls_rmse'))} "
+        f"erp_absrel={format_eval_number(row.get('erp_prior_depth_irls_abs_rel'))} "
+        f"erp_delta1={format_eval_number(row.get('erp_prior_depth_irls_delta_1p25'))} "
+        f"erp_eval={format_eval_number(row.get('erp_evaluated_gt_fraction'))} "
         f"pose_pairs={pair_count} t_med_deg={t_deg} r_med_deg={r_deg} "
         f"seq={seq_name}"
     )
@@ -897,7 +991,184 @@ def format_eval_number(value: Any) -> str:
     return f"{number:.6g}" if math.isfinite(number) else "NA"
 
 
-def compute_depth_metrics(pred_depth: torch.Tensor, target_depth: torch.Tensor, target_valid: torch.Tensor) -> dict[str, float]:
+def build_covered_sphere_weights(
+    camera_meta: dict[str, torch.Tensor],
+    *,
+    height: int,
+    width: int,
+    num_panos: int,
+) -> torch.Tensor:
+    """Build equal-solid-angle weights without double-counting overlap."""
+    yaw = camera_meta["yaw"]
+    pitch = camera_meta["pitch"]
+    fov_x = camera_meta["fov_x"]
+    fov_y = camera_meta["fov_y"]
+    if yaw.ndim != 2 or pitch.shape != yaw.shape or fov_x.shape != yaw.shape or fov_y.shape != yaw.shape:
+        raise ValueError("Expected flattened camera metadata with shape [batch, total_views]")
+    batch_size, total_views = yaw.shape
+    if num_panos < 1 or total_views % num_panos != 0:
+        raise ValueError(f"Cannot split {total_views} views across {num_panos} panoramas")
+    views_per_pano = total_views // num_panos
+    grouped = [value.reshape(batch_size, num_panos, views_per_pano) for value in (yaw, pitch, fov_x, fov_y)]
+    output: list[torch.Tensor] = []
+    for batch_index in range(batch_size):
+        pano_weights: list[torch.Tensor] = []
+        for pano_index in range(num_panos):
+            params = tuple(value[batch_index, pano_index] for value in grouped)
+            pano_weights.append(_covered_sphere_weights_for_view_set(*params, height=height, width=width))
+        output.append(torch.cat(pano_weights, dim=0))
+    return torch.stack(output, dim=0)[..., None]
+
+
+def _covered_sphere_weights_for_view_set(
+    yaw: torch.Tensor,
+    pitch: torch.Tensor,
+    fov_x: torch.Tensor,
+    fov_y: torch.Tensor,
+    *,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    key = (
+        str(yaw.device),
+        str(yaw.dtype),
+        int(height),
+        int(width),
+        tuple(round(float(value), 8) for value in yaw.detach().cpu()),
+        tuple(round(float(value), 8) for value in pitch.detach().cpu()),
+        tuple(round(float(value), 8) for value in fov_x.detach().cpu()),
+        tuple(round(float(value), 8) for value in fov_y.detach().cpu()),
+    )
+    cached = _SPHERICAL_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    metric_dtype = torch.float32
+    yaw = yaw.to(dtype=metric_dtype)
+    pitch = pitch.to(dtype=metric_dtype)
+    fov_x = fov_x.to(dtype=metric_dtype)
+    fov_y = fov_y.to(dtype=metric_dtype)
+    rays = pinhole_rays(
+        yaw,
+        pitch,
+        fov_x,
+        fov_y,
+        height,
+        width,
+        device=yaw.device,
+        dtype=metric_dtype,
+    )
+    forward, right, up = yaw_pitch_to_axes(yaw, pitch)
+
+    # For the gnomonic plane used by pinhole_rays,
+    # dOmega = dx dy / (1 + x^2 + y^2)^(3/2).
+    local_forward = torch.einsum("vhwc,vc->vhw", rays, forward).clamp_min(0.0)
+    tan_x = torch.tan(fov_x * 0.5)
+    tan_y = torch.tan(fov_y * 0.5)
+    solid_angle = tan_x[:, None, None] * tan_y[:, None, None] * local_forward.pow(3)
+
+    ray_flat = rays.reshape(-1, 3)
+    z = ray_flat @ forward.transpose(0, 1)
+    x = ray_flat @ right.transpose(0, 1)
+    y = ray_flat @ up.transpose(0, 1)
+    inside = (
+        (z > 1e-7)
+        & (x.abs() <= z * tan_x[None, :] + 1e-6)
+        & (y.abs() <= z * tan_y[None, :] + 1e-6)
+    )
+    coverage_count = inside.sum(dim=-1).reshape_as(solid_angle).clamp_min(1)
+    weights = (solid_angle / coverage_count).detach()
+    _SPHERICAL_WEIGHT_CACHE[key] = weights
+    return weights
+
+
+def compute_erp_prior_depth_metrics(
+    *,
+    pred_window_z: torch.Tensor,
+    gt_erp_depth: torch.Tensor,
+    source_depth_semantics: str,
+    max_range_depth: float,
+    camera_meta: dict[str, torch.Tensor],
+    dataset_name: str,
+    align_corners: bool,
+) -> dict[str, float]:
+    """Fuse windows into ERP and complete only statistically stable polar caps."""
+    gt_range = erp_depth_to_range_depth(gt_erp_depth.detach().float(), source_depth_semantics)
+    if gt_range.ndim == 5 and gt_range.shape[2] == 1:
+        gt_range = gt_range[:, :, 0]
+    if gt_range.ndim != 4:
+        raise ValueError(f"Expected GT ERP depth [B,N,H,W], got {tuple(gt_range.shape)}")
+    batch, num_panos, erp_height, erp_width = gt_range.shape
+    views = int(pred_window_z.shape[1])
+    if num_panos < 1 or views % num_panos != 0:
+        raise ValueError(f"Cannot map {views} windows to {num_panos} panoramas")
+    view_pano_index = (
+        torch.arange(num_panos, device=pred_window_z.device)
+        .repeat_interleave(views // num_panos)
+        .unsqueeze(0)
+        .expand(batch, -1)
+    )
+    splatted = splat_window_z_depth_to_erp(
+        pred_window_z,
+        yaw=camera_meta["yaw"],
+        pitch=camera_meta["pitch"],
+        fov_x=camera_meta["fov_x"],
+        fov_y=camera_meta["fov_y"],
+        view_pano_index=view_pano_index,
+        num_panos=num_panos,
+        erp_height=erp_height,
+        erp_width=erp_width,
+        align_corners=align_corners,
+    )
+    gt_valid = torch.isfinite(gt_range) & (gt_range > 0.0)
+    if float(max_range_depth) > 0:
+        gt_valid &= gt_range <= float(max_range_depth)
+    window_mask = splatted["valid_mask"] & gt_valid
+
+    row_latitudes = 90.0 - (
+        torch.arange(erp_height, device=gt_range.device, dtype=torch.float32) + 0.5
+    ) * 180.0 / float(erp_height)
+    north = (row_latitudes >= ERP_POLAR_PRIOR_LATITUDE_DEG).reshape(1, 1, erp_height, 1)
+    south = (row_latitudes <= -ERP_POLAR_PRIOR_LATITUDE_DEG).reshape(1, 1, erp_height, 1)
+    priors = ERP_POLAR_DEPTH_PRIORS_M.get(str(dataset_name), {"north": None, "south": None})
+    prior_depth = torch.zeros_like(gt_range)
+    prior_available = torch.zeros_like(gt_valid)
+    for cap_mask, cap_name in ((north, "north"), (south, "south")):
+        prior = priors.get(cap_name)
+        if prior is None:
+            continue
+        expanded = cap_mask.expand_as(gt_valid)
+        prior_depth = torch.where(expanded, prior_depth.new_tensor(float(prior)), prior_depth)
+        prior_available |= expanded
+
+    # Priors complete only geometry not observed by a valid window prediction.
+    prior_fill_mask = prior_available & ~splatted["valid_mask"] & gt_valid
+    completed_pred = torch.where(prior_fill_mask, prior_depth, splatted["depth"])
+    eval_mask = window_mask | prior_fill_mask
+    metrics = compute_depth_metrics(
+        completed_pred,
+        gt_range,
+        eval_mask,
+        alignment_valid=window_mask,
+        alignment_scale_exempt=prior_fill_mask,
+    )
+    gt_valid_count = gt_valid.sum().clamp_min(1).float()
+    return {
+        **{f"erp_prior_{key}": value for key, value in metrics.items()},
+        "erp_window_coverage_fraction": float(window_mask.sum().float().div(gt_valid_count).cpu()),
+        "erp_prior_fill_fraction": float(prior_fill_mask.sum().float().div(gt_valid_count).cpu()),
+        "erp_evaluated_gt_fraction": float(eval_mask.sum().float().div(gt_valid_count).cpu()),
+    }
+
+
+def compute_depth_metrics(
+    pred_depth: torch.Tensor,
+    target_depth: torch.Tensor,
+    target_valid: torch.Tensor,
+    spherical_weights: torch.Tensor | None = None,
+    alignment_valid: torch.Tensor | None = None,
+    alignment_scale_exempt: torch.Tensor | None = None,
+) -> dict[str, float]:
     pred = pred_depth.detach().float()
     target = target_depth.detach().float()
     valid = (
@@ -927,15 +1198,66 @@ def compute_depth_metrics(pred_depth: torch.Tensor, target_depth: torch.Tensor, 
         }
     pred_values = pred[valid].clamp_min(1e-6)
     target_values = target[valid].clamp_min(1e-6)
-    raw_metrics = depth_metrics_from_values(pred_values, target_values, prefix="depth")
-    irls_scale = fit_irls_scale(pred_values, target_values)
-    aligned_metrics = depth_metrics_from_values(pred_values * irls_scale, target_values, prefix="depth_irls")
+    if spherical_weights is None:
+        metric_weights = torch.ones_like(pred_values)
+    else:
+        weights = spherical_weights.detach().float()
+        if weights.shape != pred.shape:
+            raise ValueError(f"Spherical weight shape {tuple(weights.shape)} does not match depth {tuple(pred.shape)}")
+        metric_weights = weights[valid].clamp_min(0.0)
+    # Existing micro summaries divide accumulator values by valid pixels. Keep
+    # that denominator while preserving the relative spherical weights.
+    metric_weights = metric_weights * (float(metric_weights.numel()) / metric_weights.sum().clamp_min(1e-12))
+    raw_metrics = depth_metrics_from_values(pred_values, target_values, prefix="depth", weights=metric_weights)
+    if alignment_valid is None:
+        alignment_mask = valid
+    else:
+        alignment_mask = (
+            alignment_valid.detach().bool()
+            & torch.isfinite(pred)
+            & torch.isfinite(target)
+            & (pred > 0)
+            & (target > 0)
+        )
+    if alignment_mask.any():
+        alignment_pred = pred[alignment_mask].clamp_min(1e-6)
+        alignment_target = target[alignment_mask].clamp_min(1e-6)
+        if spherical_weights is None:
+            alignment_weights = None
+        else:
+            alignment_weights = spherical_weights.detach().float()[alignment_mask].clamp_min(0.0)
+        irls_scale = fit_irls_scale(
+            alignment_pred,
+            alignment_target,
+            sample_weights=alignment_weights,
+        )
+    else:
+        irls_scale = pred_values.new_tensor(1.0)
+    aligned_pred_values = pred_values * irls_scale
+    if alignment_scale_exempt is not None:
+        exempt = alignment_scale_exempt.detach().bool()
+        if exempt.shape != pred.shape:
+            raise ValueError(
+                f"Alignment scale exempt shape {tuple(exempt.shape)} does not match depth {tuple(pred.shape)}"
+            )
+        aligned_pred_values = torch.where(exempt[valid], pred_values, aligned_pred_values)
+    aligned_metrics = depth_metrics_from_values(
+        aligned_pred_values,
+        target_values,
+        prefix="depth_irls",
+        weights=metric_weights,
+    )
     return {
         **raw_metrics,
-        **depth_metric_accumulators(pred_values, target_values, prefix="depth"),
+        **depth_metric_accumulators(pred_values, target_values, prefix="depth", weights=metric_weights),
         "depth_irls_scale": float(irls_scale.cpu()),
         **aligned_metrics,
-        **depth_metric_accumulators(pred_values * irls_scale, target_values, prefix="depth_irls"),
+        **depth_metric_accumulators(
+            aligned_pred_values,
+            target_values,
+            prefix="depth_irls",
+            weights=metric_weights,
+        ),
         "depth_valid_pixels": int(valid.sum().item()),
     }
 
@@ -1155,39 +1477,58 @@ def pose_auc(r_error: torch.Tensor, t_error: torch.Tensor, max_threshold: int) -
     return float(np.mean(np.cumsum(norm)))
 
 
-def depth_metrics_from_values(pred_values: torch.Tensor, target_values: torch.Tensor, prefix: str) -> dict[str, float]:
+def depth_metrics_from_values(
+    pred_values: torch.Tensor,
+    target_values: torch.Tensor,
+    prefix: str,
+    weights: torch.Tensor | None = None,
+) -> dict[str, float]:
     diff = pred_values - target_values
     abs_diff = diff.abs()
     ratio = torch.maximum(pred_values / target_values, target_values / pred_values)
+    weights = torch.ones_like(pred_values) if weights is None else weights
+    weight_sum = weights.sum().clamp_min(1e-12)
     return {
-        f"{prefix}_mae": float(abs_diff.mean().cpu()),
-        f"{prefix}_rmse": float(torch.sqrt((diff.square()).mean()).cpu()),
-        f"{prefix}_abs_rel": float((abs_diff / target_values).mean().cpu()),
-        f"{prefix}_delta_1p25": float((ratio < 1.25).float().mean().cpu()),
-        f"{prefix}_delta_1p25_2": float((ratio < 1.25**2).float().mean().cpu()),
-        f"{prefix}_delta_1p25_3": float((ratio < 1.25**3).float().mean().cpu()),
+        f"{prefix}_mae": float((weights * abs_diff).sum().div(weight_sum).cpu()),
+        f"{prefix}_rmse": float(torch.sqrt((weights * diff.square()).sum().div(weight_sum)).cpu()),
+        f"{prefix}_abs_rel": float((weights * abs_diff / target_values).sum().div(weight_sum).cpu()),
+        f"{prefix}_delta_1p25": float((weights * (ratio < 1.25)).sum().div(weight_sum).cpu()),
+        f"{prefix}_delta_1p25_2": float((weights * (ratio < 1.25**2)).sum().div(weight_sum).cpu()),
+        f"{prefix}_delta_1p25_3": float((weights * (ratio < 1.25**3)).sum().div(weight_sum).cpu()),
     }
 
 
-def depth_metric_accumulators(pred_values: torch.Tensor, target_values: torch.Tensor, prefix: str) -> dict[str, float]:
+def depth_metric_accumulators(
+    pred_values: torch.Tensor,
+    target_values: torch.Tensor,
+    prefix: str,
+    weights: torch.Tensor | None = None,
+) -> dict[str, float]:
     diff = pred_values - target_values
     abs_diff = diff.abs()
     ratio = torch.maximum(pred_values / target_values, target_values / pred_values)
+    weights = torch.ones_like(pred_values) if weights is None else weights
     return {
-        f"{prefix}_abs_error_sum": float(abs_diff.sum().cpu()),
-        f"{prefix}_sq_error_sum": float(diff.square().sum().cpu()),
-        f"{prefix}_abs_rel_sum": float((abs_diff / target_values).sum().cpu()),
-        f"{prefix}_delta_1p25_count": float((ratio < 1.25).float().sum().cpu()),
-        f"{prefix}_delta_1p25_2_count": float((ratio < 1.25**2).float().sum().cpu()),
-        f"{prefix}_delta_1p25_3_count": float((ratio < 1.25**3).float().sum().cpu()),
+        f"{prefix}_abs_error_sum": float((weights * abs_diff).sum().cpu()),
+        f"{prefix}_sq_error_sum": float((weights * diff.square()).sum().cpu()),
+        f"{prefix}_abs_rel_sum": float((weights * abs_diff / target_values).sum().cpu()),
+        f"{prefix}_delta_1p25_count": float((weights * (ratio < 1.25)).sum().cpu()),
+        f"{prefix}_delta_1p25_2_count": float((weights * (ratio < 1.25**2)).sum().cpu()),
+        f"{prefix}_delta_1p25_3_count": float((weights * (ratio < 1.25**3)).sum().cpu()),
     }
 
 
-def fit_irls_scale(pred_values: torch.Tensor, target_values: torch.Tensor, iterations: int = 10) -> torch.Tensor:
+def fit_irls_scale(
+    pred_values: torch.Tensor,
+    target_values: torch.Tensor,
+    iterations: int = 10,
+    sample_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    sample_weights = torch.ones_like(pred_values) if sample_weights is None else sample_weights
     scale = torch.median(target_values / pred_values).clamp_min(1e-6)
     for _ in range(iterations):
         residual = scale * pred_values - target_values
-        weights = 1.0 / residual.abs().clamp_min(1e-3)
+        weights = sample_weights / residual.abs().clamp_min(1e-3)
         denom = (weights * pred_values.square()).sum().clamp_min(1e-6)
         scale = ((weights * pred_values * target_values).sum() / denom).clamp_min(1e-6)
     return scale
@@ -1337,16 +1678,41 @@ def summarize_metric_rows(rows: list[dict[str, Any]], keys: list[str]) -> dict[s
 
 def summarize_panovggt_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
+        # Backward-compatible aliases used by existing Table 3 summaries.
+        "macro_by_sample": summarize_metric_rows(rows, PANOVGGT_PRIMARY_METRICS),
+        "micro_by_valid_pixel": summarize_panovggt_micro(rows),
+        "covered_sphere": {
         "metric_meaning": {
-            "depth_irls_abs_rel": "Abs Rel after per-sample robust scale-only alignment; this is the primary PanoVGGT-style depth comparison.",
-            "depth_irls_delta_1p25": "delta < 1.25 after per-sample robust scale-only alignment; this is the primary PanoVGGT-style depth comparison.",
-            "depth_irls_rmse": "RMSE after per-sample robust scale-only alignment.",
+            "depth_irls_abs_rel": "Covered-sphere Abs Rel after solid-angle-weighted per-sample robust scale-only alignment; overlapping windows are counted once.",
+            "depth_irls_delta_1p25": "Covered-sphere delta < 1.25 after the same weighted scale-only alignment.",
+            "depth_irls_rmse": "Covered-sphere RMSE after the same weighted scale-only alignment.",
             "depth_abs_rel": "Raw-scale Abs Rel using the model/checkpoint predicted depth scale.",
             "depth_delta_1p25": "Raw-scale delta < 1.25 using the model/checkpoint predicted depth scale.",
             "depth_rmse": "Raw-scale RMSE using the model/checkpoint predicted depth scale.",
         },
         "macro_by_sample": summarize_metric_rows(rows, PANOVGGT_PRIMARY_METRICS),
         "micro_by_valid_pixel": summarize_panovggt_micro(rows),
+        },
+        "erp_with_polar_prior": {
+            "metric_meaning": {
+                "erp_prior_depth_irls_abs_rel": (
+                    "Uniform-ERP-pixel Abs Rel after scale fitting only on valid window-covered ERP pixels; "
+                    "uncovered stable polar caps use fixed dataset priors."
+                ),
+                "erp_prior_depth_irls_delta_1p25": "ERP delta < 1.25 under the same scale and prior protocol.",
+                "erp_prior_depth_irls_rmse": "ERP RMSE under the same scale and prior protocol.",
+            },
+            "macro_by_sample": summarize_metric_rows(
+                rows,
+                [
+                    "erp_prior_depth_irls_abs_rel",
+                    "erp_prior_depth_irls_delta_1p25",
+                    "erp_prior_depth_irls_rmse",
+                    "erp_evaluated_gt_fraction",
+                ],
+            ),
+            "micro_by_valid_pixel": summarize_erp_prior_micro(rows),
+        },
     }
 
 
@@ -1401,11 +1767,20 @@ def finite_row_values(rows: list[dict[str, Any]], key: str) -> list[float]:
 
 
 def summarize_panovggt_micro(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    valid = sum(float(row.get("depth_valid_pixels", 0.0)) for row in rows)
+    return summarize_depth_micro(rows, field_prefix="")
+
+
+def summarize_erp_prior_micro(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return summarize_depth_micro(rows, field_prefix="erp_prior_")
+
+
+def summarize_depth_micro(rows: list[dict[str, Any]], field_prefix: str) -> dict[str, Any]:
+    depth_prefix = f"{field_prefix}depth"
+    valid = sum(float(row.get(f"{depth_prefix}_valid_pixels", 0.0)) for row in rows)
     if valid <= 0:
-        return {"depth_valid_pixels": 0}
-    summary: dict[str, Any] = {"depth_valid_pixels": int(valid)}
-    for prefix in ("depth", "depth_irls"):
+        return {f"{depth_prefix}_valid_pixels": 0}
+    summary: dict[str, Any] = {f"{depth_prefix}_valid_pixels": int(valid)}
+    for prefix in (depth_prefix, f"{depth_prefix}_irls"):
         abs_error_sum = sum(float(row.get(f"{prefix}_abs_error_sum", 0.0)) for row in rows)
         sq_error_sum = sum(float(row.get(f"{prefix}_sq_error_sum", 0.0)) for row in rows)
         abs_rel_sum = sum(float(row.get(f"{prefix}_abs_rel_sum", 0.0)) for row in rows)

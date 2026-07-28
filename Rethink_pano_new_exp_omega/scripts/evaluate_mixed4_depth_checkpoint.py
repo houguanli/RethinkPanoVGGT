@@ -25,12 +25,16 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.evaluate_depth_checkpoint import (  # noqa: E402
     CAMERA_PAIR_CSV_FIELDS,
     DEPTH_ACCUMULATOR_KEYS,
+    DEPTH_METRIC_PROTOCOL,
     DEPTH_METRIC_KEYS,
+    ERP_PRIOR_COVERAGE_KEYS,
+    ERP_PRIOR_DEPTH_METRIC_KEYS,
     PANOVGGT_PRIMARY_METRICS,
     PER_SAMPLE_CSV_FIELDS,
     apply_checkpoint_eval_defaults,
     build_eval_model,
     evaluate_run,
+    erp_polar_prior_metadata,
     apply_eval_max_panos,
     initialize_csv,
     load_checkpoint_payload,
@@ -201,12 +205,36 @@ def main() -> None:
     camera_pair_csv = args.camera_pair_csv
     if camera_pair_csv is None and args.per_sample_csv is not None:
         camera_pair_csv = args.per_sample_csv.with_name(f"{args.per_sample_csv.stem}_camera_pairs.csv")
-    per_sample_rows = read_csv_rows(args.per_sample_csv) if args.resume else []
+    loaded_sample_rows = read_csv_rows(args.per_sample_csv) if args.resume else []
+    per_sample_rows = [
+        row for row in loaded_sample_rows if str(row.get("depth_metric_protocol", "")) == DEPTH_METRIC_PROTOCOL
+    ]
+    dropped_legacy_rows = len(loaded_sample_rows) - len(per_sample_rows)
     camera_pair_rows = read_csv_rows(camera_pair_csv) if args.resume else []
-    if args.per_sample_csv is not None and not (args.resume and args.per_sample_csv.exists()):
-        initialize_csv(args.per_sample_csv, PER_SAMPLE_CSV_FIELDS)
-    if camera_pair_csv is not None and not (args.resume and camera_pair_csv.exists()):
-        initialize_csv(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS)
+    if dropped_legacy_rows:
+        retained_keys = {
+            (str(row.get("run", "")), int(float(row.get("dataset_index", -1)))) for row in per_sample_rows
+        }
+        camera_pair_rows = [
+            row
+            for row in camera_pair_rows
+            if (str(row.get("run", "")), int(float(row.get("dataset_index", -1)))) in retained_keys
+        ]
+        print(
+            f"[EVAL-RESUME] discarded {dropped_legacy_rows} rows from an older depth metric protocol; "
+            "those samples will be evaluated again",
+            flush=True,
+        )
+    if args.per_sample_csv is not None:
+        if args.resume:
+            write_per_sample_csv(args.per_sample_csv, per_sample_rows)
+        else:
+            initialize_csv(args.per_sample_csv, PER_SAMPLE_CSV_FIELDS)
+    if camera_pair_csv is not None:
+        if args.resume:
+            write_camera_pair_csv(camera_pair_csv, camera_pair_rows)
+        else:
+            initialize_csv(camera_pair_csv, CAMERA_PAIR_CSV_FIELDS)
 
     selected_datasets = select_datasets(args.datasets)
     manifest_rows = load_sample_manifest(args.sample_manifest)
@@ -308,7 +336,14 @@ def main() -> None:
         "num_yaw": int(train_args.num_yaw),
         "pitch_degrees": str(train_args.pitch_degrees),
         "fov_degrees": float(train_args.fov_degrees),
-        "depth_evaluation_domain": "sampled_pinhole_windows",
+        "depth_evaluation_domain": "covered_sphere_sampled_pinhole_windows",
+        "depth_evaluation_domains": {
+            "covered_sphere": "sampled pinhole windows with solid-angle weights and overlap de-duplication",
+            "erp_with_polar_prior": "uniform ERP pixels after window splat and stable-cap prior completion",
+        },
+        "depth_metric_protocol": DEPTH_METRIC_PROTOCOL,
+        "depth_pixel_weighting": "pinhole_solid_angle_divided_by_same_pano_window_coverage_count",
+        "erp_polar_prior": erp_polar_prior_metadata(),
         "panocity_max_panos": int(args.panocity_max_panos or 0),
         "pano_count_policy": str(args.pano_count_policy),
         "dataset_pano_counts": {key: int(value) for key, value in sorted(dataset_pano_counts.items())},
@@ -403,7 +438,14 @@ def write_dataset_shard_snapshot(
         "num_yaw": int(train_args.num_yaw),
         "pitch_degrees": str(train_args.pitch_degrees),
         "fov_degrees": float(train_args.fov_degrees),
-        "depth_evaluation_domain": "sampled_pinhole_windows",
+        "depth_evaluation_domain": "covered_sphere_sampled_pinhole_windows",
+        "depth_evaluation_domains": {
+            "covered_sphere": "sampled pinhole windows with solid-angle weights and overlap de-duplication",
+            "erp_with_polar_prior": "uniform ERP pixels after window splat and stable-cap prior completion",
+        },
+        "depth_metric_protocol": DEPTH_METRIC_PROTOCOL,
+        "depth_pixel_weighting": "pinhole_solid_angle_divided_by_same_pano_window_coverage_count",
+        "erp_polar_prior": erp_polar_prior_metadata(),
         "num_shards": int(args.num_shards),
         "shard_rank": int(args.shard_rank),
         "dataset_root": str(train_args.dataset_root),
@@ -578,6 +620,9 @@ def summarize_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str
         metrics = run.get("panovggt_metric_summary", {})
         micro = metrics.get("micro_by_valid_pixel", {})
         macro = metrics.get("macro_by_sample", {})
+        erp_metrics = metrics.get("erp_with_polar_prior", {})
+        erp_micro = erp_metrics.get("micro_by_valid_pixel", {})
+        erp_macro = erp_metrics.get("macro_by_sample", {})
         ours_abs_rel = micro.get("depth_irls_abs_rel")
         ours_delta = micro.get("depth_irls_delta_1p25")
         reference_mono = PANOVGGT_TABLE3_MONOCULAR.get(dataset)
@@ -600,6 +645,19 @@ def summarize_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str
                 "delta_1p25": micro.get("depth_delta_1p25"),
                 "rmse": micro.get("depth_rmse"),
             },
+            "ours_erp_with_polar_prior": {
+                "micro_irls_scale_aligned": {
+                    "abs_rel": erp_micro.get("erp_prior_depth_irls_abs_rel"),
+                    "delta_1p25": erp_micro.get("erp_prior_depth_irls_delta_1p25"),
+                    "rmse": erp_micro.get("erp_prior_depth_irls_rmse"),
+                },
+                "macro_by_sample_irls_scale_aligned": {
+                    "abs_rel": erp_macro.get("erp_prior_depth_irls_abs_rel", {}).get("mean"),
+                    "delta_1p25": erp_macro.get("erp_prior_depth_irls_delta_1p25", {}).get("mean"),
+                    "rmse": erp_macro.get("erp_prior_depth_irls_rmse", {}).get("mean"),
+                    "evaluated_gt_fraction": erp_macro.get("erp_evaluated_gt_fraction", {}).get("mean"),
+                },
+            },
             "panovggt_table3_monocular": reference_mono,
             "panovggt_table3_multiview": reference_multi,
             "beats_panovggt_monocular": compare_to_reference(ours_abs_rel, ours_delta, reference_mono),
@@ -608,12 +666,22 @@ def summarize_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str
     return {
         "paper_protocol_note": (
             "PanoVGGT Table 3 reports Abs Rel and delta<1.25 after IRLS scale normalization. "
-            "Metrics here are computed directly on the sampled pinhole windows; raw-scale metrics "
-            "are also retained."
+            "Metrics here use solid-angle weighting over the sphere covered by sampled pinhole windows, "
+            "with overlap divided by coverage count. PanoVGGT Table 3 uses a different spatial weighting, "
+            "so the stored paper-reference comparisons are numeric context rather than protocol-identical claims."
         ),
         "per_dataset": per_dataset,
         "overall_micro_irls_scale_aligned": summarize_panovggt_rows(rows).get("micro_by_valid_pixel", {}),
         "overall_macro_by_sample": summarize_metric_rows(rows, PANOVGGT_PRIMARY_METRICS),
+        "overall_erp_with_polar_prior": {
+            "micro_by_valid_pixel": summarize_panovggt_rows(rows)
+            .get("erp_with_polar_prior", {})
+            .get("micro_by_valid_pixel", {}),
+            "macro_by_sample": summarize_metric_rows(
+                rows, ERP_PRIOR_DEPTH_METRIC_KEYS + ERP_PRIOR_COVERAGE_KEYS
+            ),
+        },
+        "erp_polar_prior": erp_polar_prior_metadata(),
         "panovggt_table3_monocular_macro_reference": macro_reference(PANOVGGT_TABLE3_MONOCULAR),
         "panovggt_table3_multiview_macro_reference": macro_reference(PANOVGGT_TABLE3_MULTIVIEW),
     }

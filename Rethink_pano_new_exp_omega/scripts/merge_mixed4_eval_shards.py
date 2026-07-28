@@ -19,7 +19,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.evaluate_depth_checkpoint import (  # noqa: E402
     CAMERA_PAIR_CSV_FIELDS,
     DEPTH_ACCUMULATOR_KEYS,
+    DEPTH_METRIC_PROTOCOL,
     DEPTH_METRIC_KEYS,
+    ERP_PRIOR_COVERAGE_KEYS,
+    ERP_PRIOR_DEPTH_ACCUMULATOR_KEYS,
+    ERP_PRIOR_DEPTH_METRIC_KEYS,
     PANOVGGT_PRIMARY_METRICS,
     rank_samples,
     read_train_loss_reference,
@@ -57,6 +61,9 @@ NUMERIC_FIELDS = {
     "sample_weight",
     *DEPTH_METRIC_KEYS,
     *DEPTH_ACCUMULATOR_KEYS,
+    *ERP_PRIOR_DEPTH_METRIC_KEYS,
+    *ERP_PRIOR_DEPTH_ACCUMULATOR_KEYS,
+    *ERP_PRIOR_COVERAGE_KEYS,
 }
 
 
@@ -75,7 +82,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     payloads = [read_json(path) for path in args.shard_json]
+    protocols = {str(payload.get("depth_metric_protocol", "")) for payload in payloads}
+    if protocols != {DEPTH_METRIC_PROTOCOL}:
+        raise ValueError(
+            f"Cannot merge depth shards with incompatible metric protocols: {sorted(protocols)}; "
+            f"expected {DEPTH_METRIC_PROTOCOL}"
+        )
     rows = read_rows(args.shard_csv)
+    row_protocols = {str(row.get("depth_metric_protocol", "")) for row in rows}
+    if rows and row_protocols != {DEPTH_METRIC_PROTOCOL}:
+        raise ValueError(f"Shard CSV rows use incompatible depth metric protocols: {sorted(row_protocols)}")
     camera_pair_rows = read_camera_pair_rows(args.shard_camera_csv or [])
     run_meta = collect_run_meta(payloads)
 
@@ -130,6 +146,10 @@ def main() -> None:
                 ),
                 "valid_fraction_summary": summarize_values([float(row["valid_fraction"]) for row in run_rows]),
                 "depth_metric_summary": summarize_metric_rows(run_rows, DEPTH_METRIC_KEYS),
+                "erp_prior_depth_metric_summary": summarize_metric_rows(
+                    run_rows, ERP_PRIOR_DEPTH_METRIC_KEYS
+                ),
+                "erp_prior_coverage_summary": summarize_metric_rows(run_rows, ERP_PRIOR_COVERAGE_KEYS),
                 "panovggt_metric_summary": summarize_panovggt_rows(run_rows),
                 "by_quality_bin": summarize_by_key(run_rows, "quality_bin", "loss"),
                 "best_samples": {
@@ -158,7 +178,13 @@ def main() -> None:
         "num_yaw": first.get("num_yaw"),
         "pitch_degrees": first.get("pitch_degrees"),
         "fov_degrees": first.get("fov_degrees"),
-        "depth_evaluation_domain": first.get("depth_evaluation_domain", "sampled_pinhole_windows"),
+        "depth_evaluation_domain": first.get(
+            "depth_evaluation_domain", "covered_sphere_sampled_pinhole_windows"
+        ),
+        "depth_metric_protocol": first.get("depth_metric_protocol"),
+        "depth_pixel_weighting": first.get("depth_pixel_weighting"),
+        "depth_evaluation_domains": first.get("depth_evaluation_domains"),
+        "erp_polar_prior": first.get("erp_polar_prior"),
         "num_shards": max(int(payload.get("num_shards", 1)) for payload in payloads) if payloads else 1,
         "dataset_root": first.get("dataset_root"),
         "sample_policy": first.get("sample_policy"),
