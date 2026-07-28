@@ -32,9 +32,9 @@ sampler:
   fov_degrees: 90.0
   pano_height: 512
   pano_width: 1024
-  # The 2026-07-18 result was run from the 2026-07-17 configuration:
-  # Patch GeoRA in the second half (12 layers), Camera GeoRA in the final layer.
-  # Set either count to 24 for all-layer ablations.
+  # The 2026-07-16 reference run used the final 2026-07-15 configuration:
+  # Patch GeoRA in the second half (layers 12..23) and Camera GeoRA at layer 23.
+  # These numeric aliases preserve that 12/1 layout; use 24/24 for all-layer ablations.
   luna_patch_layer_count: 12
   luna_camera_layer_count: 1
 
