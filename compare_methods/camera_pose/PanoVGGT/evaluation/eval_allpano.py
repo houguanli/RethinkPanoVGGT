@@ -243,6 +243,10 @@ def _normalize_dataset_root(name: str, root: str) -> str:
     return str(path)
 
 
+def _dataset_root_from_base(base_root: str, dataset_dir: str) -> str:
+    return str(Path(base_root).expanduser() / dataset_dir)
+
+
 def _sequence_item_ids(name: str, dataset, seq_index: int) -> list[int]:
     """Return deterministic item ids inside one top-level sequence."""
     if name == "PanoCity":
@@ -549,14 +553,17 @@ def parse_args():
         description="Evaluate on all panoramic datasets (pose / depth / point-cloud).")
 
     # paths
+    p.add_argument("--datasets_root", type=str,
+                   default=os.environ.get("PANOVGGT_DATASETS_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets"),
+                   help="Root containing PanoCity, Matterport3D, Stanford2D3DS, and Structured3D subdirectories.")
     p.add_argument("--panocity_root", type=str,
-                   default=os.environ.get("PANOCITY_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets/PanoCity"))
+                   default=os.environ.get("PANOCITY_ROOT"))
     p.add_argument("--matterport_root", type=str,
-                   default=os.environ.get("MATTERPORT3D_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets/Matterport3D"))
+                   default=os.environ.get("MATTERPORT3D_ROOT"))
     p.add_argument("--stanford_root", type=str,
-                   default=os.environ.get("STANFORD2D3DS_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets/Stanford2D3DS"))
+                   default=os.environ.get("STANFORD2D3DS_ROOT"))
     p.add_argument("--structured3d_root", type=str,
-                   default=os.environ.get("STRUCTURED3D_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets/Structured3D"))
+                   default=os.environ.get("STRUCTURED3D_ROOT"))
     p.add_argument("--datasets", nargs="+",
                    default=["panocity", "matterport", "stanford", "structured3d"],
                    choices=sorted(DATASET_KEYS.keys()),
@@ -646,24 +653,29 @@ def main():
     all_results = {}
 
     # ── datasets ─────────────────────────────────────────────────────
+    panocity_root = args.panocity_root or _dataset_root_from_base(args.datasets_root, "PanoCity")
+    matterport_root = args.matterport_root or _dataset_root_from_base(args.datasets_root, "Matterport3D")
+    stanford_root = args.stanford_root or _dataset_root_from_base(args.datasets_root, "Stanford2D3DS")
+    structured3d_root = args.structured3d_root or _dataset_root_from_base(args.datasets_root, "Structured3D")
+
     DATASETS = [
         ("PanoCity", PanoCityDataset, {
-            "PanoCity_DIR": _normalize_dataset_root("PanoCity", args.panocity_root),
+            "PanoCity_DIR": _normalize_dataset_root("PanoCity", panocity_root),
             "min_num_images": max(2, args.frames_panocity),
         }, args.num_seqs_panocity, args.frames_panocity),
 
         ("Matterport3D", Matterport3DDataset, {
-            "Matterport3D_DIR": _normalize_dataset_root("Matterport3D", args.matterport_root),
+            "Matterport3D_DIR": _normalize_dataset_root("Matterport3D", matterport_root),
             "min_num_images": max(2, args.frames_matterport),
         }, args.num_seqs_matterport, args.frames_matterport),
 
         ("Stanford2D3DS", Stanford2D3DSDataset, {
-            "Stanford2D3DS_DIR": _normalize_dataset_root("Stanford2D3DS", args.stanford_root),
+            "Stanford2D3DS_DIR": _normalize_dataset_root("Stanford2D3DS", stanford_root),
             "min_num_images": max(2, args.frames_stanford),
         }, args.num_seqs_stanford, args.frames_stanford),
 
         ("Structured3D", Structured3DDataset, {
-            "Structured3D_DIR": _normalize_dataset_root("Structured3D", args.structured3d_root),
+            "Structured3D_DIR": _normalize_dataset_root("Structured3D", structured3d_root),
             "min_num_rooms": max(2, args.frames_structured3d),
         }, args.num_seqs_structured3d, args.frames_structured3d),
     ]
@@ -700,6 +712,12 @@ def main():
         json.dump({
             "results": all_results,
             "config": vars(args),
+            "resolved_dataset_roots": {
+                "PanoCity": _normalize_dataset_root("PanoCity", panocity_root),
+                "Matterport3D": _normalize_dataset_root("Matterport3D", matterport_root),
+                "Stanford2D3DS": _normalize_dataset_root("Stanford2D3DS", stanford_root),
+                "Structured3D": _normalize_dataset_root("Structured3D", structured3d_root),
+            },
             "model_load": load_info,
             "model_img_size": model_img_size,
         }, f, indent=2)
