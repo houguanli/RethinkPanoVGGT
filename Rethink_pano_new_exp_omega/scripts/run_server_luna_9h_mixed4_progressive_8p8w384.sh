@@ -24,7 +24,7 @@ CONFIG="configs/multipano_rtx5000x4_mixed4_pano_all384_luna_after_full_warmup_9h
 DATASET_ROOT="${DATASET_ROOT:-/whitehole/AOKI/panovggt}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 LUNA_OUT="${LUNA_OUT:-logs/server_mixed4_luna_9h_progressive_2to8p_8w384_fov90_pitch30_${RUN_TAG}}"
-RUN_VALIDATION="${RUN_VALIDATION:-1}"
+LUNA_RUN_VALIDATION="${LUNA_RUN_VALIDATION:-1}"
 BASE_CHECKPOINT="${BASE_CHECKPOINT:-}"
 
 if [[ -z "$BASE_CHECKPOINT" ]]; then
@@ -55,6 +55,7 @@ LOG="$LUNA_OUT/train_9h.log"
   echo "[luna-9h] curriculum=0-1h:2p,1-3h:4p,3-6h:6p,6-9h:8p"
   echo "[luna-9h] dataset_caps=panocity:8,matterport3d:3,stanford2d3ds:3,structured3d:3"
   echo "[luna-9h] windows=4 yaw x pitch(-30,+30), 384x384, FoV=90deg"
+  echo "[luna-9h] run_validation=$LUNA_RUN_VALIDATION"
 } | tee "$LOG"
 
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
@@ -80,33 +81,13 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   --no-inherit-checkpoint-training-defaults \
   2>&1 | tee -a "$LOG"
 
-if [[ "$RUN_VALIDATION" != "1" ]]; then
-  echo "[luna-9h] validation skipped because RUN_VALIDATION=$RUN_VALIDATION" | tee -a "$LOG"
-  exit 0
-fi
-if [[ ! -s "$LUNA_OUT/last.pt" ]]; then
-  echo "[luna-9h] training completed without last.pt: $LUNA_OUT/last.pt" | tee -a "$LOG" >&2
-  exit 1
-fi
-
-echo "[luna-9h] launching automatic mixed4 anchor evaluation" | tee -a "$LOG"
 env \
   PYTHON="$RESOLVED_PYTHON" \
-  GPUS="${VALIDATION_GPUS:-0,1,2,3}" \
-  CONFIG="$CONFIG" \
   DATASET_ROOT="$DATASET_ROOT" \
-  LUNA_OUT="$LUNA_OUT" \
-  CHECKPOINT="$LUNA_OUT/last.pt" \
-  TRAIN_LOSS_CSV="$LUNA_OUT/loss.csv" \
-  EVAL_OUT="${VALIDATION_OUT:-$LUNA_OUT/eval_mixed4_anchor_traincaps_8w384_4gpu}" \
-  EVAL_DATASETS=all \
-  LIMIT_PER_DATASET="${VALIDATION_LIMIT_PER_DATASET:-0}" \
-  SAMPLE_POLICY=anchor \
-  PANO_COUNT_POLICY=config \
-  DATASET_PANO_COUNTS="panocity:8,matterport3d:3,stanford2d3ds:3,structured3d:3" \
-  CAMERA_EVAL_MAX_PANOS=8 \
-  WINDOW_SIZE=384 \
-  NUM_YAW=4 \
+  BASE_CHECKPOINT="$BASE_CHECKPOINT" \
+  POSTTRAIN_RUN_VALIDATION="$LUNA_RUN_VALIDATION" \
+  VALIDATION_GPUS="${VALIDATION_GPUS:-0,1,2,3}" \
+  VALIDATION_LIMIT_PER_DATASET="${VALIDATION_LIMIT_PER_DATASET:-0}" \
   PRINT_EACH_SAMPLE="${PRINT_EACH_SAMPLE:-1}" \
-  BASE_CHECKPOINT_OVERRIDE="$BASE_CHECKPOINT" \
-  bash scripts/run_multipano_eval_after_training.sh
+  bash scripts/run_server_posttrain_mixed4_progressive_8p8w384.sh "$LUNA_OUT" \
+  2>&1 | tee -a "$LOG"
