@@ -240,11 +240,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-pair-csv", type=Path, default=None, help="Optional streaming PanoVGGT-style camera pair CSV path.")
     parser.add_argument("--camera-pose-trans-norm-thresh", type=float, default=1e-2, help="GT baseline threshold for translation-angle camera eval.")
     parser.add_argument(
+        "--latitude-min-deg",
+        type=float,
+        default=None,
+        help="Minimum ERP latitude included in depth metrics. Defaults to -75 degrees.",
+    )
+    parser.add_argument(
+        "--latitude-max-deg",
+        type=float,
+        default=None,
+        help="Maximum ERP latitude included in depth metrics. Defaults to +75 degrees.",
+    )
+    parser.add_argument(
         "--erp-latitude-limit-deg",
         type=float,
-        default=75.0,
-        help="Covered-ERP metric latitude limit; polar caps outside +/- this value are excluded.",
+        default=None,
+        help="Deprecated symmetric alias for --latitude-min-deg/--latitude-max-deg.",
     )
+    parser.add_argument("--num-shards", type=int, default=1, help="Split selected anchor indices across this many workers.")
+    parser.add_argument("--shard-rank", type=int, default=0, help="Zero-based worker index within --num-shards.")
     parser.add_argument(
         "--camera-eval-max-panos",
         type=int,
@@ -262,9 +276,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    latitude_min_deg, latitude_max_deg = resolve_latitude_band(
+        latitude_min_deg=args.latitude_min_deg,
+        latitude_max_deg=args.latitude_max_deg,
+        symmetric_limit_deg=args.erp_latitude_limit_deg,
+    )
+    if int(args.num_shards) < 1:
+        raise ValueError("--num-shards must be at least 1")
+    if int(args.shard_rank) < 0 or int(args.shard_rank) >= int(args.num_shards):
+        raise ValueError("--shard-rank must satisfy 0 <= shard_rank < num_shards")
     os.chdir(REPO_ROOT)
     set_seed(args.seed)
     cfg, config_label = load_hydra_config(args.config)
+    full_erp_eval = is_full_erp_config(cfg)
     if int(args.img_size) > 0:
         cfg.img_size = int(args.img_size)
         cfg.data.train.common_config.img_size = int(args.img_size)
@@ -337,7 +361,10 @@ def main() -> None:
             skipped_rows=skipped_rows,
             camera_pose_trans_norm_thresh=args.camera_pose_trans_norm_thresh,
             camera_eval_max_panos=args.camera_eval_max_panos,
-            erp_latitude_limit_deg=args.erp_latitude_limit_deg,
+            latitude_min_deg=latitude_min_deg,
+            latitude_max_deg=latitude_max_deg,
+            num_shards=int(args.num_shards),
+            shard_rank=int(args.shard_rank),
             normalize_scene_scale=bool(cfg.get("normalize_scene_scale", False)),
             fail_fast=bool(args.fail_fast),
             completed_sample_keys=completed_sample_keys,
@@ -357,10 +384,22 @@ def main() -> None:
         "pano_count_policy": str(args.pano_count_policy),
         "dataset_pano_counts": {key: int(value) for key, value in sorted(dataset_pano_counts.items())},
         "camera_eval_max_panos": int(args.camera_eval_max_panos),
-        "erp_latitude_limit_deg": float(args.erp_latitude_limit_deg),
+        "latitude_band_deg": {"min": latitude_min_deg, "max": latitude_max_deg},
+        "latitude_band_fraction_of_erp_rows": (latitude_max_deg - latitude_min_deg) / 180.0,
+        "erp_latitude_limit_deg": (
+            latitude_max_deg if math.isclose(latitude_min_deg, -latitude_max_deg) else None
+        ),
+        "depth_evaluation_domain": "full_erp_latitude_band" if full_erp_eval else "sampled_windows",
+        "depth_pixel_weighting": "equal_erp_pixels" if full_erp_eval else "equal_window_pixels",
+        "num_shards": int(args.num_shards),
+        "shard_rank": int(args.shard_rank),
         "dataset_root": str(resolve_dataset_root(cfg, args.dataset_root)),
         "ablation": {
-            "model": "baseline01 VGGTOmega full finetune on flattened multi-pano pinhole windows",
+            "model": (
+                "baseline01 VGGTOmega no-split full-ERP finetune"
+                if full_erp_eval
+                else "baseline01 VGGTOmega full finetune on flattened multi-pano pinhole windows"
+            ),
             "uses_pano_or_luna_structure": False,
             "uses_camera_supervision": True,
             "loss": "VGGT-Omega depth/camera losses on pano-cropped multi-view groups",
@@ -414,6 +453,54 @@ def resolve_device(raw: str) -> torch.device:
     if raw == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false.")
     return torch.device(raw)
+
+
+def resolve_latitude_band(
+    *,
+    latitude_min_deg: float | None,
+    latitude_max_deg: float | None,
+    symmetric_limit_deg: float | None,
+) -> tuple[float, float]:
+    if symmetric_limit_deg is not None:
+        if latitude_min_deg is not None or latitude_max_deg is not None:
+            raise ValueError(
+                "--erp-latitude-limit-deg cannot be combined with the asymmetric latitude options"
+            )
+        limit = abs(float(symmetric_limit_deg))
+        latitude_min_deg, latitude_max_deg = -limit, limit
+    minimum = -75.0 if latitude_min_deg is None else float(latitude_min_deg)
+    maximum = 75.0 if latitude_max_deg is None else float(latitude_max_deg)
+    if not (-90.0 <= minimum < maximum <= 90.0):
+        raise ValueError(
+            "Latitude band must satisfy -90 <= min < max <= 90; "
+            f"got min={minimum}, max={maximum}"
+        )
+    return minimum, maximum
+
+
+def is_full_erp_config(cfg: Any) -> bool:
+    target = str(cfg.data.train.dataset.dataset_configs[0].get("_target_", ""))
+    return target.endswith("PanoMinimalMultiPanoFullERPDataset")
+
+
+def latitude_band_mask_like_depth(
+    depth: torch.Tensor,
+    *,
+    latitude_min_deg: float,
+    latitude_max_deg: float,
+) -> torch.Tensor:
+    if depth.ndim < 3:
+        raise ValueError(f"Expected ERP depth with at least 3 dimensions, got {tuple(depth.shape)}")
+    height = int(depth.shape[-3])
+    row_latitudes = 90.0 - (
+        torch.arange(height, device=depth.device, dtype=torch.float32) + 0.5
+    ) * (180.0 / float(height))
+    row_mask = (row_latitudes >= float(latitude_min_deg)) & (
+        row_latitudes <= float(latitude_max_deg)
+    )
+    shape = [1] * depth.ndim
+    shape[-3] = height
+    return row_mask.reshape(shape).expand_as(depth)
 
 
 def build_model(cfg: Any, checkpoint: Path, device: torch.device) -> torch.nn.Module:
@@ -562,7 +649,10 @@ def evaluate_dataset(
     skipped_rows: list[dict[str, Any]],
     camera_pose_trans_norm_thresh: float,
     camera_eval_max_panos: int,
-    erp_latitude_limit_deg: float,
+    latitude_min_deg: float,
+    latitude_max_deg: float,
+    num_shards: int,
+    shard_rank: int,
     normalize_scene_scale: bool,
     fail_fast: bool,
     completed_sample_keys: set[tuple[str, str, int]],
@@ -578,7 +668,8 @@ def evaluate_dataset(
         item_count = len(runtime_dataset)
     else:
         item_count = len(source_items) if source_items is not None else len(dataset)
-    indices = metrics_lib.sample_indices(item_count, limit, seed)
+    global_indices = list(metrics_lib.sample_indices(item_count, limit, seed))
+    indices = global_indices[int(shard_rank) :: int(num_shards)]
     selected_indices = {int(index) for index in indices}
     rows = [
         row
@@ -662,13 +753,31 @@ def evaluate_dataset(
                 pred_depth = predictions["depth"].detach().float() * pred_scale
                 target_depth = batch["depths"].detach().float()[..., None]
                 target_valid = batch["point_masks"].detach().bool()[..., None]
+                metric_domain_mask = torch.ones_like(target_valid)
+                if is_full_erp:
+                    metric_domain_mask = latitude_band_mask_like_depth(
+                        target_depth,
+                        latitude_min_deg=latitude_min_deg,
+                        latitude_max_deg=latitude_max_deg,
+                    )
+                    target_valid = target_valid & metric_domain_mask
                 depth_metrics = metrics_lib.compute_depth_metrics(pred_depth, target_depth, target_valid)
-                erp_metrics = compute_covered_erp_depth_metrics(
-                    pred_window_z=pred_depth,
-                    batch=batch,
-                    metrics_lib=metrics_lib,
-                    latitude_limit_deg=float(erp_latitude_limit_deg),
-                )
+                if is_full_erp:
+                    erp_metrics = {
+                        "erp_coverage_fraction": 1.0,
+                        "erp_common_valid_fraction": float(
+                            target_valid.sum().float().div(metric_domain_mask.sum().clamp_min(1)).cpu()
+                        ),
+                        **{f"erp_{key}": value for key, value in depth_metrics.items()},
+                    }
+                else:
+                    erp_metrics = compute_covered_erp_depth_metrics(
+                        pred_window_z=pred_depth,
+                        batch=batch,
+                        metrics_lib=metrics_lib,
+                        latitude_min_deg=latitude_min_deg,
+                        latitude_max_deg=latitude_max_deg,
+                    )
                 pose_metrics, pose_pair_rows = compute_window0_camera_pose_metrics(
                     predictions=predictions,
                     batch=batch,
@@ -709,7 +818,9 @@ def evaluate_dataset(
                     "loss_FL": scalar_tensor(camera_loss_dict.get("loss_FL", 0.0)),
                     "camera_valid_fraction": scalar_tensor(camera_loss_dict.get("camera_valid_fraction", 0.0)),
                     **pose_metrics,
-                    "valid_fraction": float(target_valid.float().mean().detach().cpu()),
+                    "valid_fraction": float(
+                        target_valid.sum().float().div(metric_domain_mask.sum().clamp_min(1)).cpu()
+                    ),
                     "pred_depth_scale": pred_scale,
                     "metadata_valid_ratio": sample_scalar(sample.get("metadata_valid_ratio"), 1.0),
                     "metadata_structure_score": sample_scalar(sample.get("metadata_structure_score"), 0.0),
@@ -765,6 +876,9 @@ def evaluate_dataset(
         "dataset_size": item_count,
         "requested_samples": int(limit),
         "candidate_samples": len(indices),
+        "global_candidate_samples": len(global_indices),
+        "num_shards": int(num_shards),
+        "shard_rank": int(shard_rank),
         "evaluated_samples": len(rows),
         "resumed_samples": resumed_row_count,
         "effective_pano_min_count": int(getattr(dataset, "pano_min_count", 1)),
@@ -881,7 +995,8 @@ def compute_covered_erp_depth_metrics(
     pred_window_z: torch.Tensor,
     batch: dict[str, torch.Tensor],
     metrics_lib: Any,
-    latitude_limit_deg: float,
+    latitude_min_deg: float,
+    latitude_max_deg: float,
 ) -> dict[str, float]:
     gt_erp = batch.get("pano_range_depth_erp")
     if gt_erp is None:
@@ -909,9 +1024,11 @@ def compute_covered_erp_depth_metrics(
         erp_width=erp_width,
         align_corners=False,
     )
-    lat_limit = min(max(float(latitude_limit_deg), 0.0), 90.0)
     row_latitudes = 90.0 - (torch.arange(erp_height, device=gt_erp.device) + 0.5) * 180.0 / erp_height
-    latitude_mask = (row_latitudes.abs() <= lat_limit).reshape(1, 1, erp_height, 1)
+    latitude_mask = (
+        (row_latitudes >= float(latitude_min_deg))
+        & (row_latitudes <= float(latitude_max_deg))
+    ).reshape(1, 1, erp_height, 1)
     latitude_mask = latitude_mask.expand(batch_size, num_panos, erp_height, erp_width)
     gt_valid = torch.isfinite(gt_erp) & (gt_erp > 0.0)
     coverage_mask = splatted["coverage_mask"] & latitude_mask
