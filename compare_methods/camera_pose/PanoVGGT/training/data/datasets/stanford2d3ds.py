@@ -225,6 +225,10 @@ class Stanford2D3DSDataset(BaseDataset):
             ids: list = None,
             aspect_ratio: float = 1.0,
     ) -> dict:
+        explicit_ids = ids is not None
+        requested_count = len(ids) if explicit_ids else img_per_seq
+        min_required = 1 if requested_count is not None and int(requested_count) <= 1 else 2
+
         if self.inside_random:
             seq_index = random.randint(0, self.sequence_list_len - 1)
         if seq_index is None:
@@ -241,8 +245,10 @@ class Stanford2D3DSDataset(BaseDataset):
             if glob.glob(pose_pattern):
                 valid_indices.append(i)
 
-        if len(valid_indices) < 2:
+        if len(valid_indices) < min_required:
             logging.error(f"Not enough valid poses in {area}/region_{region_id}. Skipping sequence.")
+            if explicit_ids:
+                raise RuntimeError(f"Not enough valid poses in {area}/region_{region_id}")
             return self.get_data(img_per_seq=img_per_seq, aspect_ratio=aspect_ratio)
 
         
@@ -270,8 +276,12 @@ class Stanford2D3DSDataset(BaseDataset):
                     pad = np.random.choice(valid_indices, deficit, replace=self.allow_duplicate_img).tolist()
                     filtered.extend(pad)
                 ids = filtered
-            if len(ids) < 2:
-                ids = np.random.choice(valid_indices, max(2, img_per_seq), replace=self.allow_duplicate_img).tolist()
+            if len(ids) < min_required:
+                ids = np.random.choice(
+                    valid_indices,
+                    max(min_required, img_per_seq or min_required),
+                    replace=self.allow_duplicate_img,
+                ).tolist()
 
         
         base_h, base_w = self.base_resolution

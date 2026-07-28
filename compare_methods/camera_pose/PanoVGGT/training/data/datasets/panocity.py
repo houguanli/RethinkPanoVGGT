@@ -510,6 +510,10 @@ class PanoCityDataset(BaseDataset):
             aspect_ratio: float = 1.0,
     ) -> dict:
         """Retrieve data for a specific trajectory."""
+        explicit_ids = ids is not None
+        requested_count = len(ids) if explicit_ids else img_per_seq
+        min_required = 1 if requested_count is not None and int(requested_count) <= 1 else 2
+
         if self.sequence_list_len == 0:
             raise RuntimeError("No trajectories available. Check your splits_config.json and data paths.")
 
@@ -529,6 +533,8 @@ class PanoCityDataset(BaseDataset):
         all_poses_dict = self._read_poses(poses_file_path)
         if not all_poses_dict:
             logging.error(f"No poses loaded from {poses_file_path}. Skipping.")
+            if explicit_ids:
+                raise RuntimeError(f"No poses loaded from {poses_file_path}")
             return self.get_data(img_per_seq=img_per_seq, aspect_ratio=aspect_ratio)
 
         # Keep only frames with valid finite poses.
@@ -539,9 +545,11 @@ class PanoCityDataset(BaseDataset):
                 pose = all_poses_dict[img_filename]
                 if pose is not None and np.isfinite(pose).all():
                     valid_frame_ids.append(i)
-        if len(valid_frame_ids) < 2:
+        if len(valid_frame_ids) < min_required:
             logging.error(f"Not enough valid poses in {scene}/{block}/part_{part_id}. "
                           f"Found {len(valid_frame_ids)} valid poses out of {len(pano_images)} images.")
+            if explicit_ids:
+                raise RuntimeError(f"Not enough valid poses in {scene}/{block}/part_{part_id}")
             return self.get_data(img_per_seq=img_per_seq, aspect_ratio=aspect_ratio)
 
         
@@ -554,8 +562,8 @@ class PanoCityDataset(BaseDataset):
         if self.get_nearby:
             ids = self.get_nearby_ids(ids, len(pano_images), expand_ratio=self.expand_ratio)
             ids = [int(i) for i in ids if int(i) in valid_frame_ids]
-            if len(ids) < 2:
-                ids = np.random.choice(valid_frame_ids, max(2, img_per_seq),
+            if len(ids) < min_required:
+                ids = np.random.choice(valid_frame_ids, max(min_required, img_per_seq or min_required),
                                        replace=self.allow_duplicate_img).tolist()
 
         
@@ -640,8 +648,10 @@ class PanoCityDataset(BaseDataset):
                 img_filename = osp.basename(pano_images[idx])
                 logging.debug(f"Frame {img_filename} (list idx {idx}) was not processed, skipping")
 
-        if len(batch_data['images']) < 2:
+        if len(batch_data['images']) < min_required:
             logging.error(f"Not enough valid frames after processing. Retrying...")
+            if explicit_ids:
+                raise RuntimeError(f"Not enough valid frames after processing ids={ids}")
             return self.get_data(img_per_seq=img_per_seq, aspect_ratio=aspect_ratio)
 
         return {

@@ -24,6 +24,7 @@ Usage
 """
 
 import os
+import glob
 import json
 import random
 import argparse
@@ -242,6 +243,69 @@ def _normalize_dataset_root(name: str, root: str) -> str:
     return str(path)
 
 
+def _sequence_item_ids(name: str, dataset, seq_index: int) -> list[int]:
+    """Return deterministic item ids inside one top-level sequence."""
+    if name == "PanoCity":
+        traj = dataset.trajectories[seq_index % dataset.sequence_list_len]
+        pano_images = traj["pano_images"]
+        poses_file = traj.get("poses_file")
+        if poses_file:
+            poses = dataset._read_poses(os.path.join(dataset.PanoCity_DIR, poses_file))
+            valid = []
+            for i, rgb_rel in enumerate(pano_images):
+                pose = poses.get(os.path.basename(rgb_rel))
+                if pose is not None and np.isfinite(pose).all():
+                    valid.append(i)
+            return valid
+        return list(range(len(pano_images)))
+
+    if name == "Matterport3D":
+        return list(range(len(dataset.room_trajectories[seq_index % dataset.sequence_list_len][3])))
+
+    if name == "Stanford2D3DS":
+        area, _, _, panoramas, _ = dataset.trajectories[seq_index % dataset.sequence_list_len]
+        valid = []
+        for i, pano_id in enumerate(panoramas):
+            pose_pattern = os.path.join(
+                dataset.Stanford2D3DS_DIR,
+                area,
+                "pano",
+                "pose",
+                f"camera_{pano_id}_*_frame_equirectangular_domain_pose.json",
+            )
+            if glob.glob(pose_pattern):
+                valid.append(i)
+        return valid
+
+    if name == "Structured3D":
+        return list(range(len(dataset.scene_trajectories[seq_index % dataset.sequence_list_len][1])))
+
+    raise ValueError(f"Unsupported dataset: {name}")
+
+
+def _iter_eval_samples(
+    name: str,
+    dataset,
+    indices: list[int],
+    num_frames: int,
+    eval_unit: str,
+    sample_stride: int,
+) -> list[tuple[int, list[int] | None]]:
+    if eval_unit == "sequence":
+        return [(si, None) for si in indices]
+
+    stride = max(1, int(sample_stride))
+    window = max(1, int(num_frames))
+    samples: list[tuple[int, list[int] | None]] = []
+    for si in indices:
+        item_ids = _sequence_item_ids(name, dataset, si)
+        if len(item_ids) < window:
+            continue
+        for start in range(0, len(item_ids) - window + 1, stride):
+            samples.append((si, item_ids[start:start + window]))
+    return samples
+
+
 # =========================================================================
 #  Single-sequence evaluation
 # =========================================================================
@@ -394,6 +458,8 @@ def eval_one_dataset(
     depth_irls_iters: int,
     json_root: str,
     skip_pointcloud: bool = False,
+    eval_unit: str = "sample",
+    sample_stride: int = 1,
 ) -> dict:
     """Evaluate *model* on *dataset* and save per-dataset JSON."""
     pc_cfg = POINTCLOUD_CONFIG.get(name, _DEFAULT_PC)
@@ -407,15 +473,17 @@ def eval_one_dataset(
     print(f"{'=' * 72}")
 
     indices = list(range(dataset.sequence_list_len))
-    random.shuffle(indices)
     if 0 < num_seqs < len(indices):
         indices = indices[:num_seqs]
+    samples = _iter_eval_samples(name, dataset, indices, num_frames, eval_unit, sample_stride)
+    print(f"  Eval    : unit={eval_unit} | sequences={len(indices)} | samples={len(samples)} | stride={sample_stride}")
 
     agg = {"pose": {}, "depth": {}, "world_point": {}, "global_point": {}}
+    successful_samples = 0
 
-    for si in tqdm(indices, desc=name):
+    for sample_idx, (si, ids) in enumerate(tqdm(samples, desc=name)):
         try:
-            data = dataset.get_data(seq_index=si, img_per_seq=num_frames, aspect_ratio=1.0)
+            data = dataset.get_data(seq_index=si, img_per_seq=num_frames, ids=ids, aspect_ratio=1.0)
             pose_m, depth_m, wpt_m, gpt_m = evaluate_sequence(
                 model, data, device, amp_dtype,
                 depth_max=dataset.depth_max,
@@ -430,9 +498,10 @@ def eval_one_dataset(
                                 (wpt_m, "world_point"), (gpt_m, "global_point")]:
                 for k, v in src.items():
                     agg[bucket].setdefault(k, []).append(v)
+            successful_samples += 1
 
         except Exception as exc:
-            print(f"\n  [ERROR] seq {si}: {exc}")
+            print(f"\n  [ERROR] sample {sample_idx} seq {si} ids={ids}: {exc}")
             traceback.print_exc()
 
     result = {cat: {k: _safe_mean(v) for k, v in metrics.items()}
@@ -457,6 +526,10 @@ def eval_one_dataset(
     path = os.path.join(json_root, f"eval_{name.lower()}.json")
     with open(path, "w") as f:
         json.dump({**result, "num_sequences": len(indices),
+                   "num_eval_samples": len(samples),
+                   "num_successful_samples": successful_samples,
+                   "eval_unit": eval_unit,
+                   "sample_stride": sample_stride,
                    "frames_per_seq": num_frames,
                    "depth_align": depth_align,
                    "depth_eval_latitude_band": [depth_lat_min, depth_lat_max],
@@ -531,6 +604,10 @@ def parse_args():
                    help="Maximum latitude in degrees for depth metric pixels after full-image alignment.")
     p.add_argument("--depth_irls_iters", type=int, default=100,
                    help="IRLS iterations for scale+shift depth alignment.")
+    p.add_argument("--eval_unit", type=str, default="sample", choices=["sample", "sequence"],
+                   help="sample enumerates every deterministic sliding window inside each sequence; sequence keeps one call per sequence.")
+    p.add_argument("--sample_stride", type=int, default=1,
+                   help="Sliding-window stride when --eval_unit=sample.")
     p.add_argument("--no_pointcloud", action="store_true",
                    help="Skip expensive point-cloud ICP metrics and report pose/depth only.")
     p.add_argument("--json_root",   type=str, default="eval_results")
@@ -613,6 +690,8 @@ def main():
             depth_irls_iters=args.depth_irls_iters,
             json_root=args.json_root,
             skip_pointcloud=args.no_pointcloud,
+            eval_unit=args.eval_unit,
+            sample_stride=args.sample_stride,
         )
 
     # ── global summary ───────────────────────────────────────────────

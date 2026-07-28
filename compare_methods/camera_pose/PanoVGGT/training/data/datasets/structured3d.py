@@ -334,6 +334,10 @@ class Structured3DDataset(BaseDataset):
             aspect_ratio: float = 1.0,
     ) -> dict:
         """Retrieve data for a specific scene sequence."""
+        explicit_ids = ids is not None
+        requested_count = len(ids) if explicit_ids else img_per_seq
+        min_required = 1 if requested_count is not None and int(requested_count) <= 1 else 2
+
         if self.inside_random:
             seq_index = random.randint(0, self.sequence_list_len - 1)
         if seq_index is None:
@@ -370,8 +374,10 @@ class Structured3DDataset(BaseDataset):
                 logging.warning(f"Error processing room {scene}/{room_id}: {e}")
                 continue
 
-        if len(room_data) < 2:
+        if len(room_data) < min_required:
             logging.error(f"Not enough valid rooms in {scene}. Skipping sequence.")
+            if explicit_ids:
+                raise RuntimeError(f"Not enough valid rooms in {scene}")
             return self.get_data(img_per_seq=img_per_seq, aspect_ratio=aspect_ratio)
 
         
@@ -384,8 +390,8 @@ class Structured3DDataset(BaseDataset):
         if self.get_nearby:
             ids = self.get_nearby_ids(ids, len(room_data), expand_ratio=self.expand_ratio)
             ids = [int(i) for i in ids if int(i) < len(room_data)]
-            if len(ids) < 2:
-                ids = np.random.choice(len(room_data), max(2, img_per_seq),
+            if len(ids) < min_required:
+                ids = np.random.choice(len(room_data), max(min_required, img_per_seq or min_required),
                                        replace=self.allow_duplicate_img).tolist()
 
         # Use fixed training resolution.
@@ -445,8 +451,10 @@ class Structured3DDataset(BaseDataset):
                 logging.warning(f"Error processing room {room_id}: {e}")
                 continue
 
-        if len(batch_data['images']) < 2:
+        if len(batch_data['images']) < min_required:
             logging.error(f"Not enough valid frames after processing. Retrying...")
+            if explicit_ids:
+                raise RuntimeError(f"Not enough valid frames after processing ids={ids}")
             return self.get_data(img_per_seq=img_per_seq, aspect_ratio=aspect_ratio)
 
         return {

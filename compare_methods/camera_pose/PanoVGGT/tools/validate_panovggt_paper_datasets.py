@@ -158,6 +158,8 @@ def main() -> int:
     parser.add_argument("--depth-lat-min", type=float, default=-15.0)
     parser.add_argument("--depth-lat-max", type=float, default=60.0)
     parser.add_argument("--depth-irls-iters", type=int, default=100)
+    parser.add_argument("--eval-unit", default="sample", choices=["sample", "sequence"])
+    parser.add_argument("--sample-stride", type=int, default=1)
     parser.add_argument("--amp-dtype", default="bf16", choices=["none", "bf16", "fp16"])
     parser.add_argument("--with-pointcloud", action="store_true", help="Run expensive dense point-cloud metrics.")
     parser.add_argument("--seed", type=int, default=0)
@@ -210,6 +212,8 @@ def main() -> int:
             depth_irls_iters=args.depth_irls_iters,
             json_root=str(json_root),
             skip_pointcloud=not args.with_pointcloud,
+            eval_unit=args.eval_unit,
+            sample_stride=args.sample_stride,
         )
         results[dataset_name] = {
             "metrics": metrics,
