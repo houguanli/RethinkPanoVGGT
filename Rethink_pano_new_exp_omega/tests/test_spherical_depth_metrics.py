@@ -69,9 +69,7 @@ def test_erp_metric_adds_dataset_polar_prior_without_changing_window_scale() -> 
     erp_height, erp_width = 48, 96
     gt = torch.full((1, 1, erp_height, erp_width), 4.0)
     latitudes = 90.0 - (torch.arange(erp_height) + 0.5) * 180.0 / erp_height
-    north = latitudes >= 75.0
     south = latitudes <= -75.0
-    gt[:, :, north] = ERP_POLAR_DEPTH_PRIORS_M["Stanford2D3DS"]["north"]
     gt[:, :, south] = ERP_POLAR_DEPTH_PRIORS_M["Stanford2D3DS"]["south"]
 
     metrics = compute_erp_prior_depth_metrics(
@@ -85,6 +83,6 @@ def test_erp_metric_adds_dataset_polar_prior_without_changing_window_scale() -> 
     )
 
     assert abs(metrics["erp_prior_depth_irls_scale"] - 2.0) < 1e-3
-    assert metrics["erp_prior_fill_fraction"] > 0.1
+    assert metrics["erp_prior_fill_fraction"] > 0.05
     assert metrics["erp_evaluated_gt_fraction"] > metrics["erp_window_coverage_fraction"]
     assert metrics["erp_prior_depth_irls_abs_rel"] < 1e-3

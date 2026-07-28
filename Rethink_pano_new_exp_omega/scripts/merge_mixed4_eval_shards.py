@@ -22,6 +22,7 @@ from scripts.evaluate_depth_checkpoint import (  # noqa: E402
     DEPTH_METRIC_PROTOCOL,
     DEPTH_METRIC_KEYS,
     ERP_PRIOR_COVERAGE_KEYS,
+    ERP_PRIOR_DIAGNOSTIC_KEYS,
     ERP_PRIOR_DEPTH_ACCUMULATOR_KEYS,
     ERP_PRIOR_DEPTH_METRIC_KEYS,
     PANOVGGT_PRIMARY_METRICS,
@@ -64,6 +65,7 @@ NUMERIC_FIELDS = {
     *ERP_PRIOR_DEPTH_METRIC_KEYS,
     *ERP_PRIOR_DEPTH_ACCUMULATOR_KEYS,
     *ERP_PRIOR_COVERAGE_KEYS,
+    *ERP_PRIOR_DIAGNOSTIC_KEYS,
 }
 
 
@@ -150,6 +152,9 @@ def main() -> None:
                     run_rows, ERP_PRIOR_DEPTH_METRIC_KEYS
                 ),
                 "erp_prior_coverage_summary": summarize_metric_rows(run_rows, ERP_PRIOR_COVERAGE_KEYS),
+                "erp_prior_diagnostic_summary": summarize_metric_rows(
+                    run_rows, ERP_PRIOR_DIAGNOSTIC_KEYS
+                ),
                 "panovggt_metric_summary": summarize_panovggt_rows(run_rows),
                 "by_quality_bin": summarize_by_key(run_rows, "quality_bin", "loss"),
                 "best_samples": {

@@ -61,19 +61,19 @@ from vggt_omega.utils.rotation import mat_to_quat, quat_to_mat  # noqa: E402
 from vggt_omega.models.layers.pano_position import pinhole_rays, yaw_pitch_to_axes  # noqa: E402
 
 
-DEPTH_METRIC_PROTOCOL = "dual_covered_sphere_and_erp_polar_prior_v1"
+DEPTH_METRIC_PROTOCOL = "dual_covered_sphere_and_erp_stable_polar_prior_v2"
 _SPHERICAL_WEIGHT_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
 
 # Median of per-panorama polar-cap medians from 100 deterministic samples per
 # dataset (seed 20260728, |latitude| >= 75 degrees). A missing value means the
-# cap was overwhelmingly invalid/Inf and is intentionally not imputed.
+# cap was invalid/Inf or its median was not stable enough across panoramas.
 ERP_POLAR_PRIOR_SOURCE = "mixed4_polar_depth_100_seed20260728"
 ERP_POLAR_PRIOR_LATITUDE_DEG = 75.0
 ERP_POLAR_DEPTH_PRIORS_M = {
     "Panocity": {"north": None, "south": 10.039999961853027},
     "Matterport3D": {"north": None, "south": None},
-    "Stanford2D3DS": {"north": 1.3974609375, "south": 1.380859375},
-    "Structured3D": {"north": 1.2009999752044678, "south": 1.543000042438507},
+    "Stanford2D3DS": {"north": None, "south": 1.380859375},
+    "Structured3D": {"north": None, "south": None},
 }
 
 
@@ -94,6 +94,10 @@ def erp_polar_prior_metadata() -> dict[str, Any]:
         "sample_count_per_dataset": 100,
         "latitude_threshold_degrees": ERP_POLAR_PRIOR_LATITUDE_DEG,
         "values_m": ERP_POLAR_DEPTH_PRIORS_M,
+        "selection_rule": (
+            "cap valid fraction >= 0.95 and cross-panorama standard deviation of cap medians "
+            "/ mean <= 0.15; otherwise the prior is null"
+        ),
         "scale_fit_domain": "valid window-covered ERP pixels only",
         "fill_domain": "uncovered GT-valid polar pixels with a non-null dataset/cap prior",
         "pixel_weighting": "uniform ERP pixels",
@@ -138,6 +142,15 @@ ERP_PRIOR_COVERAGE_KEYS = [
     "erp_window_coverage_fraction",
     "erp_prior_fill_fraction",
     "erp_evaluated_gt_fraction",
+]
+ERP_PRIOR_DIAGNOSTIC_KEYS = [
+    "erp_window_only_depth_irls_abs_rel",
+    "erp_window_only_depth_irls_delta_1p25",
+    "erp_no_prior_depth_irls_abs_rel",
+    "erp_no_prior_depth_irls_delta_1p25",
+    "erp_prior_region_abs_rel",
+    "erp_prior_north_abs_rel",
+    "erp_prior_south_abs_rel",
 ]
 
 PANOVGGT_PRIMARY_METRICS = [
@@ -200,6 +213,7 @@ PER_SAMPLE_CSV_FIELDS = [
     *ERP_PRIOR_DEPTH_METRIC_KEYS,
     *ERP_PRIOR_DEPTH_ACCUMULATOR_KEYS,
     *ERP_PRIOR_COVERAGE_KEYS,
+    *ERP_PRIOR_DIAGNOSTIC_KEYS,
 ]
 
 CAMERA_PAIR_CSV_FIELDS = [
@@ -864,6 +878,7 @@ def evaluate_run(
         "depth_metric_summary": summarize_metric_rows(rows, DEPTH_METRIC_KEYS),
         "erp_prior_depth_metric_summary": summarize_metric_rows(rows, ERP_PRIOR_DEPTH_METRIC_KEYS),
         "erp_prior_coverage_summary": summarize_metric_rows(rows, ERP_PRIOR_COVERAGE_KEYS),
+        "erp_prior_diagnostic_summary": summarize_metric_rows(rows, ERP_PRIOR_DIAGNOSTIC_KEYS),
         "panovggt_metric_summary": summarize_panovggt_rows(rows),
         "panovggt_camera_pose_summary": summarize_camera_pose_pairs(run_camera_pair_rows),
         "by_quality_bin": summarize_by_key(rows, "quality_bin", "loss"),
@@ -1152,12 +1167,38 @@ def compute_erp_prior_depth_metrics(
         alignment_valid=window_mask,
         alignment_scale_exempt=prior_fill_mask,
     )
+    window_only = compute_depth_metrics(splatted["depth"], gt_range, window_mask)
+    missing_as_invalid = torch.where(
+        prior_fill_mask,
+        torch.full_like(splatted["depth"], 1e-6),
+        splatted["depth"],
+    )
+    no_prior = compute_depth_metrics(
+        missing_as_invalid,
+        gt_range,
+        eval_mask,
+        alignment_valid=window_mask,
+    )
+
+    def prior_abs_rel(mask: torch.Tensor) -> float:
+        if not mask.any():
+            return 0.0
+        values = (prior_depth[mask] - gt_range[mask]).abs() / gt_range[mask].clamp_min(1e-6)
+        return float(values.mean().cpu())
+
     gt_valid_count = gt_valid.sum().clamp_min(1).float()
     return {
         **{f"erp_prior_{key}": value for key, value in metrics.items()},
         "erp_window_coverage_fraction": float(window_mask.sum().float().div(gt_valid_count).cpu()),
         "erp_prior_fill_fraction": float(prior_fill_mask.sum().float().div(gt_valid_count).cpu()),
         "erp_evaluated_gt_fraction": float(eval_mask.sum().float().div(gt_valid_count).cpu()),
+        "erp_window_only_depth_irls_abs_rel": window_only["depth_irls_abs_rel"],
+        "erp_window_only_depth_irls_delta_1p25": window_only["depth_irls_delta_1p25"],
+        "erp_no_prior_depth_irls_abs_rel": no_prior["depth_irls_abs_rel"],
+        "erp_no_prior_depth_irls_delta_1p25": no_prior["depth_irls_delta_1p25"],
+        "erp_prior_region_abs_rel": prior_abs_rel(prior_fill_mask),
+        "erp_prior_north_abs_rel": prior_abs_rel(prior_fill_mask & north),
+        "erp_prior_south_abs_rel": prior_abs_rel(prior_fill_mask & south),
     }
 
 

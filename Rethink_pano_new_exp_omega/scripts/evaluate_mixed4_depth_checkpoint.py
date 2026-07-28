@@ -28,6 +28,7 @@ from scripts.evaluate_depth_checkpoint import (  # noqa: E402
     DEPTH_METRIC_PROTOCOL,
     DEPTH_METRIC_KEYS,
     ERP_PRIOR_COVERAGE_KEYS,
+    ERP_PRIOR_DIAGNOSTIC_KEYS,
     ERP_PRIOR_DEPTH_METRIC_KEYS,
     PANOVGGT_PRIMARY_METRICS,
     PER_SAMPLE_CSV_FIELDS,
@@ -657,6 +658,13 @@ def summarize_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str
                     "rmse": erp_macro.get("erp_prior_depth_irls_rmse", {}).get("mean"),
                     "evaluated_gt_fraction": erp_macro.get("erp_evaluated_gt_fraction", {}).get("mean"),
                 },
+                "same_domain_diagnostics_macro": {
+                    key: value.get("mean")
+                    for key, value in summarize_metric_rows(
+                        [row for row in rows if str(row.get("dataset", "unknown")) == dataset],
+                        ERP_PRIOR_DIAGNOSTIC_KEYS,
+                    ).items()
+                },
             },
             "panovggt_table3_monocular": reference_mono,
             "panovggt_table3_multiview": reference_multi,
@@ -678,7 +686,8 @@ def summarize_panovggt_benchmark(runs: list[dict[str, Any]], rows: list[dict[str
             .get("erp_with_polar_prior", {})
             .get("micro_by_valid_pixel", {}),
             "macro_by_sample": summarize_metric_rows(
-                rows, ERP_PRIOR_DEPTH_METRIC_KEYS + ERP_PRIOR_COVERAGE_KEYS
+                rows,
+                ERP_PRIOR_DEPTH_METRIC_KEYS + ERP_PRIOR_COVERAGE_KEYS + ERP_PRIOR_DIAGNOSTIC_KEYS,
             ),
         },
         "erp_polar_prior": erp_polar_prior_metadata(),
