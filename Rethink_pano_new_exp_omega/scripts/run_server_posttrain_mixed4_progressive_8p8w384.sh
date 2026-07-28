@@ -41,7 +41,7 @@ if [[ -z "$BASE_CHECKPOINT" ]]; then
   done
 fi
 
-LOSS_PLOT="$LUNA_OUT/loss_curve_luna_9h_smoothed_robust.png"
+LOSS_PLOT="$LUNA_OUT/loss_curve_luna_10h_smoothed_robust.png"
 echo "[posttrain] generating smoothed loss plot: $LOSS_PLOT"
 "$RESOLVED_PYTHON" scripts/plot_loss_csv.py \
   --run "luna=$LUNA_OUT/loss.csv" \
@@ -53,7 +53,7 @@ echo "[posttrain] generating smoothed loss plot: $LOSS_PLOT"
   --clip-quantile 0.98 \
   --raw-alpha 0.10 \
   --out "$LOSS_PLOT" \
-  --title "Mixed4 progressive 2-to-8 pano, 8-window LUNA 9h"
+  --title "Mixed4 progressive 3-to-9 pano, 8-window LUNA 10h"
 if [[ ! -s "$LOSS_PLOT" ]]; then
   echo "[posttrain] loss plot was not created: $LOSS_PLOT" >&2
   exit 1
@@ -81,13 +81,13 @@ env \
   LUNA_OUT="$LUNA_OUT" \
   CHECKPOINT="$LUNA_OUT/last.pt" \
   TRAIN_LOSS_CSV="$LUNA_OUT/loss.csv" \
-  EVAL_OUT="${VALIDATION_OUT:-$LUNA_OUT/eval_mixed4_anchor_traincaps_8w384_4gpu}" \
+  EVAL_OUT="${VALIDATION_OUT:-$LUNA_OUT/eval_mixed4_anchor_panovggt_counts_8w384_4gpu}" \
   EVAL_DATASETS=all \
   LIMIT_PER_DATASET="${VALIDATION_LIMIT_PER_DATASET:-0}" \
   SAMPLE_POLICY=anchor \
-  PANO_COUNT_POLICY=config \
-  DATASET_PANO_COUNTS="panocity:8,matterport3d:3,stanford2d3ds:3,structured3d:3" \
-  CAMERA_EVAL_MAX_PANOS=8 \
+  PANO_COUNT_POLICY="${VALIDATION_PANO_COUNT_POLICY:-panovggt}" \
+  DATASET_PANO_COUNTS="${VALIDATION_DATASET_PANO_COUNTS:-}" \
+  CAMERA_EVAL_MAX_PANOS="${VALIDATION_CAMERA_EVAL_MAX_PANOS:-10}" \
   WINDOW_SIZE=384 \
   NUM_YAW=4 \
   PRINT_EACH_SAMPLE="$EVAL_PRINT_EACH_SAMPLE" \

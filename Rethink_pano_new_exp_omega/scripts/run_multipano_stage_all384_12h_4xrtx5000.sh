@@ -39,7 +39,7 @@ USE_SINGLE_DEPTH_SCALE_INIT="${USE_SINGLE_DEPTH_SCALE_INIT:-1}"
 SINGLE_WEIGHTED_PRED_DEPTH_SCALE="${SINGLE_WEIGHTED_PRED_DEPTH_SCALE:-2.827019691467285}"
 
 WARMUP_CONFIG="${WARMUP_CONFIG:-configs/multipano_rtx5000x4_mixed4_pano_omega_warmup_3h_for_luna.yaml}"
-WARMUP_OUT="${WARMUP_OUT:-$LUNA/logs/mixed4_pano_omega_multipano_warmup_3h_fixed8window_for_luna}"
+WARMUP_OUT="${WARMUP_OUT:-$LUNA/logs/mixed4_pano_omega_warmup_2h_3p_8w384_erp1024x512}"
 WARMUP_CKPT="$WARMUP_OUT/last.pt"
 CALIB_JSON="$WARMUP_OUT/depth_scale_calibration.json"
 CALIB_LOG="$WARMUP_OUT/depth_scale_calibration.log"
@@ -48,11 +48,11 @@ CALIB_MAX_PIXELS_PER_SAMPLE="${CALIB_MAX_PIXELS_PER_SAMPLE:-50000}"
 NUM_YAW="${NUM_YAW:-4}"
 PITCH_DEGREES="${PITCH_DEGREES:--30,30}"
 FOV_DEGREES="${FOV_DEGREES:-90}"
-DATASET_PANO_MAX_COUNTS="${DATASET_PANO_MAX_COUNTS:-panocity:8,matterport3d:3,stanford2d3ds:3,structured3d:3}"
+DATASET_PANO_MAX_COUNTS="${DATASET_PANO_MAX_COUNTS:-panocity:9,matterport3d:3,stanford2d3ds:3,structured3d:3}"
 
 LUNA_CONFIG="${LUNA_CONFIG:-configs/multipano_rtx5000x4_mixed4_pano_all384_luna_after_full_warmup_9h.yaml}"
-LUNA_OUT="${LUNA_OUT:-$LUNA/logs/mixed4_pano_all384_fixed8window_4xrtx5000_multipano_after_full_warmup_9h}"
-SEQ_LOG="${SEQ_LOG:-$LUNA/logs/mixed4_pano_all384_fixed8window_4xrtx5000_multipano_stage_12h_sequence.log}"
+LUNA_OUT="${LUNA_OUT:-$LUNA/logs/mixed4_pano_3to9p_8w384_erp1024x512_luna_10h}"
+SEQ_LOG="${SEQ_LOG:-$LUNA/logs/mixed4_pano_3to9p_8w384_erp1024x512_stage_12h_sequence.log}"
 EXTRA_TRAIN_ARGS_ARRAY=()
 if [[ -n "${EXTRA_TRAIN_ARGS:-}" ]]; then
   # shellcheck disable=SC2206
@@ -61,7 +61,7 @@ fi
 
 mkdir -p "$(dirname "$SEQ_LOG")"
 if [[ "${CLEAN_OUTPUT:-0}" == "1" ]]; then
-  rm -rf "$WARMUP_OUT" "$LUNA_OUT" "$SEQ_LOG" "$LUNA/logs/debug_mixed4_pano_all384_fixed8window_4xrtx5000_multipano_after_full_warmup_9h"
+  rm -rf "$WARMUP_OUT" "$LUNA_OUT" "$SEQ_LOG" "$LUNA/logs/debug_mixed4_pano_3to9p_8w384_erp1024x512_luna_10h"
 fi
 mkdir -p "$WARMUP_OUT" "$LUNA_OUT"
 
@@ -83,6 +83,9 @@ mkdir -p "$WARMUP_OUT" "$LUNA_OUT"
   echo "[sequence] pitch_degrees=$PITCH_DEGREES"
   echo "[sequence] fov_degrees=$FOV_DEGREES"
   echo "[sequence] fixed_windows_per_pano=8"
+  echo "[sequence] pano_resolution=1024x512"
+  echo "[sequence] schedule=2h_warmup+10h_luna"
+  echo "[sequence] pano_curriculum=warmup:3,luna:0-2h:3,2-5h:6,5-10h:9"
   echo "[sequence] dataset_pano_max_counts=$DATASET_PANO_MAX_COUNTS"
   echo "[sequence] extra_train_args=${EXTRA_TRAIN_ARGS:-}"
 } | tee -a "$SEQ_LOG"
@@ -173,6 +176,8 @@ else
     --num-yaw "$NUM_YAW" \
     --pitch-degrees="$PITCH_DEGREES" \
     --fov-degrees "$FOV_DEGREES" \
+    --pano-height 512 \
+    --pano-width 1024 \
     --pred-depth-scale "$PRED_DEPTH_SCALE" \
     --depth-loss-mode log_huber \
     --depth-scale-alignment none \
@@ -181,7 +186,7 @@ else
     --depth-scale-alignment-max 1000000.0 \
     --no-inherit-checkpoint-training-defaults \
     "${EXTRA_TRAIN_ARGS_ARRAY[@]}" \
-    2>&1 | tee -a "$WARMUP_OUT/train_3h.log"
+    2>&1 | tee -a "$WARMUP_OUT/train_2h.log"
   echo "[sequence] stage1 multi-pano Omega warmup low384 finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 fi
 
@@ -201,7 +206,7 @@ LUNA_DURATION_ARGS=()
 if [[ -n "${LUNA_MAX_DURATION_MINUTES:-}" ]]; then
   LUNA_DURATION_ARGS=(--max-duration-minutes "$LUNA_MAX_DURATION_MINUTES")
 elif [[ "$WARMUP_CKPT_PREEXISTING" == "1" ]]; then
-  LUNA_DURATION_ARGS=(--max-duration-minutes 720.0)
+  LUNA_DURATION_ARGS=(--max-duration-minutes 600.0)
 fi
 if [[ "${#LUNA_DURATION_ARGS[@]}" -gt 0 ]]; then
   echo "[sequence] luna_duration_override=${LUNA_DURATION_ARGS[*]}" | tee -a "$SEQ_LOG"
@@ -223,6 +228,8 @@ PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" \
   --num-yaw "$NUM_YAW" \
   --pitch-degrees="$PITCH_DEGREES" \
   --fov-degrees "$FOV_DEGREES" \
+  --pano-height 512 \
+  --pano-width 1024 \
   --pred-depth-scale "$PRED_DEPTH_SCALE" \
   --depth-loss-mode log_huber \
   --depth-scale-alignment none \
@@ -237,7 +244,7 @@ echo "[sequence] stage2/3 multi-pano LUNA all384 finished $(date --iso-8601=seco
 if [[ -s "$WARMUP_OUT/loss.csv" && -s "$LUNA_OUT/loss.csv" ]]; then
   "$PYTHON" scripts/plot_loss_csv.py \
     --run "warmup=$WARMUP_OUT/loss.csv" \
-    --run "luna=$LUNA_OUT/loss.csv@3" \
+    --run "luna=$LUNA_OUT/loss.csv@2" \
     --metric auto \
     --x elapsed_hours \
     --smooth-method rolling_median \
@@ -246,7 +253,7 @@ if [[ -s "$WARMUP_OUT/loss.csv" && -s "$LUNA_OUT/loss.csv" ]]; then
     --clip-quantile 0.98 \
     --raw-alpha 0.10 \
     --out "$LUNA_OUT/loss_curve_all384_multipano_smoothed_robust.png" \
-    --title "Mixed4 all384 3h multi-pano Omega warmup + 9h LUNA robust smoothed loss" \
+    --title "Mixed4 ERP1K 2h 3-pano Omega warmup + 10h LUNA 3-to-9 pano" \
     2>&1 | tee -a "$SEQ_LOG"
 fi
 

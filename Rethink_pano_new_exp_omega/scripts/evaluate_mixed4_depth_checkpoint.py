@@ -88,6 +88,7 @@ PANOVGGT_DATASET_PANO_COUNTS = {
     "stanford2d3ds": 3,
     "structured3d": 3,
 }
+SINGLE_PANO_DATASET_COUNTS = {name: 1 for name in PANOVGGT_DATASET_PANO_COUNTS}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -117,9 +118,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--panocity-max-panos", type=int, default=0, help="Optional Panocity-specific eval pano cap, overriding --eval-max-panos for Panocity.")
     parser.add_argument(
         "--pano-count-policy",
-        choices=["config", "panovggt"],
-        default="config",
-        help="Use config pano counts or PanoVGGT comparison counts: Panocity=10, indoor datasets=3.",
+        choices=["config", "panovggt", "single"],
+        default="panovggt",
+        help=(
+            "Pano count policy. Default panovggt uses Panocity=10 and indoor datasets=3; "
+            "single forces every dataset to one panorama; config keeps checkpoint/config counts."
+        ),
     )
     parser.add_argument(
         "--dataset-pano-counts",
@@ -530,7 +534,13 @@ def select_datasets(raw: str) -> set[str]:
 
 
 def resolve_dataset_pano_counts(policy: str, raw_counts: str | None) -> dict[str, int]:
-    counts = dict(PANOVGGT_DATASET_PANO_COUNTS) if str(policy) == "panovggt" else {}
+    normalized_policy = str(policy)
+    if normalized_policy == "panovggt":
+        counts = dict(PANOVGGT_DATASET_PANO_COUNTS)
+    elif normalized_policy == "single":
+        counts = dict(SINGLE_PANO_DATASET_COUNTS)
+    else:
+        counts = {}
     for token in str(raw_counts or "").split(","):
         token = token.strip()
         if not token:

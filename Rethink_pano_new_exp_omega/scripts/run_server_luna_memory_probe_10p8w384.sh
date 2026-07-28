@@ -12,7 +12,7 @@ DATASET_ROOT="${DATASET_ROOT:-/whitehole/AOKI/panovggt}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 WARMUP_CHECKPOINT="${1:-${WARMUP_CHECKPOINT:-}}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-OUTPUT_DIR="${OUTPUT_DIR:-logs/server_luna_memory_probe_10p_8w384_fov90_pitch30_erp1024x512_${RUN_TAG}}"
+OUTPUT_DIR="${OUTPUT_DIR:-logs/server_luna_memory_probe_9p_8w384_fov90_pitch30_erp1024x512_${RUN_TAG}}"
 BASE_CHECKPOINT="${BASE_CHECKPOINT:-}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
@@ -38,22 +38,24 @@ with open(path, "r", encoding="utf-8") as handle:
 data = config.get("data") or {}
 sampler = config.get("sampler") or {}
 stages = (config.get("optimization") or {}).get("training_stages") or []
-stage = stages[0] if len(stages) == 1 else {}
 pitch_values = [value.strip() for value in str(sampler.get("pitch_degrees", "")).split(",") if value.strip()]
 checks = {
-    "data.pano_min_count": (data.get("pano_min_count"), 10),
-    "data.pano_max_count": (data.get("pano_max_count"), 10),
+    "data.pano_min_count": (data.get("pano_min_count"), 3),
+    "data.pano_max_count": (data.get("pano_max_count"), 9),
     "sampler.window_size": (sampler.get("window_size"), 384),
     "sampler.num_yaw": (sampler.get("num_yaw"), 4),
     "sampler.pitch_count": (len(pitch_values), 2),
-    "stage.pano_min_count": (stage.get("pano_min_count"), 10),
-    "stage.pano_max_count": (stage.get("pano_max_count"), 10),
-    "stage.window_size": (stage.get("window_size"), 384),
+    "stage.count": (len(stages), 3),
+    "stage.pano_max_counts": ([stage.get("pano_max_count") for stage in stages], [3, 6, 9]),
+    "stage.window_sizes": ([stage.get("window_size") for stage in stages], [384, 384, 384]),
 }
 errors = [f"{key}={actual!r}, expected {expected!r}" for key, (actual, expected) in checks.items() if actual != expected]
 if errors:
-    raise SystemExit("[memory-probe] invalid 10p/8-window probe config: " + "; ".join(errors))
-print(f"[memory-probe] preflight verified: 10 panos x {sampler['num_yaw']} yaw x {len(pitch_values)} pitch = 80 views/sample")
+    raise SystemExit("[memory-probe] invalid 3/6/9p 8-window probe config: " + "; ".join(errors))
+print(
+    f"[memory-probe] preflight verified: 3->6->9 panos, "
+    f"{sampler['num_yaw']} yaw x {len(pitch_values)} pitch, max 72 views/sample"
+)
 PY
 
 # Warmup checkpoints use trainable_delta format. Read the recorded foundation
@@ -140,9 +142,10 @@ LOG="$OUTPUT_DIR/train_console.log"
   echo "[memory-probe] dataset_root=$DATASET_ROOT"
   echo "[memory-probe] output_dir=$OUTPUT_DIR"
   echo "[memory-probe] nproc_per_node=$NPROC_PER_NODE"
-  echo "[memory-probe] input=10 panos x ERP 1024x512"
-  echo "[memory-probe] sampler=4 yaw x pitch(-30,+30), 384x384, FoV=90deg; total=8 windows/pano, 80 windows/sample"
-  echo "[memory-probe] duration_minutes=${DURATION_MINUTES:-10}"
+  echo "[memory-probe] input=3->6->9 panos x ERP 1024x512"
+  echo "[memory-probe] sampler=4 yaw x pitch(-30,+30), 384x384, FoV=90deg; total=8 windows/pano, max 72 windows/sample"
+  echo "[memory-probe] smoke_curriculum=0-0.20m:3p,0.20-0.45m:6p,0.45m+:9p"
+  echo "[memory-probe] duration_minutes=${DURATION_MINUTES:-1}"
 } | tee "$LOG"
 
 set +e
@@ -158,7 +161,7 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   --output-dir "$OUTPUT_DIR" \
   --tensorboard-dir "$OUTPUT_DIR/tensorboard" \
   --debug-dir "$OUTPUT_DIR/debug" \
-  --max-duration-minutes "${DURATION_MINUTES:-10}" \
+  --max-duration-minutes "${DURATION_MINUTES:-1}" \
   --no-inherit-checkpoint-training-defaults \
   2>&1 | tee -a "$LOG"
 status=${PIPESTATUS[0]}

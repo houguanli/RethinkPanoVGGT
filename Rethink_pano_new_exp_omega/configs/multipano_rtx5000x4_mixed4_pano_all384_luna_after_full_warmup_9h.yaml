@@ -1,4 +1,4 @@
-# 4x RTX 5000: multi-pano mixed PanoVGGT bundle, all LUNA stages at 384.
+# 4x RTX 5000: ERP 1024x512, fixed 8x384 windows, 10h LUNA curriculum 3->6->9.
 data:
   dataset_root: ../../panovggt
   dataset_format: pano_minimal
@@ -13,10 +13,10 @@ data:
   bad_sample_list: configs/structured3d_bad_scenes.txt
   curriculum_bins: null
   use_metadata_weights: false
-  checkpoint: logs/mixed4_pano_omega_multipano_warmup_3h_fixed8window_for_luna/last.pt
+  checkpoint: logs/mixed4_pano_omega_warmup_2h_3p_8w384_erp1024x512/last.pt
   pano_sample_mode: variable_neighborhood
-  pano_min_count: 2
-  pano_max_count: 8
+  pano_min_count: 3
+  pano_max_count: 9
   pano_grouping: nearest
   output_depth_scale: 1000.0
   invalid_depth_value: 65535.0
@@ -30,8 +30,8 @@ sampler:
   num_yaw: 4
   pitch_degrees: "-30,30"
   fov_degrees: 90.0
-  pano_height: 0
-  pano_width: 0
+  pano_height: 512
+  pano_width: 1024
   luna_patch_layers: last3
   luna_camera_layers: "23"
 
@@ -39,8 +39,8 @@ model:
   enable_pano_global_token: true
   enable_pano_geometry_residual: false
   aggregator_use_checkpoint: true
-  # Decode dense depth in smaller frame chunks so the final 8-pano x
-  # 8-window (64-view) sample fits on 32GB RTX5000 cards.
+  # Decode dense depth in smaller frame chunks so the final 9-pano x
+  # 8-window (72-view) Panocity sample remains bounded.
   dense_head_frames_chunk_size: 1
   dense_head_use_checkpoint: true
   dense_head_return_confidence: false
@@ -105,11 +105,12 @@ optimization:
   optimizer_type: adafactor
   batch_size: 1
   training_stages:
-    - name: multipano_camera_bootstrap_2p_all384
-      until_minutes: 60.0
+    - name: multipano_camera_bootstrap_3p_all384
+      until_minutes: 120.0
       window_size: 384
       dense_head_frames_chunk_size: 1
-      pano_max_count: 2
+      pano_min_count: 3
+      pano_max_count: 3
       trainable: luna_residual_tail_heads
       lr: 5.0e-5
       pred_depth_scale_lr: null
@@ -124,29 +125,11 @@ optimization:
       train_depth_residual: false
       learn_pred_depth_scale: false
       learn_dataset_depth_scale: false
-    - name: multipano_camera_expand_4p_all384
-      until_minutes: 180.0
-      window_size: 384
-      dense_head_frames_chunk_size: 1
-      pano_max_count: 4
-      trainable: luna_residual_tail_heads
-      lr: 5.0e-5
-      pred_depth_scale_lr: null
-      dataset_depth_scale_lr: null
-      weight_decay: 0.05
-      optimizer_type: adafactor
-      camera_loss_weight: 0.20
-      camera_center_residual_weight: 0.5
-      global_point_loss_weight: 0.02
-      enable_luna_forward: true
-      enable_depth_residual: false
-      train_depth_residual: false
-      learn_pred_depth_scale: false
-      learn_dataset_depth_scale: false
     - name: multipano_camera_expand_6p_all384
-      until_minutes: 360.0
+      until_minutes: 300.0
       window_size: 384
       dense_head_frames_chunk_size: 1
+      pano_min_count: 3
       pano_max_count: 6
       trainable: luna_residual_tail_heads
       lr: 2.0e-5
@@ -162,10 +145,11 @@ optimization:
       train_depth_residual: false
       learn_pred_depth_scale: false
       learn_dataset_depth_scale: false
-    - name: multipano_camera_full_8p_all384
+    - name: multipano_camera_full_9p_all384
       window_size: 384
       dense_head_frames_chunk_size: 1
-      pano_max_count: 8
+      pano_min_count: 3
+      pano_max_count: 9
       trainable: luna_residual_tail_heads
       lr: 1.0e-5
       pred_depth_scale_lr: null
@@ -191,18 +175,18 @@ runtime:
   max_steps: 1000000
   num_workers: 4
   seed: 43
-  max_duration_minutes: 540.0
+  max_duration_minutes: 600.0
   save_every_steps: 1000
   save_last: true
   checkpoint_format: trainable_delta
   debug_depth_dump: false
   debug_depth_threshold: 0.3
   debug_depth_max_dumps_per_step: 0
-  debug_dir: logs/debug_mixed4_pano_all384_fixed8window_4xrtx5000_multipano_after_full_warmup_9h
+  debug_dir: logs/debug_mixed4_pano_3to9p_8w384_erp1024x512_luna_10h
   progress_bar: true
   progress_log_every: 50
   tensorboard: true
-  tensorboard_dir: logs/mixed4_pano_all384_fixed8window_4xrtx5000_multipano_after_full_warmup_9h/tensorboard
+  tensorboard_dir: logs/mixed4_pano_3to9p_8w384_erp1024x512_luna_10h/tensorboard
 
 output:
-  output_dir: logs/mixed4_pano_all384_fixed8window_4xrtx5000_multipano_after_full_warmup_9h
+  output_dir: logs/mixed4_pano_3to9p_8w384_erp1024x512_luna_10h

@@ -1,9 +1,10 @@
 # 4x RTX 5000: pure VGGT-Omega warmup on multi-pano mixed PanoVGGT data.
 #
 # This replaces the old baseline01 single-pano/window warmup for multi-pano
-# experiments.  LUNA modules are present in the model but disabled/frozen in
+# experiments. LUNA modules are present in the model but disabled/frozen in
 # the stage below, so the checkpoint trains Omega depth/camera heads with the
-# same pano-relative camera objective used by the later LUNA stage.
+# same pano-relative camera objective used by the later LUNA stage. Each
+# sample uses 3 panoramas at ERP 1024x512 and 8 fixed 384x384 windows per pano.
 data:
   dataset_root: ../../panovggt
   dataset_format: pano_minimal
@@ -19,8 +20,8 @@ data:
   curriculum_bins: null
   use_metadata_weights: false
   pano_sample_mode: fixed_neighborhood
-  pano_min_count: 2
-  pano_max_count: 2
+  pano_min_count: 3
+  pano_max_count: 3
   pano_grouping: nearest
   randomize_pano_order: false
   output_depth_scale: 1000.0
@@ -35,8 +36,8 @@ sampler:
   num_yaw: 4
   pitch_degrees: "-30,30"
   fov_degrees: 90.0
-  pano_height: 0
-  pano_width: 0
+  pano_height: 512
+  pano_width: 1024
   luna_patch_layers: last3
   luna_camera_layers: "23"
 
@@ -108,13 +109,15 @@ optimization:
   optimizer_type: adamw
   batch_size: 1
   training_stages:
-    - name: omega_multipano_warmup_low384
-      until_minutes: 180.0
+    - name: omega_multipano_warmup_2h_3p_8w384_erp1024x512
+      until_minutes: 120.0
       window_size: 384
       num_yaw: 4
       pitch_degrees: "-30,30"
       fov_degrees: 90.0
       dense_head_frames_chunk_size: 1
+      pano_min_count: 3
+      pano_max_count: 3
       trainable: all
       lr: 1.0e-5
       pred_depth_scale_lr: null
@@ -141,7 +144,7 @@ runtime:
   max_steps: 1000000
   num_workers: 4
   seed: 43
-  max_duration_minutes: 180.0
+  max_duration_minutes: 120.0
   save_every_steps: 1000
   save_last: true
   checkpoint_format: trainable_delta
@@ -149,11 +152,11 @@ runtime:
   debug_depth_dump: false
   debug_depth_threshold: 0.3
   debug_depth_max_dumps_per_step: 0
-  debug_dir: logs/debug_mixed4_pano_omega_multipano_warmup_3h_fixed8window_for_luna
+  debug_dir: logs/debug_mixed4_pano_omega_warmup_2h_3p_8w384_erp1024x512
   progress_bar: true
   progress_log_every: 50
   tensorboard: true
-  tensorboard_dir: logs/mixed4_pano_omega_multipano_warmup_3h_fixed8window_for_luna/tensorboard
+  tensorboard_dir: logs/mixed4_pano_omega_warmup_2h_3p_8w384_erp1024x512/tensorboard
 
 output:
-  output_dir: logs/mixed4_pano_omega_multipano_warmup_3h_fixed8window_for_luna
+  output_dir: logs/mixed4_pano_omega_warmup_2h_3p_8w384_erp1024x512
