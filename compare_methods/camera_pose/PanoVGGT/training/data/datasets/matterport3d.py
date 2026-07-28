@@ -129,12 +129,36 @@ class Matterport3DDataset(BaseDataset):
                 serializable.append([scene, room_id, room_name, valid_views, [res[0], res[1]]])
             return serializable
 
-        data = load_or_build_json_cache(cache_path, build_fn)
+        if osp.exists(cache_path):
+            data = load_or_build_json_cache(cache_path, build_fn)
+        else:
+            data = self._load_project_split_index()
+            if data is None:
+                data = load_or_build_json_cache(cache_path, build_fn)
         
         self.room_trajectories = []
         for scene, room_id, room_name, valid_views, res in data:
             self.room_trajectories.append((scene, room_id, room_name, valid_views, (res[0], res[1])))
         self.sequence_list_len = len(self.room_trajectories)
+
+    def _project_split_path(self):
+        data_dir = osp.dirname(osp.dirname(osp.abspath(__file__)))
+        return osp.join(data_dir, "splits", "matterport3d", f"matterport3d_{self.mode}_index.json")
+
+    def _load_project_split_index(self):
+        split_path = self._project_split_path()
+        if not osp.exists(split_path):
+            return None
+        try:
+            with open(split_path, "r") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                logging.info(f"[ProjectSplit] Loaded Matterport3D {self.mode} index from {split_path}")
+                return data
+            logging.warning(f"[ProjectSplit] Expected list in {split_path}, got {type(data).__name__}")
+        except Exception as e:
+            logging.warning(f"[ProjectSplit] Failed to read {split_path}: {e}")
+        return None
 
     def _scan_rooms_once(self):
         """Scan all rooms in all scenes using parsed JSON and PIL image headers."""

@@ -78,6 +78,13 @@ DATASET_KEYS = {
     "structured3d": "Structured3D",
 }
 
+DATASET_ROOT_ALIASES = {
+    "PanoCity": ("PanoCity", "Panocity", "PanoCity_paired"),
+    "Matterport3D": ("Matterport3D",),
+    "Stanford2D3DS": ("Stanford2D3DS", "2D3DS"),
+    "Structured3D": ("Structured3D", "Structured3D_Dataset/Structured3D"),
+}
+
 PAPER_DEPTH_TARGETS = {
     "Matterport3D": {
         "monocular": {"Abs Rel": 0.0884, "delta1": 0.9157},
@@ -244,7 +251,22 @@ def _normalize_dataset_root(name: str, root: str) -> str:
 
 
 def _dataset_root_from_base(base_root: str, dataset_dir: str) -> str:
-    return str(Path(base_root).expanduser() / dataset_dir)
+    base = Path(base_root).expanduser()
+    for alias in DATASET_ROOT_ALIASES.get(dataset_dir, (dataset_dir,)):
+        candidate = base / alias
+        if candidate.exists():
+            return str(candidate)
+    return str(base / dataset_dir)
+
+
+def _load_mixed4_summary(base_root: str) -> dict | None:
+    path = Path(base_root).expanduser() / "mixed4_index_summary.json"
+    if not path.exists():
+        return None
+    with open(path, "r") as f:
+        summary = json.load(f)
+    summary["_path"] = str(path)
+    return summary
 
 
 def _sequence_item_ids(name: str, dataset, seq_index: int) -> list[int]:
@@ -657,6 +679,10 @@ def main():
     all_results = {}
 
     # ── datasets ─────────────────────────────────────────────────────
+    mixed4_summary = _load_mixed4_summary(args.datasets_root)
+    if mixed4_summary is not None:
+        print(f"Mixed4 summary: {mixed4_summary['_path']}")
+
     panocity_root = args.panocity_root or _dataset_root_from_base(args.datasets_root, "PanoCity")
     matterport_root = args.matterport_root or _dataset_root_from_base(args.datasets_root, "Matterport3D")
     stanford_root = args.stanford_root or _dataset_root_from_base(args.datasets_root, "Stanford2D3DS")
@@ -722,6 +748,7 @@ def main():
                 "Stanford2D3DS": _normalize_dataset_root("Stanford2D3DS", stanford_root),
                 "Structured3D": _normalize_dataset_root("Structured3D", structured3d_root),
             },
+            "mixed4_index_summary": mixed4_summary,
             "model_load": load_info,
             "model_img_size": model_img_size,
         }, f, indent=2)

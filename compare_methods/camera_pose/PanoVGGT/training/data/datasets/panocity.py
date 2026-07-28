@@ -5,6 +5,7 @@ import logging
 import random
 import math
 import time
+import re
 
 import cv2
 import numpy as np
@@ -116,6 +117,14 @@ class PanoCityDataset(BaseDataset):
                 self.base_resolution = tuple(self.trajectories[0]['resolution'])
             return
 
+        flat_cache = self._load_flat_cache_split_index()
+        if flat_cache is not None:
+            self.trajectories = flat_cache
+            self.sequence_list_len = len(self.trajectories)
+            if self.trajectories:
+                self.base_resolution = tuple(self.trajectories[0]['resolution'])
+            return
+
         cache_dir = osp.join(self.PanoCity_DIR, "cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_path = osp.join(cache_dir, f"PanoCity_{self.mode}_index.json")
@@ -136,6 +145,105 @@ class PanoCityDataset(BaseDataset):
             data_dir = osp.dirname(osp.dirname(osp.abspath(__file__)))
             split_dir = osp.join(data_dir, "splits", "panocity")
         return osp.join(split_dir, f"panocity_{self.mode}_index.json")
+
+    def _flat_cache_path(self):
+        return osp.join(self.PanoCity_DIR, "cache", f"panocity_{self.mode}_index.json")
+
+    @staticmethod
+    def _frame_index_from_path(path: str, fallback: int) -> int:
+        stem = osp.splitext(osp.basename(path))[0]
+        matches = re.findall(r"\d+", stem)
+        return int(matches[-1]) if matches else fallback
+
+    def _load_flat_cache_split_index(self):
+        """
+        Load root/cache/panocity_{split}_index.json flat records and group them
+        into trajectory records. This supports exported PanoCity roots that do
+        not include the older splits_config.json or per-block poses JSON files.
+        """
+        cache_path = self._flat_cache_path()
+        if not osp.exists(cache_path):
+            return None
+
+        try:
+            with open(cache_path, "r") as f:
+                records = json.load(f)
+        except Exception as e:
+            logging.warning(f"[FlatCache] Failed to read {cache_path}: {e}")
+            return None
+
+        if not isinstance(records, list):
+            logging.warning(f"[FlatCache] Expected list in {cache_path}, got {type(records).__name__}")
+            return None
+
+        grouped = {}
+        for order, rec in enumerate(records):
+            rgb_path = rec.get("rgb_path")
+            depth_path = rec.get("depth_path")
+            rotation = rec.get("pano_rotation_c2w")
+            position = rec.get("pano_position_m")
+            if not rgb_path or not depth_path or rotation is None or position is None:
+                continue
+            if rec.get("pano_rotation_valid") is False:
+                continue
+
+            key = rec.get("scene_group_key") or (
+                f"{rec.get('city', 'panocity')}:{rec.get('block', 'block')}:{rec.get('part_id', 0)}"
+            )
+            group = grouped.setdefault(key, {
+                "scene": rec.get("city", "panocity"),
+                "block": rec.get("block", "block"),
+                "part_id": rec.get("part_id", 0),
+                "items": [],
+            })
+
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[:3, :3] = np.asarray(rotation, dtype=np.float32)
+            c2w[:3, 3] = np.asarray(position, dtype=np.float32)
+            frame_idx = self._frame_index_from_path(rgb_path, order)
+            group["items"].append((frame_idx, rgb_path, depth_path, osp.basename(rgb_path), c2w.tolist()))
+
+        trajectories = []
+        missing_first_rgb = 0
+        for group in grouped.values():
+            items = sorted(group["items"], key=lambda x: x[0])
+            if len(items) < self.min_num_images:
+                continue
+
+            first_rgb = osp.join(self.PanoCity_DIR, items[0][1])
+            if not osp.exists(first_rgb):
+                missing_first_rgb += 1
+                continue
+
+            try:
+                with Image.open(first_rgb) as img:
+                    width, height = img.size
+            except Exception as e:
+                logging.warning(f"[FlatCache] Read header failed {first_rgb}: {e}")
+                continue
+
+            trajectories.append({
+                "scene": group["scene"],
+                "block": group["block"],
+                "part_id": group["part_id"],
+                "pano_images": [item[1] for item in items],
+                "panodepth_images": [item[2] for item in items],
+                "poses_file": None,
+                "poses_inline": {item[3]: item[4] for item in items},
+                "indices": [item[0] for item in items],
+                "resolution": [height, width],
+            })
+
+        if not trajectories:
+            logging.warning(f"[FlatCache] {cache_path} exists but no valid grouped trajectories matched")
+            return None
+        if missing_first_rgb:
+            logging.warning(f"[FlatCache] Skipped {missing_first_rgb}/{len(grouped)} groups with missing first RGB")
+
+        logging.info(
+            f"[FlatCache] Loaded {len(trajectories)} PanoCity {self.mode} trajectories from {cache_path}"
+        )
+        return trajectories
 
     def _load_official_split_index(self):
         """
@@ -525,12 +633,19 @@ class PanoCityDataset(BaseDataset):
         traj = self.trajectories[seq_index % self.sequence_list_len]
         scene = traj['scene']; block = traj['block']; part_id = traj['part_id']
         pano_images = traj['pano_images']; panodepth_images = traj['panodepth_images']
-        poses_file = traj['poses_file']; indices = traj['indices']
+        poses_file = traj.get('poses_file'); indices = traj['indices']
         orig_resolution = tuple(traj['resolution'])
 
         # Load all poses for this trajectory once.
-        poses_file_path = osp.join(self.PanoCity_DIR, poses_file)
-        all_poses_dict = self._read_poses(poses_file_path)
+        if poses_file:
+            poses_file_path = osp.join(self.PanoCity_DIR, poses_file)
+            all_poses_dict = self._read_poses(poses_file_path)
+        else:
+            poses_file_path = "<inline>"
+            all_poses_dict = {
+                name: np.asarray(matrix, dtype=np.float32)
+                for name, matrix in traj.get("poses_inline", {}).items()
+            }
         if not all_poses_dict:
             logging.error(f"No poses loaded from {poses_file_path}. Skipping.")
             if explicit_ids:

@@ -25,10 +25,6 @@ esac
 
 python -m evaluation.eval_allpano \
   --datasets_root "${DATASETS_ROOT}" \
-  --panocity_root "${DATASETS_ROOT}/PanoCity" \
-  --matterport_root "${DATASETS_ROOT}/Matterport3D" \
-  --stanford_root "${DATASETS_ROOT}/Stanford2D3DS" \
-  --structured3d_root "${DATASETS_ROOT}/Structured3D" \
   --ckpt "${CKPT}" \
   --split "${SPLIT}" \
   --frames_panocity "${FRAMES}" \
