@@ -29,6 +29,7 @@ import random
 import argparse
 import importlib
 import traceback
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -67,6 +68,30 @@ POINTCLOUD_CONFIG = {
 
 _DEFAULT_PC = {"icp_threshold": 0.1, "normal_radius": 0.2}
 
+DATASET_KEYS = {
+    "panocity": "PanoCity",
+    "matterport": "Matterport3D",
+    "matterport3d": "Matterport3D",
+    "stanford": "Stanford2D3DS",
+    "stanford2d3ds": "Stanford2D3DS",
+    "structured3d": "Structured3D",
+}
+
+PAPER_DEPTH_TARGETS = {
+    "Matterport3D": {
+        "monocular": {"Abs Rel": 0.0884, "delta1": 0.9157},
+        "multi": {"Abs Rel": 0.0840, "delta1": 0.9266},
+    },
+    "Stanford2D3DS": {
+        "monocular": {"Abs Rel": 0.0711, "delta1": 0.9392},
+        "multi": {"Abs Rel": 0.0778, "delta1": 0.9323},
+    },
+    "Structured3D": {
+        "monocular": {"Abs Rel": 0.0438, "delta1": 0.9728},
+        "multi": {"Abs Rel": 0.0400, "delta1": 0.9870},
+    },
+}
+
 
 # =========================================================================
 #  Helpers
@@ -101,6 +126,122 @@ def _ensure_nhw3(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _default_lowres_ckpt() -> Path:
+    root = _repo_root()
+    candidates = [
+        root / "checkpoints" / "model_lowres.pt",
+        root / "../../../ckpt/PanoVGGT/model_lowres.pt",
+        root / "../../../ckpt/PanoVGGT/model.pt",
+    ]
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved.exists():
+            return resolved
+    return candidates[0].resolve()
+
+
+def _cfg_select(cfg, key: str, default):
+    from omegaconf import OmegaConf
+
+    value = OmegaConf.select(cfg, key, default=default)
+    return default if value is None else value
+
+
+def build_model_from_hydra_config(config_name: str, device: torch.device) -> torch.nn.Module:
+    """Build PanoVGGT with the repository Hydra model config."""
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+    from panovggt.models.panovggt_model import PanoVGGTModel
+
+    config_dir = _repo_root() / "training" / "config"
+    with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
+        cfg = compose(config_name=config_name)
+    OmegaConf.resolve(cfg)
+
+    model_cfg = cfg.model
+    aggregator_cfg = OmegaConf.to_container(
+        _cfg_select(model_cfg, "aggregator", {}), resolve=True
+    )
+    if isinstance(aggregator_cfg, dict):
+        aggregator_cfg.setdefault("load_dinov2_pretrained", False)
+        aggregator_cfg.setdefault("allow_dinov2_download", False)
+
+    model = PanoVGGTModel(
+        img_size=int(cfg.img_size),
+        patch_size=int(cfg.patch_size),
+        embed_dim=int(_cfg_select(cfg, "embed_dim", 1024)),
+        enable_camera=bool(_cfg_select(model_cfg, "enable_camera", True)),
+        enable_depth=bool(_cfg_select(model_cfg, "enable_depth", True)),
+        enable_point=bool(_cfg_select(model_cfg, "enable_point", True)),
+        enable_global_points=bool(_cfg_select(model_cfg, "enable_global_points", True)),
+        geometry_output_scale=float(_cfg_select(model_cfg, "geometry_output_scale", 1.0)),
+        train_geometry_output_scale=bool(_cfg_select(model_cfg, "train_geometry_output_scale", False)),
+        aggregator=aggregator_cfg,
+    )
+    return model.to(device).eval()
+
+
+def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device, strict: bool = False) -> dict:
+    ckpt = Path(ckpt_path).expanduser().resolve()
+    if not ckpt.exists():
+        raise FileNotFoundError(f"PanoVGGT checkpoint not found: {ckpt}")
+
+    payload = torch.load(ckpt, map_location="cpu", weights_only=False)
+    for key in ("model", "model_state_dict", "state_dict"):
+        if isinstance(payload, dict) and key in payload:
+            payload = payload[key]
+            break
+    state = {
+        (k[7:] if k.startswith("module.") else k): v
+        for k, v in payload.items()
+    }
+    missing, unexpected = model.load_state_dict(state, strict=strict)
+    print(
+        f"Model loaded from {ckpt} "
+        f"(missing={len(missing)}, unexpected={len(unexpected)}, strict={strict})"
+    )
+    return {
+        "checkpoint": str(ckpt),
+        "missing": list(missing),
+        "unexpected": list(unexpected),
+        "strict": strict,
+    }
+
+
+def _latitude_band_mask(height: int, width: int, lat_min: float, lat_max: float) -> np.ndarray:
+    """Return an equirectangular latitude mask where top row is +90 degrees."""
+    rows = np.arange(height, dtype=np.float32) + 0.5
+    lat = 90.0 - rows * (180.0 / float(height))
+    lo, hi = sorted((float(lat_min), float(lat_max)))
+    row_mask = (lat >= lo) & (lat <= hi)
+    return np.broadcast_to(row_mask[:, None], (height, width)).copy()
+
+
+def _depth_align_kwargs(depth_align: str, irls_iters: int) -> dict:
+    if depth_align == "metric":
+        return {"metric_scale": True}
+    if depth_align == "scale&shift":
+        return {"align_with_lad2": True, "max_iters": irls_iters}
+    if depth_align == "irls-absrel":
+        return {"align_with_irls_absrel": True, "max_iters": irls_iters}
+    if depth_align == "robust-scale":
+        return {"align_with_scale": True}
+    return {}
+
+
+def _normalize_dataset_root(name: str, root: str) -> str:
+    path = Path(root).expanduser()
+    if name == "Structured3D" and not any(path.glob("scene_*")):
+        nested = path / "Structured3D"
+        if nested.is_dir():
+            path = nested
+    return str(path)
+
+
 # =========================================================================
 #  Single-sequence evaluation
 # =========================================================================
@@ -112,6 +253,9 @@ def evaluate_sequence(
     amp_dtype: torch.dtype | None,
     depth_max: float = 10.0,
     depth_align: str = "median-scale",
+    depth_lat_min: float | None = None,
+    depth_lat_max: float | None = None,
+    depth_irls_iters: int = 100,
     dataset_name: str = "",
     skip_pointcloud: bool = False,
 ) -> tuple:
@@ -186,13 +330,19 @@ def evaluate_sequence(
     depth_metrics: dict = {}
     if pred_depth is not None:
         per_frame: Dict[str, list] = {}
-        align_kw = {"align_with_lad2": True} if depth_align == "scale&shift" else {"align_with_scale": True}
+        align_kw = _depth_align_kwargs(depth_align, depth_irls_iters)
+        lat_mask = None
+        if depth_lat_min is not None and depth_lat_max is not None:
+            lat_mask = _latitude_band_mask(H, W, depth_lat_min, depth_lat_max)
         for i in range(N):
+            custom_mask = gt_mask[i].cpu().numpy()
+            if lat_mask is not None:
+                custom_mask = custom_mask & lat_mask
             res, *_ = depth_evaluation(
                 pred_depth[i].cpu().numpy(),
                 gt_depth[i].cpu().numpy(),
                 max_depth=depth_max,
-                custom_mask=gt_mask[i].cpu().numpy(),
+                custom_mask=custom_mask,
                 **align_kw,
             )
             for k, v in res.items():
@@ -239,6 +389,9 @@ def eval_one_dataset(
     num_seqs: int,
     num_frames: int,
     depth_align: str,
+    depth_lat_min: float | None,
+    depth_lat_max: float | None,
+    depth_irls_iters: int,
     json_root: str,
     skip_pointcloud: bool = False,
 ) -> dict:
@@ -246,6 +399,7 @@ def eval_one_dataset(
     pc_cfg = POINTCLOUD_CONFIG.get(name, _DEFAULT_PC)
     print(f"\n{'=' * 72}")
     print(f"  Dataset : {name}")
+    print(f"  Depth   : align={depth_align} | latitude=[{depth_lat_min}, {depth_lat_max}]")
     if skip_pointcloud:
         print("  Point-cloud metrics: skipped")
     else:
@@ -266,6 +420,9 @@ def eval_one_dataset(
                 model, data, device, amp_dtype,
                 depth_max=dataset.depth_max,
                 depth_align=depth_align,
+                depth_lat_min=depth_lat_min,
+                depth_lat_max=depth_lat_max,
+                depth_irls_iters=depth_irls_iters,
                 dataset_name=name,
                 skip_pointcloud=skip_pointcloud,
             )
@@ -280,10 +437,18 @@ def eval_one_dataset(
 
     result = {cat: {k: _safe_mean(v) for k, v in metrics.items()}
               for cat, metrics in agg.items()}
+    regime = "monocular" if num_frames == 1 else "multi"
+    paper_depth_target = PAPER_DEPTH_TARGETS.get(name, {}).get(regime)
+    if paper_depth_target and result.get("depth"):
+        result["paper_depth_target"] = paper_depth_target
+        result["paper_depth_delta"] = {
+            "Abs Rel": result["depth"].get("Abs Rel", 0.0) - paper_depth_target["Abs Rel"],
+            "delta1": result["depth"].get("δ < 1.25", 0.0) - paper_depth_target["delta1"],
+        }
 
     # print summary
-    for cat in ("pose", "depth", "world_point", "global_point"):
-        if result[cat]:
+    for cat in ("pose", "depth", "world_point", "global_point", "paper_depth_delta"):
+        if result.get(cat):
             rounded = {k: round(v, 5) for k, v in result[cat].items()}
             print(f"  {cat:>14s}: {rounded}")
 
@@ -293,6 +458,9 @@ def eval_one_dataset(
     with open(path, "w") as f:
         json.dump({**result, "num_sequences": len(indices),
                    "frames_per_seq": num_frames,
+                   "depth_align": depth_align,
+                   "depth_eval_latitude_band": [depth_lat_min, depth_lat_max],
+                   "depth_irls_iters": depth_irls_iters,
                    "pointcloud_enabled": not skip_pointcloud,
                    "pointcloud_config": pc_cfg}, f, indent=2)
     print(f"  → {path}")
@@ -309,30 +477,41 @@ def parse_args():
 
     # paths
     p.add_argument("--panocity_root", type=str,
-                   default=os.environ.get("PANOCITY_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets/Panocity"))
+                   default=os.environ.get("PANOCITY_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets/PanoCity"))
     p.add_argument("--matterport_root", type=str,
                    default=os.environ.get("MATTERPORT3D_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets/Matterport3D"))
     p.add_argument("--stanford_root", type=str,
                    default=os.environ.get("STANFORD2D3DS_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets/Stanford2D3DS"))
     p.add_argument("--structured3d_root", type=str,
                    default=os.environ.get("STRUCTURED3D_ROOT", "/mnt/e/PanoVGGT_minimal_datasets/datasets/Structured3D"))
+    p.add_argument("--datasets", nargs="+",
+                   default=["panocity", "matterport", "stanford", "structured3d"],
+                   choices=sorted(DATASET_KEYS.keys()),
+                   help="Datasets to evaluate. Defaults to all four paper datasets.")
 
     # model
-    p.add_argument("--ckpt",  type=str, required=True, help="Path to model checkpoint")
+    p.add_argument("--ckpt",  type=str, default=str(_default_lowres_ckpt()),
+                   help="Path to model checkpoint. Defaults to checkpoints/model_lowres.pt when present.")
+    p.add_argument("--model_build_mode", type=str, default="hydra", choices=["hydra", "direct"],
+                   help="Use repository Hydra config or direct module:Class construction.")
+    p.add_argument("--config", type=str, default="default",
+                   help="Hydra config name when --model_build_mode=hydra.")
+    p.add_argument("--strict_load", action="store_true",
+                   help="Require exact checkpoint/model key match.")
     p.add_argument("--model", type=str, default="panovggt.models.panovggt_model:PanoVGGTModel",
                    help="module:ClassName")
     p.add_argument("--model_kwargs", type=str, default=None,
                    help="JSON string of model constructor kwargs")
     p.add_argument("--model_kwargs_file", type=str, default=None,
                    help="Path to a JSON file with model constructor kwargs")
-    p.add_argument("--split", type=str, default="test_final",
-                   choices=["train", "test", "test_final"])
+    p.add_argument("--split", type=str, default="test",
+                   choices=["train", "val", "test", "test_final"])
 
     # per-dataset sequence counts (-1 = all)
     p.add_argument("--num_seqs_panocity",       type=int, default=-1)
     p.add_argument("--num_seqs_matterport",   type=int, default=-1)
     p.add_argument("--num_seqs_stanford",     type=int, default=-1)
-    p.add_argument("--num_seqs_structured3d", type=int, default=100)
+    p.add_argument("--num_seqs_structured3d", type=int, default=-1)
 
     # per-dataset frame counts
     p.add_argument("--frames_panocity",       type=int, default=10)
@@ -344,7 +523,14 @@ def parse_args():
     p.add_argument("--device",      type=str, default="cuda")
     p.add_argument("--seed",        type=int, default=0)
     p.add_argument("--amp_dtype",   type=str, default="bf16", choices=["none", "bf16", "fp16"])
-    p.add_argument("--depth_align", type=str, default="median-scale")
+    p.add_argument("--depth_align", type=str, default="irls-absrel",
+                   choices=["median-scale", "robust-scale", "scale&shift", "irls-absrel", "metric"])
+    p.add_argument("--depth_lat_min", type=float, default=-15.0,
+                   help="Minimum latitude in degrees for depth metric pixels after full-image alignment.")
+    p.add_argument("--depth_lat_max", type=float, default=60.0,
+                   help="Maximum latitude in degrees for depth metric pixels after full-image alignment.")
+    p.add_argument("--depth_irls_iters", type=int, default=100,
+                   help="IRLS iterations for scale+shift depth alignment.")
     p.add_argument("--no_pointcloud", action="store_true",
                    help="Skip expensive point-cloud ICP metrics and report pose/depth only.")
     p.add_argument("--json_root",   type=str, default="eval_results")
@@ -359,24 +545,23 @@ def main():
     amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(args.amp_dtype)
 
     # ── load model ───────────────────────────────────────────────────
-    mod_path, cls_name = args.model.split(":")
-    ModelClass = getattr(importlib.import_module(mod_path), cls_name)
-    if args.model_kwargs_file:
-        with open(args.model_kwargs_file, "r") as f:
-            kwargs = json.load(f)
+    if args.model_build_mode == "hydra":
+        model = build_model_from_hydra_config(args.config, device)
     else:
-        kwargs = json.loads(args.model_kwargs) if args.model_kwargs else {}
-    model = ModelClass(**kwargs).to(device).eval()
-
-    ckpt = torch.load(args.ckpt, map_location="cpu")
-    sd = ckpt.get("model", ckpt.get("state_dict", ckpt))
-    sd = {k.replace("module.", ""): v for k, v in sd.items()}
-    model.load_state_dict(sd, strict=False)
-    print(f"Model loaded from {args.ckpt}")
+        mod_path, cls_name = args.model.split(":")
+        ModelClass = getattr(importlib.import_module(mod_path), cls_name)
+        if args.model_kwargs_file:
+            with open(args.model_kwargs_file, "r") as f:
+                kwargs = json.load(f)
+        else:
+            kwargs = json.loads(args.model_kwargs) if args.model_kwargs else {}
+        model = ModelClass(**kwargs).to(device).eval()
+    load_info = load_checkpoint(model, args.ckpt, device, strict=args.strict_load)
+    model_img_size = int(getattr(getattr(model, "aggregator", None), "img_size", 518))
 
     # ── common dataset config ────────────────────────────────────────
     common = SimpleNamespace(
-        img_size=336, patch_size=14, rescale=None, rescale_aug=None,
+        img_size=model_img_size, patch_size=14, rescale=None, rescale_aug=None,
         landscape_check=False, training=False, get_nearby=True,
         inside_random=False, allow_duplicate_img=True, augs=None, debug=False,
     )
@@ -386,27 +571,30 @@ def main():
     # ── datasets ─────────────────────────────────────────────────────
     DATASETS = [
         ("PanoCity", PanoCityDataset, {
-            "PanoCity_DIR": args.panocity_root,
+            "PanoCity_DIR": _normalize_dataset_root("PanoCity", args.panocity_root),
             "min_num_images": max(2, args.frames_panocity),
         }, args.num_seqs_panocity, args.frames_panocity),
 
         ("Matterport3D", Matterport3DDataset, {
-            "Matterport3D_DIR": args.matterport_root,
+            "Matterport3D_DIR": _normalize_dataset_root("Matterport3D", args.matterport_root),
             "min_num_images": max(2, args.frames_matterport),
         }, args.num_seqs_matterport, args.frames_matterport),
 
         ("Stanford2D3DS", Stanford2D3DSDataset, {
-            "Stanford2D3DS_DIR": args.stanford_root,
+            "Stanford2D3DS_DIR": _normalize_dataset_root("Stanford2D3DS", args.stanford_root),
             "min_num_images": max(2, args.frames_stanford),
         }, args.num_seqs_stanford, args.frames_stanford),
 
         ("Structured3D", Structured3DDataset, {
-            "Structured3D_DIR": args.structured3d_root,
+            "Structured3D_DIR": _normalize_dataset_root("Structured3D", args.structured3d_root),
             "min_num_rooms": max(2, args.frames_structured3d),
         }, args.num_seqs_structured3d, args.frames_structured3d),
     ]
 
+    selected_datasets = {DATASET_KEYS[key] for key in args.datasets}
     for name, DatasetClass, ds_kwargs, n_seqs, n_frames in DATASETS:
+        if name not in selected_datasets:
+            continue
         if n_seqs == 0:
             print(f"Skipping {name} because requested sequence count is 0")
             continue
@@ -420,6 +608,9 @@ def main():
             name, ds, model, device, amp_dtype,
             num_seqs=n_seqs, num_frames=n_frames,
             depth_align=args.depth_align,
+            depth_lat_min=args.depth_lat_min,
+            depth_lat_max=args.depth_lat_max,
+            depth_irls_iters=args.depth_irls_iters,
             json_root=args.json_root,
             skip_pointcloud=args.no_pointcloud,
         )
@@ -427,7 +618,12 @@ def main():
     # ── global summary ───────────────────────────────────────────────
     summary_path = os.path.join(args.json_root, "eval_all_datasets.json")
     with open(summary_path, "w") as f:
-        json.dump({"results": all_results, "config": vars(args)}, f, indent=2)
+        json.dump({
+            "results": all_results,
+            "config": vars(args),
+            "model_load": load_info,
+            "model_img_size": model_img_size,
+        }, f, indent=2)
 
     print(f"\n{'=' * 72}")
     print(f"  All done — summary saved to {summary_path}")

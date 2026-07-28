@@ -33,6 +33,40 @@ def _absolute_value_scaling(
     return s.detach(), t.detach()
 
 
+def _irls_absrel_scaling(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    s_init: torch.Tensor,
+    max_iters: int = 100,
+) -> tuple:
+    """IRLS scale + shift minimizing ``|s * pred + t - gt| / gt``."""
+    s = s_init.to(device=pred.device, dtype=pred.dtype).detach()
+    t = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+    gt_weight = 1.0 / gt.clamp(min=1e-8)
+    ones = torch.ones_like(pred)
+
+    for _ in range(max_iters):
+        residual = (s * pred + t - gt).abs().clamp(min=1e-8)
+        w = gt_weight / residual
+
+        a00 = (w * pred * pred).sum()
+        a01 = (w * pred).sum()
+        a11 = w.sum()
+        b0 = (w * pred * gt).sum()
+        b1 = (w * gt).sum()
+        det = a00 * a11 - a01 * a01
+
+        if det.abs() < 1e-12:
+            s = (w * pred * gt).sum() / (w * pred * pred).sum().clamp(min=1e-12)
+            t = torch.zeros_like(t)
+            continue
+
+        s = (b0 * a11 - b1 * a01) / det
+        t = (a00 * b1 - a01 * b0) / det
+
+    return s.detach(), t.detach()
+
+
 def _absolute_value_scaling2(
     pred: torch.Tensor,
     gt: torch.Tensor,
@@ -74,6 +108,7 @@ def depth_evaluation(
     align_with_lstsq: bool = False,
     align_with_lad: bool = False,
     align_with_lad2: bool = False,
+    align_with_irls_absrel: bool = False,
     align_with_scale: bool = False,
     disp_input: bool = False,
     # L1-alignment hyper-params
@@ -92,6 +127,7 @@ def depth_evaluation(
         align_with_lstsq: Least-squares scale + shift.
         align_with_lad: Weiszfeld L1 scale + shift.
         align_with_lad2: SGD-based L1 scale + shift.
+        align_with_irls_absrel: IRLS scale + shift for AbsRel-style weighted L1.
         align_with_scale: Robust scale-only (no shift).
         disp_input: Operate in disparity space.
 
@@ -158,6 +194,10 @@ def depth_evaluation(
     elif align_with_lad2:
         s_init = (torch.median(gt) / torch.median(pred)).item()
         s, t = _absolute_value_scaling2(pred, gt, s_init=s_init, lr=lr, max_iters=max_iters)
+        pred = s * pred + t
+    elif align_with_irls_absrel:
+        s_init = torch.median(gt) / torch.median(pred).clamp(min=1e-8)
+        s, t = _irls_absrel_scaling(pred, gt, s_init=s_init, max_iters=max_iters)
         pred = s * pred + t
     elif align_with_scale:
         s = torch.nanmean(gt) / torch.nanmean(pred)

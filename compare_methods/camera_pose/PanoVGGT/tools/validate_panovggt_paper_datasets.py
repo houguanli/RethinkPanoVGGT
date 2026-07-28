@@ -52,29 +52,18 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def load_panovggt(repo: Path, ckpt: Path, device: torch.device):
+def load_panovggt(repo: Path, ckpt: Path, device: torch.device, config: str):
     sys.path.insert(0, str(repo))
-    from hydra import compose, initialize_config_dir
-    from omegaconf import OmegaConf
-    from evaluate_panocity import _build_model
+    from evaluation.eval_allpano import build_model_from_hydra_config, load_checkpoint
 
-    with initialize_config_dir(version_base=None, config_dir=str(repo / "training" / "config")):
-        cfg = compose(config_name="panocity_4rtx5000")
-    OmegaConf.resolve(cfg)
-
-    model = _build_model(cfg).to(device).eval()
-    payload = torch.load(ckpt, map_location=device, weights_only=False)
-    for key in ("model", "model_state_dict", "state_dict"):
-        if isinstance(payload, dict) and key in payload:
-            payload = payload[key]
-            break
-    state = {(key[7:] if key.startswith("module.") else key): value for key, value in payload.items()}
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    return model, {"missing": missing, "unexpected": unexpected}
+    model = build_model_from_hydra_config(config, device)
+    load_info = load_checkpoint(model, str(ckpt), device, strict=False)
+    return model, {"missing": load_info["missing"], "unexpected": load_info["unexpected"]}
 
 
 def build_dataset(repo: Path, name: str, root: Path, split: str, frames: int, img_size: int):
     sys.path.insert(0, str(repo))
+    from training.data.datasets.panocity import PanoCityDataset
     from training.data.datasets.matterport3d import Matterport3DDataset
     from training.data.datasets.stanford2d3ds import Stanford2D3DSDataset
     from training.data.datasets.structured3d import Structured3DDataset
@@ -97,6 +86,15 @@ def build_dataset(repo: Path, name: str, root: Path, split: str, frames: int, im
         augs=None,
         debug=False,
     )
+    if name == "PanoCity":
+        return PanoCityDataset(
+            common_conf=common,
+            split=split,
+            PanoCity_DIR=str(root),
+            min_num_images=max(2, frames),
+            len_test=10**9,
+            get_nearby=True,
+        )
     if name == "Matterport3D":
         return Matterport3DDataset(
             common_conf=common,
@@ -145,8 +143,10 @@ def compare_metrics(dataset: str, observed: dict, frames: int) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", default="/home/aoki/RethinkPanoVGGT_omega_compare_methods_only/compare_methods/camera_pose/PanoVGGT")
-    parser.add_argument("--ckpt", default="/home/aoki/RethinkPanoVGGT_omega_compare_methods_only/ckpt/PanoVGGT/model.pt")
-    parser.add_argument("--datasets", nargs="+", default=["matterport", "stanford", "structured3d"])
+    parser.add_argument("--ckpt", default="/home/aoki/RethinkPanoVGGT_omega_compare_methods_only/compare_methods/camera_pose/PanoVGGT/checkpoints/model_lowres.pt")
+    parser.add_argument("--config", default="default")
+    parser.add_argument("--datasets", nargs="+", default=["panocity", "matterport", "stanford", "structured3d"])
+    parser.add_argument("--panocity-root", default="/mnt/e/PanoVGGT_minimal_datasets/datasets/PanoCity")
     parser.add_argument("--matterport-root", default="/mnt/e/PanoVGGT_minimal_datasets/datasets/Matterport3D")
     parser.add_argument("--stanford-root", default="/mnt/e/PanoVGGT_minimal_datasets/datasets/Stanford2D3DS")
     parser.add_argument("--structured3d-root", default="/mnt/e/PanoVGGT_minimal_datasets/datasets/Structured3D")
@@ -154,7 +154,10 @@ def main() -> int:
     parser.add_argument("--num-seqs", type=int, default=10, help="-1 means all indexed sequences")
     parser.add_argument("--frames", type=int, default=3)
     parser.add_argument("--img-size", type=int, default=518)
-    parser.add_argument("--depth-align", default="median-scale", choices=["median-scale", "scale&shift"])
+    parser.add_argument("--depth-align", default="irls-absrel", choices=["median-scale", "robust-scale", "scale&shift", "irls-absrel", "metric"])
+    parser.add_argument("--depth-lat-min", type=float, default=-15.0)
+    parser.add_argument("--depth-lat-max", type=float, default=60.0)
+    parser.add_argument("--depth-irls-iters", type=int, default=100)
     parser.add_argument("--amp-dtype", default="bf16", choices=["none", "bf16", "fp16"])
     parser.add_argument("--with-pointcloud", action="store_true", help="Run expensive dense point-cloud metrics.")
     parser.add_argument("--seed", type=int, default=0)
@@ -173,8 +176,9 @@ def main() -> int:
         eval_mod.eval_pointcloud = lambda *_, **__: {}
     eval_one_dataset = eval_mod.eval_one_dataset
 
-    model, load_info = load_panovggt(repo, ckpt, device)
+    model, load_info = load_panovggt(repo, ckpt, device, args.config)
     name_map = {
+        "panocity": ("PanoCity", Path(args.panocity_root)),
         "matterport": ("Matterport3D", Path(args.matterport_root)),
         "stanford": ("Stanford2D3DS", Path(args.stanford_root)),
         "structured3d": ("Structured3D", Path(args.structured3d_root)),
@@ -201,7 +205,11 @@ def main() -> int:
             num_seqs=args.num_seqs,
             num_frames=args.frames,
             depth_align=args.depth_align,
+            depth_lat_min=args.depth_lat_min,
+            depth_lat_max=args.depth_lat_max,
+            depth_irls_iters=args.depth_irls_iters,
             json_root=str(json_root),
+            skip_pointcloud=not args.with_pointcloud,
         )
         results[dataset_name] = {
             "metrics": metrics,
