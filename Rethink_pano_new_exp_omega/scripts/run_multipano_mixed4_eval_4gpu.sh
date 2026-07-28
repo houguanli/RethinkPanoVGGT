@@ -32,8 +32,21 @@ NUM_YAW="${NUM_YAW:-4}"
 PRINT_EACH_SAMPLE="${PRINT_EACH_SAMPLE:-1}"
 RESUME="${RESUME:-1}"
 
-mkdir -p "$EVAL_OUT/shards" "$EVAL_OUT/progress"
+mkdir -p "$EVAL_OUT/shards" "$EVAL_OUT/progress" "$EVAL_OUT/dataset_summaries"
 rm -f "$EVAL_OUT"/progress/shard_*.json
+rm -f "$EVAL_OUT"/shards/shard_*_stanford2d3ds.json \
+  "$EVAL_OUT"/shards/shard_*_stanford2d3ds.csv \
+  "$EVAL_OUT"/shards/shard_*_stanford2d3ds_camera_pairs.csv \
+  "$EVAL_OUT"/shards/shard_*_matterport3d.json \
+  "$EVAL_OUT"/shards/shard_*_matterport3d.csv \
+  "$EVAL_OUT"/shards/shard_*_matterport3d_camera_pairs.csv \
+  "$EVAL_OUT"/shards/shard_*_structured3d.json \
+  "$EVAL_OUT"/shards/shard_*_structured3d.csv \
+  "$EVAL_OUT"/shards/shard_*_structured3d_camera_pairs.csv \
+  "$EVAL_OUT"/shards/shard_*_panocity.json \
+  "$EVAL_OUT"/shards/shard_*_panocity.csv \
+  "$EVAL_OUT"/shards/shard_*_panocity_camera_pairs.csv
+rm -f "$EVAL_OUT"/dataset_summaries/*_summary.json
 
 EVAL_CHECKPOINT="$CHECKPOINT"
 if [[ -n "${BASE_CHECKPOINT_OVERRIDE:-}" ]]; then
@@ -185,6 +198,48 @@ PY
   echo "[eval-4gpu] shard $rank pid=$child_pid log=$shard_log progress=$progress_file" | tee -a "$EVAL_OUT/eval_4gpu.log"
 done
 
+merge_ready_dataset_snapshots() {
+  local dataset rank ready output merge_log json_path csv_path camera_path
+  local -a jsons csvs camera_csvs
+  for dataset in stanford2d3ds matterport3d structured3d panocity; do
+    output="$EVAL_OUT/dataset_summaries/${dataset}_summary.json"
+    [[ -s "$output" ]] && continue
+    ready=1
+    jsons=()
+    csvs=()
+    camera_csvs=()
+    for rank in "${!GPU_LIST[@]}"; do
+      json_path="$EVAL_OUT/shards/shard_${rank}_${dataset}.json"
+      csv_path="$EVAL_OUT/shards/shard_${rank}_${dataset}.csv"
+      camera_path="$EVAL_OUT/shards/shard_${rank}_${dataset}_camera_pairs.csv"
+      jsons+=("$json_path")
+      csvs+=("$csv_path")
+      camera_csvs+=("$camera_path")
+      if [[ ! -s "$json_path" || ! -s "$csv_path" || ! -s "$camera_path" ]]; then
+        ready=0
+      fi
+    done
+    [[ "$ready" -eq 1 ]] || continue
+    merge_log="$EVAL_OUT/dataset_summaries/${dataset}_merge.log"
+    echo "[eval-4gpu] merging completed dataset=$dataset $(date --iso-8601=seconds)" | tee -a "$EVAL_OUT/eval_4gpu.log"
+    if PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/merge_mixed4_eval_shards.py \
+      --shard-json "${jsons[@]}" \
+      --shard-csv "${csvs[@]}" \
+      --shard-camera-csv "${camera_csvs[@]}" \
+      --output "$output" \
+      --per-sample-csv "$EVAL_OUT/dataset_summaries/${dataset}_per_sample.csv" \
+      --camera-pair-csv "$EVAL_OUT/dataset_summaries/${dataset}_camera_pairs.csv" \
+      --train-loss-csv "$TRAIN_LOSS_CSV" \
+      > "$merge_log" 2>&1; then
+      echo "[eval-4gpu] dataset summary ready: $output" | tee -a "$EVAL_OUT/eval_4gpu.log"
+    else
+      echo "[eval-4gpu] dataset merge failed: $dataset; inspect $merge_log" | tee -a "$EVAL_OUT/eval_4gpu.log"
+      tail -n 40 "$merge_log" | tee -a "$EVAL_OUT/eval_4gpu.log"
+      return 1
+    fi
+  done
+}
+
 if [[ "$SHOW_PROGRESS" == "1" ]]; then
   PROGRESS_PRINTED=0
   while true; do
@@ -317,12 +372,26 @@ PY
         done <<< "$gpu_proc_text"
       fi
     fi
+    merge_ready_dataset_snapshots
     [[ "$alive" -eq 0 ]] && break
     sleep "$PROGRESS_INTERVAL_SECONDS"
   done
   if [[ "$PROGRESS_PRINTED" == "1" ]]; then
     printf '\n'
   fi
+else
+  while true; do
+    alive=0
+    for pid in "${PIDS[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        alive=1
+        break
+      fi
+    done
+    merge_ready_dataset_snapshots
+    [[ "$alive" -eq 0 ]] && break
+    sleep "$PROGRESS_INTERVAL_SECONDS"
+  done
 fi
 
 status=0
@@ -335,6 +404,8 @@ if [[ "$status" -ne 0 ]]; then
   echo "[eval-4gpu] at least one shard failed; inspect $EVAL_OUT/shards/shard_*.log" | tee -a "$EVAL_OUT/eval_4gpu.log"
   exit "$status"
 fi
+
+merge_ready_dataset_snapshots
 
 echo "[eval-4gpu] merging shards $(date --iso-8601=seconds)" | tee -a "$EVAL_OUT/eval_4gpu.log"
 SHARD_JSONS=()

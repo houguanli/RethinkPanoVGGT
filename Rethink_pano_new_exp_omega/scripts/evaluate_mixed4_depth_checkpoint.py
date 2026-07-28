@@ -285,6 +285,16 @@ def main() -> None:
         for row in per_sample_rows[before_count:]:
             row["dataset"] = display_name
             row["split"] = split
+        write_dataset_shard_snapshot(
+            args=args,
+            train_args=train_args,
+            run=run,
+            minimal_name=minimal_name,
+            selected_datasets=selected_datasets,
+            dataset_pano_counts=dataset_pano_counts,
+            per_sample_rows=per_sample_rows,
+            camera_pair_rows=camera_pair_rows,
+        )
 
     result = {
         "config": str(args.config),
@@ -360,6 +370,70 @@ def read_csv_rows(path: Path | None) -> list[dict[str, Any]]:
             except (TypeError, ValueError):
                 pass
     return rows
+
+
+def write_dataset_shard_snapshot(
+    *,
+    args: argparse.Namespace,
+    train_args: argparse.Namespace,
+    run: dict[str, Any],
+    minimal_name: str,
+    selected_datasets: set[str],
+    dataset_pano_counts: dict[str, int],
+    per_sample_rows: list[dict[str, Any]],
+    camera_pair_rows: list[dict[str, Any]],
+) -> None:
+    if args.per_sample_csv is None:
+        return
+    run_name = str(run["name"])
+    dataset_rows = [row for row in per_sample_rows if str(row.get("run", "")) == run_name]
+    dataset_camera_rows = [row for row in camera_pair_rows if str(row.get("run", "")) == run_name]
+    sample_path = args.per_sample_csv.with_name(f"{args.per_sample_csv.stem}_{minimal_name}.csv")
+    camera_path = sample_path.with_name(f"{sample_path.stem}_camera_pairs.csv")
+    json_path = args.output.with_name(f"{args.output.stem}_{minimal_name}.json")
+    write_per_sample_csv(sample_path, dataset_rows)
+    write_camera_pair_csv(camera_path, dataset_camera_rows)
+    payload = {
+        "config": str(args.config),
+        "checkpoint": str(args.checkpoint),
+        "device": str(args.device),
+        "seed": int(args.seed),
+        "limit_per_dataset": int(args.limit_per_dataset),
+        "window_size": int(train_args.window_size),
+        "num_yaw": int(train_args.num_yaw),
+        "pitch_degrees": str(train_args.pitch_degrees),
+        "fov_degrees": float(train_args.fov_degrees),
+        "depth_evaluation_domain": "sampled_pinhole_windows",
+        "num_shards": int(args.num_shards),
+        "shard_rank": int(args.shard_rank),
+        "dataset_root": str(train_args.dataset_root),
+        "sample_policy": str(args.sample_policy),
+        "pano_count_policy": str(args.pano_count_policy),
+        "dataset_pano_counts": {key: int(value) for key, value in sorted(dataset_pano_counts.items())},
+        "datasets": sorted(selected_datasets),
+        "runs": [run],
+    }
+    atomic_write_json(json_path, payload)
+    print(
+        f"[EVAL-DATASET-DONE] dataset={minimal_name} samples={len(dataset_rows)} "
+        f"json={json_path} csv={sample_path}",
+        flush=True,
+    )
+
+
+def write_camera_pair_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CAMERA_PAIR_CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
 
 
 def manifest_rows_for_dataset(
