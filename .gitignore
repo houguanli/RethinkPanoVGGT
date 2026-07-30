@@ -1,13 +1,36 @@
-.ssh/
+# Python
 __pycache__/
 *.py[cod]
-.DS_Store
+*.egg-info/
 .pytest_cache/
-ckpt/
-dataset/
-outputs/
-Rethink_pano_new_exp_omega/outputs/
-comapre_method/**/outputs/
-comapre_method/*_ckpt/
-comapre_method/**/.git/
-comapre_method/**/examples/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# IDE and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local datasets and model weights
+/data/
+/datasets/
+/checkpoints/
+/ckpt/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Experiment products
+/logs/
+/outputs/
+/reports/
+/runs/
+/wandb/
+/.omm/
+*.log
+*.pid
+events.out.tfevents.*

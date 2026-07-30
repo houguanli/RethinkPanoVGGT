@@ -1,0 +1,33 @@
+[project]
+name = "p2p-vggt"
+version = "1.0.0"
+description = "Panorama-to-panorama VGGT-Omega reconstruction with LUNA adapters."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = [
+    "torch>=2.3",
+    "torchvision>=0.18",
+    "numpy<2",
+    "Pillow",
+    "einops",
+    "safetensors",
+    "opencv-python",
+    "PyYAML>=6.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+evaluation = [
+    "scipy",
+    "matplotlib",
+    "tensorboard",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vggt_omega*", "training*"]
