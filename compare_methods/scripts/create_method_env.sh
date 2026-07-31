@@ -4,7 +4,7 @@ set -euo pipefail
 METHOD="${1:-}"
 if [[ -z "${METHOD}" ]]; then
   echo "Usage: $0 <method|all>"
-  echo "Methods: panovggt panovggt_single panovggt_multi panovggt_camera panovggt_depth reloc3r vggt_omega vggt_omega_single vggt_omega_multi vggt_omega_camera vggt_omega_depth dap panda all"
+  echo "Methods: panovggt panovggt_single panovggt_multi panovggt_camera panovggt_depth reloc3r bifusepp pi3 vggt_omega vggt_omega_single vggt_omega_multi vggt_omega_camera vggt_omega_depth dap panda all"
   exit 2
 fi
 
@@ -92,6 +92,12 @@ print("ok reloc3r imports")
 PY
       )
       ;;
+    bifusepp)
+      (cd "${method_dir}" && python ../bifusepp_inference.py --check-only)
+      ;;
+    pi3)
+      (cd "${method_dir}" && python ../pi3_inference.py --check-only)
+      ;;
     vggt_omega_camera|vggt_omega_depth)
       (cd "${method_dir}" && PYTHONPATH="${COMPARE_ROOT}:${method_dir}:${PYTHONPATH:-}" python - <<'PY'
 import cv2  # noqa: F401
@@ -147,6 +153,8 @@ create_env() {
     panovggt_camera|panovggtcamera) check_method=panovggt_camera; env_name=cmp_panovggt; python_version=3.11; method_dir="${COMPARE_ROOT}/camera_pose/PanoVGGT"; reqs=("${method_dir}/requirements.txt");;
     panovggt_depth|panovggtdepth) check_method=panovggt_depth; env_name=cmp_panovggt; python_version=3.11; method_dir="${COMPARE_ROOT}/depth_geometry/PanoVGGT"; reqs=("${method_dir}/requirements.txt");;
     reloc3r|relo3r) check_method=reloc3r; env_name=cmp_reloc3r; python_version=3.11; method_dir="${COMPARE_ROOT}/camera_pose/Reloc3r"; reqs=("${method_dir}/requirements.txt" "${method_dir}/requirements_optional.txt");;
+    bifusepp|bifuse++) check_method=bifusepp; env_name=cmp_bifusepp; python_version=3.11; method_dir="${COMPARE_ROOT}/camera_pose/BiFusePlusPlus"; reqs=("${COMPARE_ROOT}/environments/bifusepp_requirements.txt");;
+    pi3) check_method=pi3; env_name=cmp_pi3; python_version=3.11; method_dir="${COMPARE_ROOT}/camera_pose/Pi3"; reqs=("${COMPARE_ROOT}/environments/pi3_requirements.txt");;
     vggt_omega_camera|vggtomegacamera) check_method=vggt_omega_camera; env_name=cmp_vggt_omega; python_version=3.10; method_dir="${COMPARE_ROOT}/camera_pose/VGGT-Omega"; reqs=("${method_dir}/requirements.txt");;
     vggt_omega_depth|vggtomegadepth) check_method=vggt_omega_depth; env_name=cmp_vggt_omega; python_version=3.10; method_dir="${COMPARE_ROOT}/depth_geometry/VGGT-Omega"; reqs=("${method_dir}/requirements.txt");;
     dap) check_method=dap; env_name=cmp_dap; python_version=3.12; method_dir="${COMPARE_ROOT}/depth_geometry/DAP"; reqs=("${method_dir}/requirements.txt");;
@@ -176,6 +184,9 @@ create_env() {
   if [[ "${check_method}" == vggt_omega_* ]]; then
     python -m pip install -e "${method_dir}"
   fi
+  if [[ "${check_method}" == "pi3" ]]; then
+    python -m pip install -e "${method_dir}"
+  fi
   post_install_check "${check_method}" "${method_dir}"
   python - <<'PY'
 import sys
@@ -187,7 +198,7 @@ PY
 check_submodules
 
 if [[ "${METHOD}" == "all" ]]; then
-  for m in panovggt_camera reloc3r vggt_omega_camera dap panda; do
+  for m in panovggt_camera reloc3r bifusepp pi3 vggt_omega_camera dap panda; do
     create_env "${m}"
   done
 elif [[ "${METHOD}" == "panovggt" || "${METHOD}" == "panovggt_single" || "${METHOD}" == "panovggtsingle" || "${METHOD}" == "panovggt_multi" || "${METHOD}" == "panovggtmulti" ]]; then

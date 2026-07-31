@@ -115,6 +115,51 @@ METHODS: Dict[str, MethodSpec] = {
         ],
         smoke_evaluate_command=["python", "evaluate_panocity.py", "--stage", "smoke"],
     ),
+    "bifusepp": MethodSpec(
+        name="bifusepp",
+        path=COMPARE_ROOT / "camera_pose" / "BiFusePlusPlus",
+        env_name="cmp_bifusepp",
+        requirements=[COMPARE_ROOT / "environments" / "bifusepp_requirements.txt"],
+        evaluate_command=[
+            "python", "../bifusepp_inference.py",
+            "--checkpoint", "../../../ckpt/BiFusePlusPlus/pretrain/supervised_pretrain.pkl",
+            "--input", "data/mp3d.jpg",
+            "--input", "data/panosuncg.jpg",
+            "--output-dir", "../../../outputs/camera_methods/bifusepp",
+        ],
+        smoke_evaluate_command=[
+            "python", "../bifusepp_inference.py",
+            "--checkpoint", "../../../ckpt/BiFusePlusPlus/pretrain/supervised_pretrain.pkl",
+            "--input", "data/mp3d.jpg",
+            "--output-dir", "../../../outputs/camera_methods/bifusepp_smoke",
+        ],
+        supports_native_finetune=False,
+    ),
+    "pi3": MethodSpec(
+        name="pi3",
+        path=COMPARE_ROOT / "camera_pose" / "Pi3",
+        env_name="cmp_pi3",
+        requirements=[COMPARE_ROOT / "environments" / "pi3_requirements.txt"],
+        editable=True,
+        evaluate_command=[
+            "python", "../pi3_inference.py",
+            "--checkpoint", "../../../ckpt/Pi3/model.safetensors",
+            "--data-path", "examples/house",
+            "--data-path", "examples/parkour",
+            "--max-frames", "2",
+            "--pixel-limit", "50176",
+            "--output-dir", "../../../outputs/camera_methods/pi3",
+        ],
+        smoke_evaluate_command=[
+            "python", "../pi3_inference.py",
+            "--checkpoint", "../../../ckpt/Pi3/model.safetensors",
+            "--data-path", "examples/parkour",
+            "--max-frames", "2",
+            "--pixel-limit", "50176",
+            "--output-dir", "../../../outputs/camera_methods/pi3_smoke",
+        ],
+        supports_native_finetune=False,
+    ),
     "panovggt_multi_camera": MethodSpec(
         name="panovggt_multi_camera",
         path=COMPARE_ROOT / "camera_pose" / "PanoVGGT",
@@ -347,6 +392,18 @@ GROUPS: Dict[str, MethodGroup] = {
         finetune_method="reloc3r",
         evaluate_methods=["reloc3r"],
     ),
+    "bifusepp": MethodGroup(
+        name="bifusepp",
+        env_name="cmp_bifusepp",
+        finetune_method="bifusepp",
+        evaluate_methods=["bifusepp"],
+    ),
+    "pi3": MethodGroup(
+        name="pi3",
+        env_name="cmp_pi3",
+        finetune_method="pi3",
+        evaluate_methods=["pi3"],
+    ),
     "vggt_omega": MethodGroup(
         name="vggt_omega",
         env_name="cmp_vggt_omega",
@@ -380,6 +437,7 @@ GROUPS: Dict[str, MethodGroup] = {
 }
 
 ALIASES: Dict[str, str] = {
+    "bifuse++": "bifusepp",
     "panovggtcamera": "panovggt_camera",
     "panovggtdepth": "panovggt_depth",
     "panovggtmulti": "panovggt_multi",

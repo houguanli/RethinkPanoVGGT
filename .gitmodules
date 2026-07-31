@@ -1,0 +1,6 @@
+[submodule "compare_methods/camera_pose/BiFusePlusPlus"]
+	path = compare_methods/camera_pose/BiFusePlusPlus
+	url = https://github.com/fuenwang/BiFusev2.git
+[submodule "compare_methods/camera_pose/Pi3"]
+	path = compare_methods/camera_pose/Pi3
+	url = https://github.com/yyfz/Pi3.git

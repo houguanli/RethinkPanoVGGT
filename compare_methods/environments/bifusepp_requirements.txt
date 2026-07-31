@@ -1,0 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1
+torchvision==0.20.1
+numpy==1.26.4
+scipy==1.13.1
+pillow==11.1.0
+imageio==2.37.0
+opencv-python-headless==4.10.0.84
+gdown==5.2.0

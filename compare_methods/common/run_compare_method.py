@@ -43,7 +43,7 @@ def _runtime_config_paths(spec) -> list[Path]:
         paths.append(spec.path / "config" / "train_panocity_4rtx5000.yaml")
     elif spec.name == "panda":
         paths.append(spec.path / "config" / "metric_depth" / "train_panocity_4rtx5000.yaml")
-    return list(dict.fromkeys(path for path in paths if path and path.exists()))
+    return list(dict.fromkeys(path for path in paths if path and path.is_file()))
 
 
 def _iter_config_assets(value: Any, parent_key: str = "") -> Iterable[tuple[str, str]]:
@@ -89,12 +89,15 @@ def _check_asset_path(label: str, raw_value: str, cwd: Path, *, allow_missing_ge
 
 
 def _validate_config_assets(spec) -> None:
+    config_paths = _runtime_config_paths(spec)
+    if not config_paths:
+        return
     try:
         import yaml
     except Exception as exc:
         raise SystemExit(f"PyYAML is required to validate config assets: {exc}") from exc
 
-    for path in _runtime_config_paths(spec):
+    for path in config_paths:
         try:
             payload = yaml.safe_load(path.read_text(encoding="utf-8", errors="ignore"))
         except Exception:

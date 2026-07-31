@@ -114,6 +114,8 @@ env_for_method() {
   case "$1" in
     panovggt|panovggt_single|panovggtsingle|panovggt_multi|panovggtmulti|panovggtcamera|panovggt_camera|panovggtdepth|panovggt_depth|panovggt_multi_camera|panovggt_multi_depth) echo cmp_panovggt;;
     reloc3r|relo3r) echo cmp_reloc3r;;
+    bifusepp|bifuse++) echo cmp_bifusepp;;
+    pi3) echo cmp_pi3;;
     vggt_omega|vggtomega|vggt_omega_single|vggtomegasingle|vggt_omega_multi|vggtomegamulti|vggt_omega_camera|vggtomegacamera|vggt_omega_depth|vggtomegadepth|vggt_omega_multi_camera|vggt_omega_multi_depth) echo cmp_vggt_omega;;
     dap) echo cmp_dap;;
     panda) echo cmp_panda;;
@@ -127,6 +129,8 @@ resolve_installed_env() {
   case "${canonical}" in
     cmp_panovggt) aliases+=("cmppanovggt");;
     cmp_reloc3r) aliases+=("cmpreloc3r");;
+    cmp_bifusepp) aliases+=("cmpbifusepp");;
+    cmp_pi3) aliases+=("cmppi3");;
     cmp_vggt_omega) aliases+=("cmpvggtomega");;
     cmp_dap) aliases+=("cmpdap");;
     cmp_panda) aliases+=("cmppanda");;
@@ -183,6 +187,12 @@ check_method_assets() {
       ;;
     reloc3r|relo3r)
       require_method_relative_file "${COMPARE_ROOT}/camera_pose/Reloc3r" "../../../ckpt/Reloc3r-512/Reloc3r-512.pth" "Reloc3r checkpoint"
+      ;;
+    bifusepp|bifuse++)
+      require_method_relative_file "${COMPARE_ROOT}/camera_pose/BiFusePlusPlus" "../../../ckpt/BiFusePlusPlus/pretrain/supervised_pretrain.pkl" "BiFuse++ supervised checkpoint"
+      ;;
+    pi3)
+      require_method_relative_file "${COMPARE_ROOT}/camera_pose/Pi3" "../../../ckpt/Pi3/model.safetensors" "Pi3 checkpoint"
       ;;
     vggt_omega|vggtomega|vggt_omega_camera|vggtomegacamera)
       require_method_relative_file "${COMPARE_ROOT}/camera_pose/VGGT-Omega" "../../../ckpt/VGGT-Omega/vggt_omega_1b_512.pt" "VGGT-Omega checkpoint"

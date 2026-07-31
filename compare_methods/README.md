@@ -13,6 +13,11 @@ appear in more than one group.
 | PanoVGGT | Cloned from `https://github.com/YijingGuo-June/PanoVGGT` | `requirements.txt` updated to match README PyTorch/xFormers versions and add `iopath`, `wcmatch`. |
 | VGGT-Omega | Cloned from `https://github.com/facebookresearch/vggt-omega` | Existing `requirements.txt` plus `requirements_demo.txt` cover inference/demo imports; no training code in public repo. |
 | Reloc3r | Cloned from `https://github.com/ffrivera0/reloc3r` | CroCo submodule initialized; requirements expanded for inference, evaluation, training, and dataset preprocessing. |
+| BiFuse++ | Official `fuenwang/BiFusev2` submodule | Pinned inference environment and headless two-panorama checkpoint test; supervised release is DepthNet-only. |
+| Pi3 | Official `yyfz/Pi3` submodule | Pinned PyTorch 2.5.1 environment, local safetensors routing, camera-pose and PLY sample tests. |
+
+BiFuse++ and Pi3 source, checkpoint, license, and sample commands are documented
+in [`camera_pose/BIFUSEPP_PI3.md`](camera_pose/BIFUSEPP_PI3.md).
 
 ## depth_geometry
 
