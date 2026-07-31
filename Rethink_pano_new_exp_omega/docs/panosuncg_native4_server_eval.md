@@ -92,6 +92,7 @@ bash scripts/run_panosuncg_0716_native4_4gpu.sh \
 
 ```text
 <output-dir>/
+├── evaluation_summary.json
 ├── depth_native4/
 │   ├── metrics_summary.json
 │   ├── per_sample_metrics.csv
@@ -108,6 +109,10 @@ bash scripts/run_panosuncg_0716_native4_4gpu.sh \
     ├── run_config.json
     └── run.log
 ```
+
+`evaluation_summary.json` contains the complete nested depth and camera
+summaries plus a compact `headline_metrics` section. It is written atomically
+after all requested stages finish.
 
 Re-run the identical command to resume. The launcher and each evaluator use
 non-blocking file locks to reject duplicate writers.

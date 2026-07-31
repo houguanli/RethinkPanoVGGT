@@ -338,4 +338,11 @@ if [[ "$DEPTH_ONLY" -eq 0 ]]; then
   echo "[panosuncg-native4] camera complete: $CAMERA_OUT/camera_center_summary.json"
 fi
 
+combine_args=(--output-dir "$OUTPUT_DIR")
+if [[ "$DEPTH_ONLY" -eq 1 ]]; then
+  combine_args+=(--allow-missing-camera)
+fi
+"$PYTHON_BIN" scripts/combine_panosuncg_native4_results.py "${combine_args[@]}"
+echo "[panosuncg-native4] combined summary: $OUTPUT_DIR/evaluation_summary.json"
+
 echo "[panosuncg-native4] all requested stages completed"
