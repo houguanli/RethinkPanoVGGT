@@ -4,7 +4,8 @@ This entry point reproduces the PanoSUNCG protocol used for the local 0716
 full-pipeline result:
 
 - one complete ERP input per depth sample;
-- checkpoint-native four `384 x 384` pinhole windows;
+- four pinhole windows at the checkpoint-native square resolution (for example,
+  `384 x 384` for 0716 or `512 x 512` for the 0719 checkpoint);
 - four yaw angles, pitch `-15` degrees, FOV `75` degrees;
 - ground truth sampled onto the same rays and converted from radial depth to
   pinhole Z-depth;
@@ -35,7 +36,7 @@ PanoSUNCG_zeroshot/
 The server dataset is expected at:
 
 ```text
-/AOKI/whitehole/PanoVGGT_minimal_datasets/datasets/PanoSUNCG_zeroshot
+/whitehole/AOKI/panovggt/PanoSUNCG_zeroshot
 ```
 
 ## Preflight
@@ -45,20 +46,21 @@ From `Rethink_pano_new_exp_omega`:
 ```bash
 bash scripts/run_panosuncg_0716_native4_4gpu.sh \
   --checkpoint /ABSOLUTE/PATH/TO/last.pt \
-  --dataset-root /AOKI/whitehole/PanoVGGT_minimal_datasets/datasets/PanoSUNCG_zeroshot \
+  --dataset-root /whitehole/AOKI/panovggt/PanoSUNCG_zeroshot \
   --output-dir /ABSOLUTE/PATH/TO/eval_panosuncg_0716_native4 \
   --gpus 0,1,2,3 \
   --check-only
 ```
 
-The checkpoint preflight rejects a sampler other than `384 / 4 / -15 / 75`.
+The checkpoint preflight accepts its native positive square window size and
+rejects geometry other than `4 yaw / -15 pitch / 75 FOV`.
 
 ## Full depth and camera evaluation
 
 ```bash
 nohup bash scripts/run_panosuncg_0716_native4_4gpu.sh \
   --checkpoint /ABSOLUTE/PATH/TO/last.pt \
-  --dataset-root /AOKI/whitehole/PanoVGGT_minimal_datasets/datasets/PanoSUNCG_zeroshot \
+  --dataset-root /whitehole/AOKI/panovggt/PanoSUNCG_zeroshot \
   --output-dir /ABSOLUTE/PATH/TO/eval_panosuncg_0716_native4 \
   --gpus 0,1,2,3 \
   > /ABSOLUTE/PATH/TO/eval_panosuncg_0716_native4/launcher.log 2>&1 &

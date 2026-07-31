@@ -186,7 +186,7 @@ echo "[panosuncg-native4] config=$CONFIG"
 echo "[panosuncg-native4] dataset=$ZERO_ROOT"
 echo "[panosuncg-native4] output=$OUTPUT_DIR"
 echo "[panosuncg-native4] GPUs=$GPUS"
-echo "[panosuncg-native4] depth_protocol=4x384, yaw=4, pitch=-15, FOV=75, direct-window weighted 10-step scale-only IRLS"
+echo "[panosuncg-native4] depth_protocol=4 checkpoint-native square windows, yaw=4, pitch=-15, FOV=75, direct-window weighted 10-step scale-only IRLS"
 echo "[panosuncg-native4] camera_protocol=5 evenly spaced frames, per-trajectory Sim(3)"
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
@@ -210,15 +210,21 @@ actual = {
     "fov_degrees": args.get("fov_degrees"),
 }
 print(f"[panosuncg-native4][checkpoint] {actual}")
-expected = (384, 4, "-15", 75.0)
 observed = (
-    actual["window_size"],
     actual["num_yaw"],
     str(actual["pitch_degrees"]),
     float(actual["fov_degrees"]),
 )
-if observed != expected:
-    raise RuntimeError(f"Checkpoint sampler mismatch: expected {expected}, got {observed}")
+expected_geometry = (4, "-15", 75.0)
+if observed != expected_geometry:
+    raise RuntimeError(
+        "Checkpoint sampler geometry mismatch: "
+        f"expected {expected_geometry}, got {observed}"
+    )
+window_size = actual["window_size"]
+if not isinstance(window_size, int) or window_size <= 0:
+    raise RuntimeError(f"Invalid checkpoint-native window_size: {window_size!r}")
+print(f"[panosuncg-native4][checkpoint] accepted native window_size={window_size}")
 PY
   echo "[panosuncg-native4] check complete; evaluation not started"
   exit 0

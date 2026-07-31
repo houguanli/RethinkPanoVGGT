@@ -2,7 +2,7 @@
 """Evaluate PanoSUNCG in the 0716 checkpoint-native four-window domain.
 
 One complete ERP is passed to the model. The checkpoint restores its native
-four-window sampler (384 square pixels, four yaw angles, pitch -15 degrees,
+four-window sampler (checkpoint-native square resolution, four yaw angles, pitch -15 degrees,
 75-degree FOV). Ground-truth radial ERP depth is sampled onto exactly the same
 rays and converted to pinhole Z-depth. Metrics are computed directly in window
 space with the repository's solid-angle weighting, overlap de-duplication and
@@ -245,17 +245,24 @@ def main() -> None:
         "fov_degrees": float(train_args.fov_degrees),
         "views_per_panorama": int(train_args.num_yaw) * len(pitches),
     }
-    expected_sampler = {
-        "window_size": 384,
+    expected_geometry = {
         "num_yaw": 4,
         "pitch_degrees": [-15.0],
         "fov_degrees": 75.0,
         "views_per_panorama": 4,
     }
-    if native_sampler != expected_sampler:
+    observed_geometry = {
+        key: native_sampler[key] for key in expected_geometry
+    }
+    if observed_geometry != expected_geometry:
         raise RuntimeError(
-            "This entry point is intentionally protocol-locked. "
-            f"Expected {expected_sampler}, got {native_sampler}"
+            "This entry point is geometry-locked but uses the checkpoint-native "
+            "square window resolution. "
+            f"Expected {expected_geometry}, got {native_sampler}"
+        )
+    if native_sampler["window_size"] <= 0:
+        raise RuntimeError(
+            f"Invalid checkpoint-native window_size: {native_sampler['window_size']}"
         )
 
     run_config = {
