@@ -16,8 +16,8 @@ data:
   use_metadata_weights: false
   checkpoint: checkpoints/vggt_omega_1b_512.pt
   pano_sample_mode: variable_neighborhood
-  pano_min_count: 3
-  pano_max_count: 9
+  pano_min_count: 2
+  pano_max_count: 10
   pano_grouping: nearest
   output_depth_scale: 1000.0
   invalid_depth_value: 65535.0
@@ -26,11 +26,11 @@ data:
 sampler:
   patch_size: 16
   window_size: 384
-  # Keep exactly the same eight-window geometry as the 2-pano warmup. Only
-  # the panorama count changes during the LUNA curriculum.
+  # The first two stages use four uniformly spaced yaw views. The final stage
+  # increases the yaw density to six views while keeping one -15-degree ring.
   num_yaw: 4
-  pitch_degrees: "-30,30"
-  fov_degrees: 90.0
+  pitch_degrees: "-15"
+  fov_degrees: 60.0
   pano_height: 512
   pano_width: 1024
   # The 2026-07-16 reference run used the final 2026-07-15 configuration:
@@ -43,8 +43,8 @@ model:
   enable_pano_global_token: true
   enable_pano_geometry_residual: false
   aggregator_use_checkpoint: true
-  # Decode dense depth in smaller frame chunks so the final 9-pano x
-  # 8-window (72-view) Panocity sample remains bounded.
+  # Decode dense depth in smaller frame chunks so the final 10-pano x
+  # 6-window (60-view) PanoCity sample remains bounded.
   dense_head_frames_chunk_size: 1
   dense_head_use_checkpoint: true
   dense_head_return_confidence: false
@@ -106,21 +106,24 @@ optimization:
   lr: 5.0e-5
   weight_decay: 0.05
   grad_clip: 1.0
-  optimizer_type: adafactor
+  optimizer_type: adamw
   batch_size: 1
   training_stages:
-    - name: multipano_camera_bootstrap_3p_all384
+    - name: multipano_camera_bootstrap_2p_4w_384
       until_minutes: 120.0
       window_size: 384
+      num_yaw: 4
+      pitch_degrees: "-15"
+      fov_degrees: 60.0
       dense_head_frames_chunk_size: 1
-      pano_min_count: 3
-      pano_max_count: 3
+      pano_min_count: 2
+      pano_max_count: 2
       trainable: luna_residual_tail_heads
       lr: 5.0e-5
       pred_depth_scale_lr: null
       dataset_depth_scale_lr: null
       weight_decay: 0.05
-      optimizer_type: adafactor
+      optimizer_type: adamw
       camera_loss_weight: 0.15
       camera_center_residual_weight: 0.5
       global_point_loss_weight: 0.0
@@ -129,18 +132,21 @@ optimization:
       train_depth_residual: false
       learn_pred_depth_scale: false
       learn_dataset_depth_scale: false
-    - name: multipano_camera_expand_6p_all384
+    - name: multipano_camera_expand_2to6p_4w_384
       until_minutes: 300.0
       window_size: 384
+      num_yaw: 4
+      pitch_degrees: "-15"
+      fov_degrees: 60.0
       dense_head_frames_chunk_size: 1
-      pano_min_count: 3
+      pano_min_count: 2
       pano_max_count: 6
       trainable: luna_residual_tail_heads
       lr: 2.0e-5
       pred_depth_scale_lr: null
       dataset_depth_scale_lr: null
       weight_decay: 0.05
-      optimizer_type: adafactor
+      optimizer_type: adamw
       camera_loss_weight: 0.25
       camera_center_residual_weight: 0.5
       global_point_loss_weight: 0.05
@@ -149,17 +155,20 @@ optimization:
       train_depth_residual: false
       learn_pred_depth_scale: false
       learn_dataset_depth_scale: false
-    - name: multipano_camera_full_9p_all384
-      window_size: 384
+    - name: multipano_camera_full_2to10p_6w_512
+      window_size: 512
+      num_yaw: 6
+      pitch_degrees: "-15"
+      fov_degrees: 60.0
       dense_head_frames_chunk_size: 1
-      pano_min_count: 3
-      pano_max_count: 9
+      pano_min_count: 2
+      pano_max_count: 10
       trainable: luna_residual_tail_heads
       lr: 1.0e-5
       pred_depth_scale_lr: null
       dataset_depth_scale_lr: null
       weight_decay: 0.05
-      optimizer_type: adafactor
+      optimizer_type: adamw
       camera_loss_weight: 0.25
       camera_center_residual_weight: 0.5
       global_point_loss_weight: 0.10

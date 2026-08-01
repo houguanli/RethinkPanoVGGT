@@ -28,7 +28,7 @@ can be loaded with non-strict state-dict matching.
 ## Repository layout
 
 ```text
-configs/train_multipano.yaml       reference 3-to-9 panorama curriculum
+configs/train_multipano.yaml       reference 2-to-10 panorama curriculum
 evaluation_common/                ERP depth splatting shared by evaluation/tests
 scripts/                          data indexing, evaluation, and reconstruction
 tests/                            CPU-oriented unit and geometry tests
@@ -141,9 +141,21 @@ torchrun --standalone --nproc_per_node=4 training/launch.py \
 ```
 
 Explicit command-line arguments override values from the YAML file. The
-reference schedule uses 1024x512 ERP inputs, eight 384x384 virtual views per
-panorama, and a 3-to-6-to-9 panorama curriculum. Reduce the window or panorama
-count for lower-memory hardware.
+reference schedule uses 1024x512 ERP inputs and the following curriculum. All
+windows use a 60-degree field of view and a -15-degree pitch.
+
+| Stage | Time range | Panoramas | Windows / panorama | Window resolution | Learning rate | Loss weights (depth / camera / point) | Trainable modules | Optimizer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Bootstrap | 0--2 h | 2 | 4 | 384x384 | 5e-5 | 1.0 / 0.15 / 0.00 | LUNA residuals and task heads | AdamW |
+| Expand | 2--5 h | 2--6 | 4 | 384x384 | 2e-5 | 1.0 / 0.25 / 0.05 | LUNA residuals and task heads | AdamW |
+| Full | 5--10 h | 2--10 | 6 | 512x512 | 1e-5 | 1.0 / 0.25 / 0.10 | LUNA residuals and task heads | AdamW |
+
+The YAML selector name for the listed trainable modules is
+`luna_residual_tail_heads`. The depth weight is the unit-weighted primary
+objective; `global_point_loss_weight` implements the shared-frame point term.
+Batch size is one per GPU, BF16 is enabled, transformer and dense-head
+checkpointing are enabled, and dense predictions are decoded one frame at a
+time. Reduce the window or panorama count for lower-memory hardware.
 
 ## Evaluation
 
