@@ -106,3 +106,43 @@ The following checks were run on CUDA on 2026-08-01, not as dry runs:
 
 Pi3 may report that the compiled RoPE2D extension is unavailable. Its tested
 PyTorch fallback is functionally valid but slower.
+
+## PanoSUNCG zero-shot benchmark
+
+The shared evaluator uses the official DA-2 split (3944 depth samples) and the
+same 118 complete trajectories, five evenly spaced frames, and Sim(3) camera
+alignment as the existing comparison table. Depth alignment is fitted on the
+full valid ERP with 100-step AbsRel IRLS scale+shift; AbsRel, RMSE, delta1, and
+delta2 are then accumulated pixel-micro over latitude -15 to +60 degrees.
+
+```bash
+bash compare_methods/scripts/run_bifuse_pi3_panosuncg.sh \
+  /path/to/PanoSUNCG_zeroshot \
+  /path/to/results
+
+python compare_methods/camera_pose/update_panosuncg_zeroshot_table.py \
+  --results-root /path/to/results \
+  --table /path/to/zero_shot_single_column.tex
+```
+
+The table updater refuses partial results and supports both the older
+three-subtable camera layout and the newer unified 11-column layout. The run
+script is resumable by default; set `RESUME=0` to replace an existing run.
+
+Pi3 is a perspective model. For depth, each ERP is converted to six 196x196
+90-degree cube faces and the predicted local Z-depth is reconstructed to a
+full ERP before alignment. For camera evaluation, each trajectory contributes
+one canonical front-facing 196x196 perspective per panorama. BiFuse++ uses its
+native 512x1024 ERP path. Its camera result is marked with a caveat because the
+released self-supervised camera checkpoint was trained on PanoSUNCG and is
+therefore in-domain rather than strict zero-shot; its supervised Matterport3D
+depth checkpoint is a valid zero-shot depth evaluation. The supervised depth
+path uses the normalization in the training/validation combined forward and
+then the release demo's `[0, 10]` output clipping.
+
+Complete local results from 2026-08-01:
+
+| Method | Depth AbsRel | Depth RMSE | Depth delta1 | Depth delta2 | Camera AUC@30 | Camera direction mean/median | Camera ATE/nATE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| BiFuse++ | 0.3277 | 1.0401 | 0.4124 | 0.6583 | 0.5147 | 20.0101 / 12.8581 | 0.6520 / 0.3523 |
+| Pi3 | 0.1272 | 0.3845 | 0.8432 | 0.9598 | 0.7553 | 11.7066 / 3.2082 | 0.6470 / 0.2189 |

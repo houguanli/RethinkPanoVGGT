@@ -175,9 +175,15 @@ def main() -> int:
         batch = _load_image(path)
         loaded_batches.append(batch)
         with torch.inference_mode():
-            depth = model.dnet(batch.to(device))[0]
-            if args.mode == "selfsupervised":
-                depth = 1.0 / (10.0 * torch.sigmoid(depth) + 0.01)
+            device_batch = batch.to(device)
+            if args.mode == "supervised":
+                # Training calls the combined model, whose forward normalizes
+                # RGB before DepthNet. The released demo bypasses this step.
+                depth = model(device_batch)[0]
+            else:
+                normalized = model.preprocess(device_batch)
+                raw_inverse_depth = model.dnet(normalized)[0]
+                depth = 1.0 / (10.0 * torch.sigmoid(raw_inverse_depth) + 0.01)
         depth_np = depth[0, 0].float().cpu().numpy().clip(0.0, 10.0)
         stem = _safe_stem(path, used)
         npy_path = output_dir / f"{stem}_depth.npy"

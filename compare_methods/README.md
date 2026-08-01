@@ -16,8 +16,9 @@ appear in more than one group.
 | BiFuse++ | Official `fuenwang/BiFusev2` submodule | Pinned inference environment and headless two-panorama checkpoint test; supervised release is DepthNet-only. |
 | Pi3 | Official `yyfz/Pi3` submodule | Pinned PyTorch 2.5.1 environment, local safetensors routing, camera-pose and PLY sample tests. |
 
-BiFuse++ and Pi3 source, checkpoint, license, and sample commands are documented
-in [`camera_pose/BIFUSEPP_PI3.md`](camera_pose/BIFUSEPP_PI3.md).
+BiFuse++ and Pi3 source, checkpoint, license, sample commands, and complete
+PanoSUNCG depth/camera protocol are documented in
+[`camera_pose/BIFUSEPP_PI3.md`](camera_pose/BIFUSEPP_PI3.md).
 
 ## depth_geometry
 
