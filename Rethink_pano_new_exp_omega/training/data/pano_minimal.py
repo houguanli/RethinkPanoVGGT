@@ -204,6 +204,9 @@ class PanoMinimalDataset(Dataset):
         group_scene_keys = {_scene_group_key(self.items[item_index]) for item_index in group}
         if group_scene_keys != {scene_key}:
             raise RuntimeError(f"Multi-pano group crosses scenes: {sorted(group_scene_keys)}")
+        if getattr(self, "preserve_exact_group_duplicates", False):
+            return [self._read_item_with_fallback(item_index) for item_index in group]
+
         scene_indices = self.indices_by_scene.get(scene_key, list(group))
         samples: List[Dict] = []
         used_indices: set[int] = set()

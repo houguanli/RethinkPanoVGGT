@@ -35,8 +35,8 @@ sampler:
   # The 2026-07-16 reference run used the final 2026-07-15 configuration:
   # Patch GeoRA in the second half (layers 12..23) and Camera GeoRA at layer 23.
   # These numeric aliases preserve that 12/1 layout; use 24/24 for all-layer ablations.
-  luna_patch_layer_count: 12
-  luna_camera_layer_count: 1
+  luna_patch_layer_count: 24
+  luna_camera_layer_count: 24
 
 model:
   enable_pano_global_token: true
