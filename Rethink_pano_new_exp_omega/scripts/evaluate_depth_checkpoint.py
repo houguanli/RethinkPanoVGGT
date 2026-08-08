@@ -59,6 +59,7 @@ from training.train_pano_omega import (  # noqa: E402
 )
 from vggt_omega.utils.rotation import mat_to_quat, quat_to_mat  # noqa: E402
 from vggt_omega.models.layers.pano_position import pinhole_rays, yaw_pitch_to_axes  # noqa: E402
+from vggt_omega.data.pano_sampler import resolve_fov_degrees  # noqa: E402
 
 
 DEPTH_METRIC_PROTOCOL = "dual_covered_sphere_and_erp_stable_polar_prior_v2"
@@ -359,6 +360,11 @@ def main() -> None:
             )
         )
 
+    fov_x_degrees, fov_y_degrees = resolve_fov_degrees(
+        train_args.fov_degrees,
+        getattr(train_args, "fov_x_degrees", None),
+        getattr(train_args, "fov_y_degrees", None),
+    )
     result = {
         "config": str(args.config),
         "checkpoint": str(args.checkpoint),
@@ -382,6 +388,8 @@ def main() -> None:
             "pano_max_count": int(getattr(train_args, "pano_max_count", 1)),
             "pitch_degrees": str(train_args.pitch_degrees),
             "fov_degrees": float(train_args.fov_degrees),
+            "fov_x_degrees": fov_x_degrees,
+            "fov_y_degrees": fov_y_degrees,
         },
         "train_loss_reference": read_train_loss_reference(args.train_loss_csv),
         "runs": runs,
@@ -440,7 +448,15 @@ def apply_checkpoint_eval_defaults(args: argparse.Namespace, payload: dict[str, 
     ):
         if key in ckpt_args and ckpt_args[key] is not None:
             setattr(args, key, ckpt_args[key])
-    for key in ("window_size", "patch_size", "num_yaw", "pitch_degrees", "fov_degrees"):
+    for key in (
+        "window_size",
+        "patch_size",
+        "num_yaw",
+        "pitch_degrees",
+        "fov_degrees",
+        "fov_x_degrees",
+        "fov_y_degrees",
+    ):
         if key in ckpt_args and ckpt_args[key] is not None:
             setattr(args, key, ckpt_args[key])
 

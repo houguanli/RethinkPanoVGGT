@@ -52,6 +52,7 @@ from training.train_pano_omega import (  # noqa: E402
     resolve_device,
     set_seed,
 )
+from vggt_omega.data.pano_sampler import resolve_fov_degrees  # noqa: E402
 
 
 DATASETS = [
@@ -329,6 +330,11 @@ def main() -> None:
             camera_pair_rows=camera_pair_rows,
         )
 
+    fov_x_degrees, fov_y_degrees = resolve_fov_degrees(
+        train_args.fov_degrees,
+        getattr(train_args, "fov_x_degrees", None),
+        getattr(train_args, "fov_y_degrees", None),
+    )
     result = {
         "config": str(args.config),
         "checkpoint": str(args.checkpoint),
@@ -341,6 +347,8 @@ def main() -> None:
         "num_yaw": int(train_args.num_yaw),
         "pitch_degrees": str(train_args.pitch_degrees),
         "fov_degrees": float(train_args.fov_degrees),
+        "fov_x_degrees": fov_x_degrees,
+        "fov_y_degrees": fov_y_degrees,
         "depth_evaluation_domain": "covered_sphere_sampled_pinhole_windows",
         "depth_evaluation_domains": {
             "covered_sphere": "sampled pinhole windows with solid-angle weights and overlap de-duplication",
@@ -433,6 +441,11 @@ def write_dataset_shard_snapshot(
     json_path = args.output.with_name(f"{args.output.stem}_{minimal_name}.json")
     write_per_sample_csv(sample_path, dataset_rows)
     write_camera_pair_csv(camera_path, dataset_camera_rows)
+    fov_x_degrees, fov_y_degrees = resolve_fov_degrees(
+        train_args.fov_degrees,
+        getattr(train_args, "fov_x_degrees", None),
+        getattr(train_args, "fov_y_degrees", None),
+    )
     payload = {
         "config": str(args.config),
         "checkpoint": str(args.checkpoint),
@@ -443,6 +456,8 @@ def write_dataset_shard_snapshot(
         "num_yaw": int(train_args.num_yaw),
         "pitch_degrees": str(train_args.pitch_degrees),
         "fov_degrees": float(train_args.fov_degrees),
+        "fov_x_degrees": fov_x_degrees,
+        "fov_y_degrees": fov_y_degrees,
         "depth_evaluation_domain": "covered_sphere_sampled_pinhole_windows",
         "depth_evaluation_domains": {
             "covered_sphere": "sampled pinhole windows with solid-angle weights and overlap de-duplication",

@@ -17,6 +17,7 @@ recover trained accuracy.
 import math
 import os
 import sys
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -25,11 +26,16 @@ import torch.nn as nn
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(THIS_DIR))
 
-from vggt_omega.data.pano_sampler import PanoWindowSampler  # noqa: E402
+from vggt_omega.data.pano_sampler import PanoWindowSampler, resolve_fov_degrees  # noqa: E402
 from vggt_omega.models.aggregator import Aggregator, _resolve_luna_layers  # noqa: E402
 from vggt_omega.models.layers import LunaCameraAdapter, LunaPatchAdapter, PatchEmbed  # noqa: E402
 from vggt_omega.models.layers.luna_patch import scatter_mean_by_global_id  # noqa: E402
 from vggt_omega.models.vggt_omega_luna import VGGTOmega_LUNA  # noqa: E402
+from training.train_pano_omega import (  # noqa: E402
+    apply_stage_sampler_overrides,
+    build_parser,
+    capture_default_sampler_args,
+)
 
 
 def test_pano_window_sampler_shapes():
@@ -44,6 +50,80 @@ def test_pano_window_sampler_shapes():
     assert output.token_meta["sphere_encoding"].shape == (1, 4, 4, 7), output.token_meta["sphere_encoding"].shape
     assert output.camera_meta["camera_encoding"].shape == (1, 4, 16), output.camera_meta["camera_encoding"].shape
     assert output.camera_meta["view_params"].shape == (1, 4, 4), output.camera_meta["view_params"].shape
+
+
+def test_pano_window_sampler_anisotropic_fov_is_backward_compatible():
+    pano = torch.rand(1, 3, 32, 64)
+    legacy = PanoWindowSampler(window_size=32, patch_size=16, fov_degrees=75.0, num_yaw=4)
+    explicit = PanoWindowSampler(
+        window_size=32,
+        patch_size=16,
+        fov_degrees=75.0,
+        num_yaw=4,
+        fov_x_degrees=75.0,
+        fov_y_degrees=75.0,
+    )
+
+    legacy_output = legacy(pano)
+    explicit_output = explicit(pano)
+
+    assert legacy.get_fov_degrees() == explicit.get_fov_degrees() == (75.0, 75.0)
+    assert torch.equal(legacy_output.windows, explicit_output.windows)
+    assert torch.equal(
+        legacy_output.token_meta["global_patch_id"],
+        explicit_output.token_meta["global_patch_id"],
+    )
+
+
+def test_pano_window_sampler_uses_independent_horizontal_and_vertical_fov():
+    pano = torch.rand(1, 3, 64, 128)
+    sampler = PanoWindowSampler(
+        window_size=64,
+        patch_size=16,
+        fov_degrees=75.0,
+        num_yaw=4,
+        pitch_degrees=(-15.0,),
+        fov_x_degrees=95.0,
+        fov_y_degrees=75.0,
+    )
+
+    output = sampler(pano)
+    fov_x = torch.rad2deg(output.camera_meta["fov_x"])
+    fov_y = torch.rad2deg(output.camera_meta["fov_y"])
+
+    assert sampler.get_fov_degrees() == (95.0, 75.0)
+    assert torch.allclose(fov_x, torch.full_like(fov_x, 95.0), atol=1e-5)
+    assert torch.allclose(fov_y, torch.full_like(fov_y, 75.0), atol=1e-5)
+    assert resolve_fov_degrees(75.0, 95.0, None) == (95.0, 75.0)
+
+
+def test_training_stage_preserves_anisotropic_fov_defaults():
+    args = build_parser().parse_args(
+        [
+            "--window-size",
+            "32",
+            "--num-yaw",
+            "4",
+            "--pitch-degrees=-15",
+            "--fov-degrees",
+            "75",
+            "--fov-x-degrees",
+            "95",
+            "--fov-y-degrees",
+            "75",
+        ]
+    )
+    capture_default_sampler_args(args)
+    model = nn.Module()
+    model.pano_sampler = PanoWindowSampler(window_size=32, patch_size=16, num_yaw=4)
+    model.aggregator = SimpleNamespace(patch_size=16)
+
+    status = apply_stage_sampler_overrides(model, args, stage=None)
+
+    assert status["fov_degrees"] == 75.0
+    assert status["fov_x_degrees"] == 95.0
+    assert status["fov_y_degrees"] == 75.0
+    assert model.pano_sampler.get_fov_degrees() == (95.0, 75.0)
 
 
 def test_luna_adapters_are_zero_init_residuals():
@@ -156,6 +236,9 @@ def test_luna_tail_layer_count_supports_full_depth():
 
 if __name__ == "__main__":
     test_pano_window_sampler_shapes()
+    test_pano_window_sampler_anisotropic_fov_is_backward_compatible()
+    test_pano_window_sampler_uses_independent_horizontal_and_vertical_fov()
+    test_training_stage_preserves_anisotropic_fov_defaults()
     test_luna_adapters_are_zero_init_residuals()
     test_luna_patch_pooling_is_isolated_by_pano_id()
     test_luna_aggregator_smoke()

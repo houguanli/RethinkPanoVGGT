@@ -28,7 +28,11 @@ sampler:
   # 2..8 panos x 4 yaw windows stress-tests up to 32 VGGT views at 384.
   num_yaw: 4
   pitch_degrees: "-15"
+  # Keep the validated vertical band [-52.5, +22.5] while closing the
+  # 15-degree horizontal gaps and creating real cross-window observations.
   fov_degrees: 75.0
+  fov_x_degrees: 95.0
+  fov_y_degrees: 75.0
   pano_height: 0
   pano_width: 0
   luna_patch_layers: last3
@@ -57,8 +61,8 @@ supervision:
   valid_ratio_loss_power: 0.5
   sample_weight_min: 0.25
   sample_weight_max: 1.25
-  # Raw adjacent-window edge comparisons are not geometrically valid across
-  # pano boundaries (and 4x75-degree windows have no edge overlap).
+  # Raw adjacent-window edge comparisons remain geometrically invalid even
+  # with horizontal overlap; a later change will match shared sphere rays.
   overlap_consistency_weight: 0.0
   global_point_loss_weight: 0.10
   global_point_stride: 16

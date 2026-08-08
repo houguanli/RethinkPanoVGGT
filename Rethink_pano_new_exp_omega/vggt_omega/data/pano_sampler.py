@@ -47,6 +47,21 @@ def make_default_view_grid(
     return yaw_grid.reshape(-1), pitch_grid.reshape(-1)
 
 
+def resolve_fov_degrees(
+    fov_degrees: float = 75.0,
+    fov_x_degrees: Optional[float] = None,
+    fov_y_degrees: Optional[float] = None,
+) -> Tuple[float, float]:
+    """Resolve legacy isotropic FoV and optional horizontal/vertical overrides."""
+    base = float(fov_degrees)
+    fov_x = base if fov_x_degrees is None else float(fov_x_degrees)
+    fov_y = base if fov_y_degrees is None else float(fov_y_degrees)
+    for name, value in (("fov_x_degrees", fov_x), ("fov_y_degrees", fov_y)):
+        if not math.isfinite(value) or not 0.0 < value < 180.0:
+            raise ValueError(f"{name} must be finite and in (0, 180), got {value}")
+    return fov_x, fov_y
+
+
 class PanoWindowSampler(nn.Module):
     """Sample VGGT-compatible virtual pinhole windows from equirectangular panos.
 
@@ -62,15 +77,41 @@ class PanoWindowSampler(nn.Module):
         num_yaw: int = 8,
         pitch_degrees: Sequence[float] = (0.0,),
         seam_width: float = 0.02,
+        fov_x_degrees: Optional[float] = None,
+        fov_y_degrees: Optional[float] = None,
     ):
         super().__init__()
         yaw, pitch = make_default_view_grid(num_yaw=num_yaw, pitch_degrees=pitch_degrees)
         self.window_size = window_size
         self.patch_size = patch_size
-        self.fov_radians = math.radians(fov_degrees)
+        self.set_fov_degrees(fov_degrees, fov_x_degrees, fov_y_degrees)
         self.seam_width = seam_width
         self.register_buffer("default_yaw", yaw, persistent=False)
         self.register_buffer("default_pitch", pitch, persistent=False)
+
+    def set_fov_degrees(
+        self,
+        fov_degrees: float = 75.0,
+        fov_x_degrees: Optional[float] = None,
+        fov_y_degrees: Optional[float] = None,
+    ) -> Tuple[float, float]:
+        """Set the default FoV while preserving the legacy scalar attribute."""
+        fov_x, fov_y = resolve_fov_degrees(fov_degrees, fov_x_degrees, fov_y_degrees)
+        if math.isclose(fov_x, fov_y, rel_tol=0.0, abs_tol=1e-12):
+            self.fov_radians = math.radians(fov_x)
+        else:
+            self.fov_radians = (math.radians(fov_x), math.radians(fov_y))
+        return fov_x, fov_y
+
+    def get_fov_degrees(self) -> Tuple[float, float]:
+        """Return the effective horizontal and vertical FoV in degrees."""
+        values = torch.as_tensor(self.fov_radians, dtype=torch.float64).flatten()
+        if values.numel() == 1:
+            value = math.degrees(float(values[0]))
+            return value, value
+        if values.numel() != 2:
+            raise ValueError(f"Expected scalar or x/y FoV, got shape {tuple(values.shape)}")
+        return math.degrees(float(values[0])), math.degrees(float(values[1]))
 
     def forward(
         self,

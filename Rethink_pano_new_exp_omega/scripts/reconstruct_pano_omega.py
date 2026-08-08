@@ -93,6 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-yaw", type=int, default=None, help="Override checkpoint window yaw count for eval/export.")
     parser.add_argument("--pitch-degrees", type=str, default=None, help="Override checkpoint pitch list for eval/export.")
     parser.add_argument("--fov-degrees", type=float, default=None, help="Override checkpoint window FOV for eval/export.")
+    parser.add_argument("--fov-x-degrees", type=float, default=None, help="Override checkpoint horizontal window FoV.")
+    parser.add_argument("--fov-y-degrees", type=float, default=None, help="Override checkpoint vertical window FoV.")
     parser.add_argument("--window-size", type=int, default=None, help="Override checkpoint window size for eval/export.")
     parser.add_argument("--seed", type=int, default=42)
     return parser
@@ -115,6 +117,14 @@ def main() -> None:
         model_args.pitch_degrees = args.pitch_degrees
     if args.fov_degrees is not None:
         model_args.fov_degrees = args.fov_degrees
+        if args.fov_x_degrees is None:
+            model_args.fov_x_degrees = None
+        if args.fov_y_degrees is None:
+            model_args.fov_y_degrees = None
+    if args.fov_x_degrees is not None:
+        model_args.fov_x_degrees = args.fov_x_degrees
+    if args.fov_y_degrees is not None:
+        model_args.fov_y_degrees = args.fov_y_degrees
     if args.window_size is not None:
         model_args.window_size = args.window_size
 
@@ -242,6 +252,8 @@ def model_args_from_checkpoint(ckpt_args: Dict) -> SimpleNamespace:
         "num_yaw": 8,
         "pitch_degrees": "0",
         "fov_degrees": 75.0,
+        "fov_x_degrees": None,
+        "fov_y_degrees": None,
         "pano_height": 0,
         "pano_width": 0,
         "enable_camera_head": True,

@@ -32,7 +32,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from training.data import MixedPanoDataset, PanoCityPairedOmegaDataset, PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E402
-from vggt_omega.data.pano_sampler import make_default_view_grid  # noqa: E402
+from vggt_omega.data.pano_sampler import make_default_view_grid, resolve_fov_degrees  # noqa: E402
 from vggt_omega.models.heads.dense_head import DenseHead  # noqa: E402
 from vggt_omega.models.layers import PatchEmbed  # noqa: E402
 from vggt_omega.models.layers.pano_position import pinhole_rays  # noqa: E402
@@ -158,6 +158,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-yaw", type=int, default=8)
     parser.add_argument("--pitch-degrees", type=str, default="0")
     parser.add_argument("--fov-degrees", type=float, default=75.0)
+    parser.add_argument(
+        "--fov-x-degrees",
+        type=float,
+        default=None,
+        help="Optional horizontal FoV override; defaults to --fov-degrees.",
+    )
+    parser.add_argument(
+        "--fov-y-degrees",
+        type=float,
+        default=None,
+        help="Optional vertical FoV override; defaults to --fov-degrees.",
+    )
     parser.add_argument("--pano-height", type=int, default=0, help="Optional resize height before sampling.")
     parser.add_argument("--pano-width", type=int, default=0, help="Optional resize width before sampling.")
     parser.add_argument(
@@ -778,6 +790,11 @@ def train(args: argparse.Namespace) -> None:
         "[INFO] pano_sampling = "
         f"{args.pano_sample_mode} min={args.pano_min_count} max={args.pano_max_count} grouping={args.pano_grouping}",
         dist_state,
+        )
+        rank0_print(
+            f"[INFO] pano_window_fov = x:{args.fov_x_degrees} y:{args.fov_y_degrees} "
+            f"legacy:{args.fov_degrees}",
+            dist_state,
         )
         rank0_print(
             f"[INFO] luna_layers = patch:{args.luna_patch_layers} camera:{args.luna_camera_layers}",
@@ -1606,6 +1623,15 @@ def capture_default_sampler_args(args: argparse.Namespace) -> None:
     args.default_num_yaw = int(args.num_yaw)
     args.default_pitch_degrees = str(args.pitch_degrees)
     args.default_fov_degrees = float(args.fov_degrees)
+    fov_x_degrees, fov_y_degrees = resolve_fov_degrees(
+        args.fov_degrees,
+        getattr(args, "fov_x_degrees", None),
+        getattr(args, "fov_y_degrees", None),
+    )
+    args.fov_x_degrees = fov_x_degrees
+    args.fov_y_degrees = fov_y_degrees
+    args.default_fov_x_degrees = fov_x_degrees
+    args.default_fov_y_degrees = fov_y_degrees
     args.default_dense_head_frames_chunk_size = int(args.dense_head_frames_chunk_size)
 
 
@@ -1652,6 +1678,19 @@ def apply_stage_sampler_overrides(
     num_yaw = int(stage.get("num_yaw", args.default_num_yaw)) if stage else int(args.default_num_yaw)
     pitch_degrees = str(stage.get("pitch_degrees", args.default_pitch_degrees)) if stage else str(args.default_pitch_degrees)
     fov_degrees = float(stage.get("fov_degrees", args.default_fov_degrees)) if stage else float(args.default_fov_degrees)
+    if stage and "fov_degrees" in stage:
+        fallback_fov_x = fov_degrees
+        fallback_fov_y = fov_degrees
+    else:
+        fallback_fov_x = args.default_fov_x_degrees
+        fallback_fov_y = args.default_fov_y_degrees
+    fov_x_degrees = float(stage.get("fov_x_degrees", fallback_fov_x)) if stage else float(fallback_fov_x)
+    fov_y_degrees = float(stage.get("fov_y_degrees", fallback_fov_y)) if stage else float(fallback_fov_y)
+    fov_x_degrees, fov_y_degrees = resolve_fov_degrees(
+        fov_degrees,
+        fov_x_degrees,
+        fov_y_degrees,
+    )
 
     if window_size <= 0:
         raise ValueError(f"stage window_size must be positive, got {window_size}")
@@ -1683,7 +1722,7 @@ def apply_stage_sampler_overrides(
 
     sampler.window_size = window_size
     sampler.patch_size = patch_size
-    sampler.fov_radians = math.radians(fov_degrees)
+    sampler.set_fov_degrees(fov_degrees, fov_x_degrees, fov_y_degrees)
     yaw, pitch = make_default_view_grid(num_yaw=num_yaw, pitch_degrees=parse_pitch_degrees(pitch_degrees))
     device = sampler.default_yaw.device if torch.is_tensor(getattr(sampler, "default_yaw", None)) else None
     sampler.default_yaw = yaw.to(device=device) if device is not None else yaw
@@ -1694,6 +1733,8 @@ def apply_stage_sampler_overrides(
     args.num_yaw = num_yaw
     args.pitch_degrees = pitch_degrees
     args.fov_degrees = fov_degrees
+    args.fov_x_degrees = fov_x_degrees
+    args.fov_y_degrees = fov_y_degrees
     return current_sampler_status(model, args)
 
 
@@ -1727,19 +1768,29 @@ def current_sampler_status(model: torch.nn.Module, args: argparse.Namespace) -> 
         base_model = base_model.model
     sampler = getattr(base_model, "pano_sampler", None)
     if sampler is None:
+        fov_x_degrees, fov_y_degrees = resolve_fov_degrees(
+            args.fov_degrees,
+            getattr(args, "fov_x_degrees", None),
+            getattr(args, "fov_y_degrees", None),
+        )
         return {
             "window_size": int(args.window_size),
             "patch_size": int(args.patch_size),
             "num_yaw": int(args.num_yaw),
             "pitch_degrees": str(args.pitch_degrees),
             "fov_degrees": float(args.fov_degrees),
+            "fov_x_degrees": fov_x_degrees,
+            "fov_y_degrees": fov_y_degrees,
         }
+    fov_x_degrees, fov_y_degrees = sampler.get_fov_degrees()
     return {
         "window_size": int(getattr(sampler, "window_size", args.window_size)),
         "patch_size": int(getattr(sampler, "patch_size", args.patch_size)),
         "num_yaw": int(getattr(sampler, "default_yaw", torch.empty(0)).numel()),
         "pitch_degrees": str(args.pitch_degrees),
-        "fov_degrees": float(math.degrees(float(getattr(sampler, "fov_radians", math.radians(args.fov_degrees))))),
+        "fov_degrees": float(args.fov_degrees),
+        "fov_x_degrees": fov_x_degrees,
+        "fov_y_degrees": fov_y_degrees,
     }
 
 
@@ -1980,6 +2031,8 @@ def build_model(args: argparse.Namespace) -> VGGTOmega_LUNA:
         "window_size": args.window_size,
         "patch_size": args.patch_size,
         "fov_degrees": args.fov_degrees,
+        "fov_x_degrees": getattr(args, "fov_x_degrees", None),
+        "fov_y_degrees": getattr(args, "fov_y_degrees", None),
         "num_yaw": args.num_yaw,
         "pitch_degrees": pitch_degrees,
     }

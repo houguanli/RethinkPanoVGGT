@@ -59,6 +59,7 @@ from training.train_pano_omega import (  # noqa: E402
     sample_depth_targets,
     unwrap_model,
 )
+from vggt_omega.data.pano_sampler import resolve_fov_degrees  # noqa: E402
 
 
 BASE_FIELDS = (
@@ -238,17 +239,26 @@ def main() -> None:
     model.eval()
 
     pitches = parse_pitch_degrees(train_args.pitch_degrees)
+    fov_x_degrees, fov_y_degrees = resolve_fov_degrees(
+        train_args.fov_degrees,
+        getattr(train_args, "fov_x_degrees", None),
+        getattr(train_args, "fov_y_degrees", None),
+    )
     native_sampler = {
         "window_size": int(train_args.window_size),
         "num_yaw": int(train_args.num_yaw),
         "pitch_degrees": list(pitches),
         "fov_degrees": float(train_args.fov_degrees),
+        "fov_x_degrees": fov_x_degrees,
+        "fov_y_degrees": fov_y_degrees,
         "views_per_panorama": int(train_args.num_yaw) * len(pitches),
     }
     expected_geometry = {
         "num_yaw": 4,
         "pitch_degrees": [-15.0],
         "fov_degrees": 75.0,
+        "fov_x_degrees": 75.0,
+        "fov_y_degrees": 75.0,
         "views_per_panorama": 4,
     }
     observed_geometry = {
