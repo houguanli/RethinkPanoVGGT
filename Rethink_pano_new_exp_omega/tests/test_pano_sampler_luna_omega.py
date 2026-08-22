@@ -17,6 +17,7 @@ recover trained accuracy.
 import math
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -29,13 +30,18 @@ sys.path.insert(0, os.path.dirname(THIS_DIR))
 from vggt_omega.data.pano_sampler import PanoWindowSampler, resolve_fov_degrees  # noqa: E402
 from vggt_omega.models.aggregator import Aggregator, _resolve_luna_layers  # noqa: E402
 from vggt_omega.models.layers import LunaCameraAdapter, LunaPatchAdapter, PatchEmbed  # noqa: E402
+from vggt_omega.models.layers.pano_position import pinhole_rays, rays_to_equirectangular  # noqa: E402
 from vggt_omega.models.layers.luna_patch import scatter_mean_by_global_id  # noqa: E402
 from vggt_omega.models.vggt_omega_luna import VGGTOmega_LUNA  # noqa: E402
 from training.train_pano_omega import (  # noqa: E402
+    apply_checkpoint_training_defaults,
     apply_stage_sampler_overrides,
     build_parser,
     capture_default_sampler_args,
+    current_sampler_status,
+    parse_args as parse_training_args,
 )
+from scripts.evaluate_depth_checkpoint import apply_eval_sampler_overrides  # noqa: E402
 
 
 def test_pano_window_sampler_shapes():
@@ -124,6 +130,123 @@ def test_training_stage_preserves_anisotropic_fov_defaults():
     assert status["fov_x_degrees"] == 95.0
     assert status["fov_y_degrees"] == 75.0
     assert model.pano_sampler.get_fov_degrees() == (95.0, 75.0)
+
+
+def test_pitch_minus15_keeps_75_degree_vertical_domain():
+    rays = pinhole_rays(
+        torch.tensor([0.0], dtype=torch.float64),
+        torch.tensor([math.radians(-15.0)], dtype=torch.float64),
+        torch.tensor([math.radians(95.0)], dtype=torch.float64),
+        torch.tensor([math.radians(75.0)], dtype=torch.float64),
+        65,
+        65,
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+    )
+    _, phi, _, _ = rays_to_equirectangular(rays)
+    center_column = torch.rad2deg(phi[0, :, 32])
+    assert math.isclose(float(center_column.min()), -52.5, abs_tol=1e-6)
+    assert math.isclose(float(center_column.max()), 22.5, abs_tol=1e-6)
+
+
+def test_fov95_increases_coverage_and_shared_sphere_tokens():
+    pano = torch.zeros(1, 3, 512, 1024)
+
+    def token_stats(fov_x_degrees: float) -> tuple[int, int]:
+        output = PanoWindowSampler(
+            window_size=384,
+            patch_size=16,
+            fov_degrees=75.0,
+            fov_x_degrees=fov_x_degrees,
+            fov_y_degrees=75.0,
+            num_yaw=4,
+            pitch_degrees=(-15.0,),
+        )(pano)
+        ids = output.token_meta["global_patch_id"][0]
+        view_sets = [set(row.tolist()) for row in ids]
+        covered = set().union(*view_sets)
+        shared: set[int] = set()
+        for view_index in range(4):
+            shared.update(view_sets[view_index] & view_sets[(view_index + 1) % 4])
+        return len(covered), len(shared)
+
+    covered75, shared75 = token_stats(75.0)
+    covered95, shared95 = token_stats(95.0)
+    assert covered95 >= covered75 + 40, (covered75, covered95)
+    assert shared95 >= shared75 + 80, (shared75, shared95)
+
+
+def test_checkpoint_sampler_geometry_round_trip_handles_multiple_pitch_rings():
+    saved_args = build_parser().parse_args(
+        [
+            "--num-yaw", "4",
+            "--pitch-degrees=-20,55,-72",
+            "--fov-degrees", "75",
+            "--fov-x-degrees", "95",
+            "--fov-y-degrees", "75",
+        ]
+    )
+    model = nn.Module()
+    model.pano_sampler = PanoWindowSampler(
+        num_yaw=4,
+        pitch_degrees=(-20.0, 55.0, -72.0),
+        fov_degrees=75.0,
+        fov_x_degrees=95.0,
+        fov_y_degrees=75.0,
+    )
+    status = current_sampler_status(model, saved_args)
+    assert status["num_yaw"] == 4
+
+    resumed_args = build_parser().parse_args([])
+    apply_checkpoint_training_defaults(resumed_args, {"args": status})
+    assert resumed_args.num_yaw == 4
+    assert resumed_args.pitch_degrees == "-20,55,-72"
+    assert resumed_args.fov_degrees == 75.0
+    assert resumed_args.fov_x_degrees == 95.0
+    assert resumed_args.fov_y_degrees == 75.0
+
+
+def test_canonical_eval_override_resets_checkpoint_anisotropic_fov():
+    train_args = SimpleNamespace(
+        window_size=384,
+        num_yaw=12,
+        pitch_degrees="-20,55,-72",
+        fov_degrees=75.0,
+        fov_x_degrees=95.0,
+        fov_y_degrees=75.0,
+    )
+    eval_args = SimpleNamespace(
+        window_size=384,
+        num_yaw=4,
+        pitch_degrees="-15",
+        fov_degrees=75.0,
+        fov_x_degrees=None,
+        fov_y_degrees=None,
+    )
+    apply_eval_sampler_overrides(train_args, eval_args)
+    assert train_args.num_yaw == 4
+    assert train_args.pitch_degrees == "-15"
+    assert train_args.fov_x_degrees == train_args.fov_y_degrees == 75.0
+
+
+def test_m1_ab_configs_round_trip_and_only_change_horizontal_fov():
+    project_root = Path(THIS_DIR).parent
+    control = parse_training_args(
+        ["--config", str(project_root / "configs/multipano_4090_mixed4_m1_fov75x75_pitch15_luna_3h.yaml")]
+    )
+    treatment = parse_training_args(
+        ["--config", str(project_root / "configs/multipano_4090_mixed4_m1_fov95x75_pitch15_luna_3h.yaml")]
+    )
+    for args in (control, treatment):
+        assert args.num_yaw == 4
+        assert args.pitch_degrees == "-15"
+        assert args.fov_degrees == 75.0
+        assert args.fov_y_degrees == 75.0
+        assert args.pano_min_count == args.pano_max_count == 2
+        assert args.seed == 47
+        assert args.inherit_checkpoint_training_defaults is False
+    assert control.fov_x_degrees == 75.0
+    assert treatment.fov_x_degrees == 95.0
 
 
 def test_luna_adapters_are_zero_init_residuals():
@@ -239,6 +362,11 @@ if __name__ == "__main__":
     test_pano_window_sampler_anisotropic_fov_is_backward_compatible()
     test_pano_window_sampler_uses_independent_horizontal_and_vertical_fov()
     test_training_stage_preserves_anisotropic_fov_defaults()
+    test_pitch_minus15_keeps_75_degree_vertical_domain()
+    test_fov95_increases_coverage_and_shared_sphere_tokens()
+    test_checkpoint_sampler_geometry_round_trip_handles_multiple_pitch_rings()
+    test_canonical_eval_override_resets_checkpoint_anisotropic_fov()
+    test_m1_ab_configs_round_trip_and_only_change_horizontal_fov()
     test_luna_adapters_are_zero_init_residuals()
     test_luna_patch_pooling_is_isolated_by_pano_id()
     test_luna_aggregator_smoke()

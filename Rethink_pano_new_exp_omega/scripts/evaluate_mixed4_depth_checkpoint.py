@@ -33,6 +33,7 @@ from scripts.evaluate_depth_checkpoint import (  # noqa: E402
     PANOVGGT_PRIMARY_METRICS,
     PER_SAMPLE_CSV_FIELDS,
     apply_checkpoint_eval_defaults,
+    apply_eval_sampler_overrides,
     build_eval_model,
     evaluate_run,
     erp_polar_prior_metadata,
@@ -116,6 +117,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-max-panos", type=int, default=0, help="Clamp eval multi-pano input length for all datasets. Use 0 to keep config pano_max_count.")
     parser.add_argument("--window-size", type=int, default=0, help="Override square window resolution; 0 keeps checkpoint/config.")
     parser.add_argument("--num-yaw", type=int, default=0, help="Override yaw windows per pano; 0 keeps checkpoint/config.")
+    parser.add_argument("--pitch-degrees", type=str, default=None, help="Override checkpoint pitch list for a fixed evaluation domain.")
+    parser.add_argument("--fov-degrees", type=float, default=None, help="Override legacy scalar FoV for evaluation.")
+    parser.add_argument("--fov-x-degrees", type=float, default=None, help="Override horizontal FoV for evaluation.")
+    parser.add_argument("--fov-y-degrees", type=float, default=None, help="Override vertical FoV for evaluation.")
     parser.add_argument("--panocity-max-panos", type=int, default=0, help="Optional Panocity-specific eval pano cap, overriding --eval-max-panos for Panocity.")
     parser.add_argument(
         "--pano-count-policy",
@@ -201,10 +206,7 @@ def main() -> None:
 
     checkpoint_payload = load_checkpoint_payload(args.checkpoint)
     apply_checkpoint_eval_defaults(train_args, checkpoint_payload)
-    if args.window_size > 0:
-        train_args.window_size = int(args.window_size)
-    if args.num_yaw > 0:
-        train_args.num_yaw = int(args.num_yaw)
+    apply_eval_sampler_overrides(train_args, args)
     model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
     model.eval()
 

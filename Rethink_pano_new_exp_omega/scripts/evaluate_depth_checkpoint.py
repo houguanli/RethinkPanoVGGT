@@ -250,6 +250,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-max-panos", type=int, default=0, help="Clamp eval multi-pano input length. Use 0 to keep config pano_max_count.")
     parser.add_argument("--window-size", type=int, default=0, help="Override square window resolution; 0 keeps checkpoint/config.")
     parser.add_argument("--num-yaw", type=int, default=0, help="Override yaw windows per pano; 0 keeps checkpoint/config.")
+    parser.add_argument("--pitch-degrees", type=str, default=None, help="Override checkpoint pitch list for a fixed evaluation domain.")
+    parser.add_argument("--fov-degrees", type=float, default=None, help="Override legacy scalar FoV for evaluation.")
+    parser.add_argument("--fov-x-degrees", type=float, default=None, help="Override horizontal FoV for evaluation.")
+    parser.add_argument("--fov-y-degrees", type=float, default=None, help="Override vertical FoV for evaluation.")
     parser.add_argument("--hard-limit", type=int, default=100, help="Extra hard-bin val samples. Use 0 to disable.")
     parser.add_argument("--seed", type=int, default=123, help="Deterministic sample seed.")
     parser.add_argument(
@@ -292,10 +296,7 @@ def main() -> None:
 
     checkpoint_payload = load_checkpoint_payload(args.checkpoint)
     apply_checkpoint_eval_defaults(train_args, checkpoint_payload)
-    if args.window_size > 0:
-        train_args.window_size = int(args.window_size)
-    if args.num_yaw > 0:
-        train_args.num_yaw = int(args.num_yaw)
+    apply_eval_sampler_overrides(train_args, args)
     apply_eval_max_panos(train_args, args.eval_max_panos)
     model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
     model.eval()
@@ -459,6 +460,34 @@ def apply_checkpoint_eval_defaults(args: argparse.Namespace, payload: dict[str, 
     ):
         if key in ckpt_args and ckpt_args[key] is not None:
             setattr(args, key, ckpt_args[key])
+
+
+def apply_eval_sampler_overrides(args: argparse.Namespace, eval_args: argparse.Namespace) -> None:
+    """Apply explicit evaluation geometry after checkpoint-native defaults.
+
+    An explicit scalar FoV defines an isotropic canonical domain unless an
+    axis-specific value is also supplied. This prevents a checkpoint's wider
+    horizontal FoV from leaking into ``--fov-degrees 75`` evaluations.
+    """
+    if int(getattr(eval_args, "window_size", 0) or 0) > 0:
+        args.window_size = int(eval_args.window_size)
+    if int(getattr(eval_args, "num_yaw", 0) or 0) > 0:
+        args.num_yaw = int(eval_args.num_yaw)
+    if getattr(eval_args, "pitch_degrees", None) is not None:
+        args.pitch_degrees = str(eval_args.pitch_degrees)
+
+    scalar_fov = getattr(eval_args, "fov_degrees", None)
+    fov_x = getattr(eval_args, "fov_x_degrees", None)
+    fov_y = getattr(eval_args, "fov_y_degrees", None)
+    if scalar_fov is not None:
+        args.fov_degrees = float(scalar_fov)
+        args.fov_x_degrees = float(scalar_fov if fov_x is None else fov_x)
+        args.fov_y_degrees = float(scalar_fov if fov_y is None else fov_y)
+    else:
+        if fov_x is not None:
+            args.fov_x_degrees = float(fov_x)
+        if fov_y is not None:
+            args.fov_y_degrees = float(fov_y)
 
 
 def apply_eval_max_panos(args: argparse.Namespace, max_panos: int | None) -> None:

@@ -1507,6 +1507,19 @@ def apply_checkpoint_training_defaults(args: argparse.Namespace, payload: Dict[s
     for key in ("learn_pred_depth_scale", "depth_residual_mode", "depth_residual_hidden", "depth_residual_max_log"):
         if key in ckpt_args and ckpt_args[key] is not None:
             setattr(args, key, ckpt_args[key])
+    # Sampling geometry is part of the learned checkpoint contract. Restore
+    # it before defaults are captured so resumed training reproduces the rays.
+    for key in (
+        "window_size",
+        "patch_size",
+        "num_yaw",
+        "pitch_degrees",
+        "fov_degrees",
+        "fov_x_degrees",
+        "fov_y_degrees",
+    ):
+        if key in ckpt_args and ckpt_args[key] is not None:
+            setattr(args, key, ckpt_args[key])
 
 
 def load_adapter_state_if_present(
@@ -1783,10 +1796,16 @@ def current_sampler_status(model: torch.nn.Module, args: argparse.Namespace) -> 
             "fov_y_degrees": fov_y_degrees,
         }
     fov_x_degrees, fov_y_degrees = sampler.get_fov_degrees()
+    view_count = int(getattr(sampler, "default_yaw", torch.empty(0)).numel())
+    pitch_count = len(parse_pitch_degrees(str(args.pitch_degrees)))
+    if pitch_count > 0 and view_count > 0 and view_count % pitch_count == 0:
+        num_yaw = view_count // pitch_count
+    else:
+        num_yaw = int(args.num_yaw)
     return {
         "window_size": int(getattr(sampler, "window_size", args.window_size)),
         "patch_size": int(getattr(sampler, "patch_size", args.patch_size)),
-        "num_yaw": int(getattr(sampler, "default_yaw", torch.empty(0)).numel()),
+        "num_yaw": num_yaw,
         "pitch_degrees": str(args.pitch_degrees),
         "fov_degrees": float(args.fov_degrees),
         "fov_x_degrees": fov_x_degrees,
