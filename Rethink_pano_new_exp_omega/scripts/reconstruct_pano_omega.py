@@ -158,7 +158,8 @@ def main() -> None:
             )
 
     model_pred_depth = predictions["depth"][0, ..., 0].detach().float().cpu().numpy()
-    pred_conf = predictions["depth_conf"][0].detach().float().cpu().numpy()
+    pred_conf_tensor = predictions.get("depth_conf")
+    pred_conf = None if pred_conf_tensor is None else pred_conf_tensor[0].detach().float().cpu().numpy()
     if target_available:
         target_depth_np = target_depth[0, ..., 0].detach().float().cpu().numpy()
         target_valid_np = target_valid[0, ..., 0].detach().cpu().numpy()
@@ -196,7 +197,8 @@ def main() -> None:
     save_depth_sheet(pred_depth, output_dir / "pred_z_depth_windows.jpg", max_depth=args.depth_max_m)
     if target_available:
         save_depth_sheet(target_depth_np, output_dir / "target_z_depth_windows.jpg", max_depth=args.depth_max_m)
-    save_conf_sheet(pred_conf, output_dir / "pred_conf_windows.jpg")
+    if pred_conf is not None:
+        save_conf_sheet(pred_conf, output_dir / "pred_conf_windows.jpg")
 
     pred_erp, valid_erp = splat_windows_to_erp(
         pred_depth=pred_depth,
