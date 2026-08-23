@@ -258,8 +258,13 @@ def model_args_from_checkpoint(ckpt_args: Dict) -> SimpleNamespace:
         "pano_width": 0,
         "enable_camera_head": True,
         "enable_pano_global_token": False,
+        "enable_pano_geometry_residual": False,
         "luna_patch_layers": 2,
         "luna_camera_layers": 2,
+        "aggregator_use_checkpoint": False,
+        "dense_head_frames_chunk_size": 8,
+        "dense_head_use_checkpoint": False,
+        "dense_head_return_confidence": True,
         "pred_depth_scale": 1.0,
         "smoke": False,
     }
