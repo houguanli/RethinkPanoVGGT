@@ -157,6 +157,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--window-size", type=int, default=512)
     parser.add_argument("--num-yaw", type=int, default=8)
     parser.add_argument("--pitch-degrees", type=str, default="0")
+    parser.add_argument(
+        "--pitch-loss-weights",
+        type=str,
+        default="",
+        help=(
+            "Optional comma-separated depth-loss multipliers, one per pitch ring. "
+            "Views retain the same forward pass and ERP fusion; only their depth "
+            "supervision is reweighted. Empty means all rings have weight 1."
+        ),
+    )
     parser.add_argument("--fov-degrees", type=float, default=75.0)
     parser.add_argument(
         "--fov-x-degrees",
@@ -1635,6 +1645,7 @@ def capture_default_sampler_args(args: argparse.Namespace) -> None:
     args.default_patch_size = int(args.patch_size)
     args.default_num_yaw = int(args.num_yaw)
     args.default_pitch_degrees = str(args.pitch_degrees)
+    args.default_pitch_loss_weights = str(args.pitch_loss_weights)
     args.default_fov_degrees = float(args.fov_degrees)
     fov_x_degrees, fov_y_degrees = resolve_fov_degrees(
         args.fov_degrees,
@@ -1690,6 +1701,11 @@ def apply_stage_sampler_overrides(
     patch_size = int(stage.get("patch_size", args.default_patch_size)) if stage else int(args.default_patch_size)
     num_yaw = int(stage.get("num_yaw", args.default_num_yaw)) if stage else int(args.default_num_yaw)
     pitch_degrees = str(stage.get("pitch_degrees", args.default_pitch_degrees)) if stage else str(args.default_pitch_degrees)
+    pitch_loss_weights = (
+        str(stage.get("pitch_loss_weights", args.default_pitch_loss_weights))
+        if stage
+        else str(args.default_pitch_loss_weights)
+    )
     fov_degrees = float(stage.get("fov_degrees", args.default_fov_degrees)) if stage else float(args.default_fov_degrees)
     if stage and "fov_degrees" in stage:
         fallback_fov_x = fov_degrees
@@ -1711,6 +1727,7 @@ def apply_stage_sampler_overrides(
         raise ValueError(f"stage patch_size must be positive, got {patch_size}")
     if window_size % patch_size != 0:
         raise ValueError(f"stage window_size={window_size} must be divisible by patch_size={patch_size}")
+    parse_pitch_loss_weights(pitch_loss_weights, len(parse_pitch_degrees(pitch_degrees)))
 
     base_model = unwrap_model(model)
     if isinstance(base_model, DepthPredictionAdapter):
@@ -1745,6 +1762,7 @@ def apply_stage_sampler_overrides(
     args.patch_size = patch_size
     args.num_yaw = num_yaw
     args.pitch_degrees = pitch_degrees
+    args.pitch_loss_weights = pitch_loss_weights
     args.fov_degrees = fov_degrees
     args.fov_x_degrees = fov_x_degrees
     args.fov_y_degrees = fov_y_degrees
@@ -2252,6 +2270,15 @@ def train_step(
             valid_ratio_power=args.valid_ratio_loss_power,
             sample_weight_min=args.sample_weight_min,
             sample_weight_max=args.sample_weight_max,
+            window_weight_multiplier=build_pitch_window_loss_weights(
+                total_views=pred_depth.shape[1],
+                pano_count=pano_count,
+                num_yaw=args.num_yaw,
+                pitch_degrees=args.pitch_degrees,
+                pitch_loss_weights=args.pitch_loss_weights,
+                device=pred_depth.device,
+                dtype=pred_depth.dtype,
+            ),
         )
         depth_diag_loss_per_sample = masked_depth_loss_per_sample(
             pred_depth,
@@ -2265,6 +2292,15 @@ def train_step(
             valid_ratio_power=args.valid_ratio_loss_power,
             sample_weight_min=args.sample_weight_min,
             sample_weight_max=args.sample_weight_max,
+            window_weight_multiplier=build_pitch_window_loss_weights(
+                total_views=pred_depth.shape[1],
+                pano_count=pano_count,
+                num_yaw=args.num_yaw,
+                pitch_degrees=args.pitch_degrees,
+                pitch_loss_weights=args.pitch_loss_weights,
+                device=pred_depth.device,
+                dtype=pred_depth.dtype,
+            ),
         )
         depth_diag_valid_ratio = depth_valid_ratio_per_sample(pred_depth, target_depth, target_valid)
         loss_depth_unfiltered = masked_depth_loss(
@@ -2388,6 +2424,15 @@ def train_step(
         ).detach(),
         "loss_camera_weighted": (float(args.camera_loss_weight) * loss_camera).detach(),
         "pano_count": loss_depth.new_tensor(float(pano_images.shape[1] if pano_images.ndim == 5 else 1)),
+        "pitch_loss_weight_mean": build_pitch_window_loss_weights(
+            total_views=pred_depth.shape[1],
+            pano_count=pano_count,
+            num_yaw=args.num_yaw,
+            pitch_degrees=args.pitch_degrees,
+            pitch_loss_weights=args.pitch_loss_weights,
+            device=pred_depth.device,
+            dtype=pred_depth.dtype,
+        ).mean().detach(),
         "depth_valid_ratio": depth_valid_ratio.detach(),
         "rgb_depth_common_mask_keep_ratio": common_mask_keep_ratio.detach(),
         "depth_window_keep_ratio": depth_window_keep_ratio.detach(),
@@ -3693,6 +3738,7 @@ def masked_depth_loss(
     valid_ratio_power: float = 0.0,
     sample_weight_min: float = 0.0,
     sample_weight_max: float = 10.0,
+    window_weight_multiplier: torch.Tensor | None = None,
 ) -> torch.Tensor:
     pred_depth = pred_depth.float()
     target_depth = target_depth.to(device=pred_depth.device, dtype=torch.float32)
@@ -3739,6 +3785,10 @@ def masked_depth_loss(
             sample_weight_min=sample_weight_min,
             sample_weight_max=sample_weight_max,
         )
+    if window_weight_multiplier is not None:
+        window_weight = window_weight * _expand_window_weight_multiplier(
+            window_weight_multiplier, per_window_loss
+        )
     if not bool((window_weight > 0).any()):
         return (0.0 * pred_depth).sum()
     return (per_window_loss * window_weight).sum() / window_weight.sum().clamp_min(1e-6)
@@ -3756,6 +3806,7 @@ def masked_depth_loss_per_sample(
     valid_ratio_power: float = 0.0,
     sample_weight_min: float = 0.0,
     sample_weight_max: float = 10.0,
+    window_weight_multiplier: torch.Tensor | None = None,
 ) -> torch.Tensor:
     pred_depth = pred_depth.float()
     target_depth = target_depth.to(device=pred_depth.device, dtype=torch.float32)
@@ -3804,6 +3855,10 @@ def masked_depth_loss_per_sample(
             sample_weight_min=sample_weight_min,
             sample_weight_max=sample_weight_max,
         )
+    if window_weight_multiplier is not None:
+        window_weight = window_weight * _expand_window_weight_multiplier(
+            window_weight_multiplier, per_window_loss
+        )
 
     if per_window_loss.ndim == 1:
         per_window_loss = per_window_loss.reshape(batch_size, -1)
@@ -3829,6 +3884,69 @@ def depth_valid_ratio_per_sample(
         valid = valid & valid_mask.to(device=target_depth.device, dtype=torch.bool)
     valid_float = valid.to(dtype=torch.float32).reshape(batch_size, -1)
     return valid_float.mean(dim=1)
+
+
+def parse_pitch_loss_weights(value: str | None, pitch_count: int) -> Tuple[float, ...]:
+    """Parse optional per-pitch supervision weights without changing sampler geometry."""
+    if pitch_count <= 0:
+        raise ValueError(f"pitch_count must be positive, got {pitch_count}")
+    items = [item.strip() for item in str(value or "").split(",") if item.strip()]
+    if not items:
+        return (1.0,) * pitch_count
+    weights = tuple(float(item) for item in items)
+    if len(weights) == 1:
+        weights = weights * pitch_count
+    if len(weights) != pitch_count:
+        raise ValueError(
+            f"pitch_loss_weights needs one value per pitch ring ({pitch_count}), got {len(weights)}"
+        )
+    if any(not math.isfinite(weight) or weight < 0.0 for weight in weights):
+        raise ValueError(f"pitch_loss_weights must be finite and non-negative, got {weights}")
+    if not any(weight > 0.0 for weight in weights):
+        raise ValueError("pitch_loss_weights must contain at least one positive value")
+    return weights
+
+
+def build_pitch_window_loss_weights(
+    total_views: int,
+    pano_count: int,
+    num_yaw: int,
+    pitch_degrees: str,
+    pitch_loss_weights: str | None,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return [1, V] pitch-ring weights in sampler's yaw-major view order.
+
+    ``make_default_view_grid`` lays out one complete pitch list for each yaw.
+    The same sequence is repeated once per panorama after the model flattens
+    pano windows, so this function remains valid for multi-pano batches.
+    """
+    pitches = parse_pitch_degrees(pitch_degrees)
+    ring_weights = parse_pitch_loss_weights(pitch_loss_weights, len(pitches))
+    views_per_pano = int(num_yaw) * len(pitches)
+    if int(num_yaw) <= 0 or int(pano_count) <= 0 or views_per_pano <= 0:
+        raise ValueError(f"Invalid sampler layout: pano_count={pano_count}, num_yaw={num_yaw}")
+    expected = int(pano_count) * views_per_pano
+    if int(total_views) != expected:
+        raise ValueError(
+            "Prediction view count does not match sampler geometry: "
+            f"got {total_views}, expected {expected} ({pano_count} panos x {views_per_pano} views)."
+        )
+    per_yaw = torch.tensor(ring_weights, device=device, dtype=dtype)
+    return per_yaw.repeat(int(num_yaw) * int(pano_count)).reshape(1, -1)
+
+
+def _expand_window_weight_multiplier(weight: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    weight = weight.to(device=target.device, dtype=torch.float32)
+    if weight.ndim == 1:
+        weight = weight.unsqueeze(0)
+    if weight.ndim != 2 or weight.shape[1] != target.shape[1] or weight.shape[0] not in (1, target.shape[0]):
+        raise ValueError(
+            f"window_weight_multiplier shape {tuple(weight.shape)} is incompatible with "
+            f"per-window target {tuple(target.shape)}"
+        )
+    return weight.expand(target.shape[0], -1)
 
 
 def _expand_sample_weight(

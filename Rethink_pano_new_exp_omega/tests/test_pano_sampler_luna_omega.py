@@ -36,10 +36,12 @@ from vggt_omega.models.vggt_omega_luna import VGGTOmega_LUNA  # noqa: E402
 from training.train_pano_omega import (  # noqa: E402
     apply_checkpoint_training_defaults,
     apply_stage_sampler_overrides,
+    build_pitch_window_loss_weights,
     build_parser,
     capture_default_sampler_args,
     current_sampler_status,
     parse_args as parse_training_args,
+    parse_pitch_loss_weights,
 )
 from scripts.evaluate_depth_checkpoint import apply_eval_sampler_overrides  # noqa: E402
 
@@ -249,6 +251,39 @@ def test_m1_ab_configs_round_trip_and_only_change_horizontal_fov():
     assert treatment.fov_x_degrees == 95.0
 
 
+def test_pitch_ring_loss_weights_follow_yaw_major_sampler_order():
+    weights = build_pitch_window_loss_weights(
+        total_views=12,
+        pano_count=1,
+        num_yaw=4,
+        pitch_degrees="-20,55,-72",
+        pitch_loss_weights="1.0,0.45,0.25",
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert torch.allclose(weights, torch.tensor([[1.0, 0.45, 0.25] * 4]))
+    assert parse_pitch_loss_weights("", 3) == (1.0, 1.0, 1.0)
+
+
+def test_pitch_ring_loss_weights_repeat_per_panorama_and_validate_count():
+    weights = build_pitch_window_loss_weights(
+        total_views=16,
+        pano_count=2,
+        num_yaw=4,
+        pitch_degrees="-20,55",
+        pitch_loss_weights="1.0,0.5",
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert torch.allclose(weights, torch.tensor([[1.0, 0.5] * 8]))
+    try:
+        parse_pitch_loss_weights("1.0,0.5", 3)
+    except ValueError as exc:
+        assert "one value per pitch ring" in str(exc)
+    else:
+        raise AssertionError("Expected invalid pitch_loss_weights to fail")
+
+
 def test_luna_adapters_are_zero_init_residuals():
     tokens = torch.randn(2, 3, 4, 8)
     token_meta = {
@@ -367,6 +402,8 @@ if __name__ == "__main__":
     test_checkpoint_sampler_geometry_round_trip_handles_multiple_pitch_rings()
     test_canonical_eval_override_resets_checkpoint_anisotropic_fov()
     test_m1_ab_configs_round_trip_and_only_change_horizontal_fov()
+    test_pitch_ring_loss_weights_follow_yaw_major_sampler_order()
+    test_pitch_ring_loss_weights_repeat_per_panorama_and_validate_count()
     test_luna_adapters_are_zero_init_residuals()
     test_luna_patch_pooling_is_isolated_by_pano_id()
     test_luna_aggregator_smoke()
