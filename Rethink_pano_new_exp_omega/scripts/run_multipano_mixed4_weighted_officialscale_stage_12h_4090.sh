@@ -23,7 +23,7 @@ CALIB_SAMPLES_PER_DATASET="${CALIB_SAMPLES_PER_DATASET:-8}"
 CALIB_MAX_PIXELS_PER_SAMPLE="${CALIB_MAX_PIXELS_PER_SAMPLE:-50000}"
 NUM_YAW="${NUM_YAW:-4}"
 EVAL_LIMIT_PER_DATASET="${EVAL_LIMIT_PER_DATASET:-0}"
-EVAL_SUFFIX="valtestfull"
+EVAL_SUFFIX="valtestfull8833_anchor"
 if [[ "$EVAL_LIMIT_PER_DATASET" != "0" ]]; then
   EVAL_SUFFIX="valtest${EVAL_LIMIT_PER_DATASET}"
 fi
@@ -151,11 +151,18 @@ echo "[sequence] mixed4 validation $EVAL_SUFFIX started $(date --iso-8601=second
   --train-loss-csv "$LUNA_OUT/loss.csv" \
   --device cuda \
   --limit-per-dataset "$EVAL_LIMIT_PER_DATASET" \
+  --sample-policy anchor \
   --num-workers 2 \
   --seed 123 \
   --no-progress \
   2>&1 | tee "$LUNA_OUT/validation_mixed4_by_dataset_${EVAL_SUFFIX}_console.log"
 echo "[sequence] mixed4 validation $EVAL_SUFFIX finished $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
+
+if [[ "$EVAL_LIMIT_PER_DATASET" == "0" ]]; then
+  "$PYTHON" scripts/validate_eval_cardinality.py \
+    "$LUNA_OUT/validation_mixed4_by_dataset_${EVAL_SUFFIX}_summary.json" \
+    2>&1 | tee -a "$SEQ_LOG"
+fi
 
 echo "[sequence] plotting loss curves $(date --iso-8601=seconds)" | tee -a "$SEQ_LOG"
 "$PYTHON" scripts/plot_loss_csv.py \

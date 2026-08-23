@@ -146,10 +146,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sample-policy",
         choices=["scene_neighborhood", "anchor"],
-        default="scene_neighborhood",
+        default="anchor",
         help=(
-            "scene_neighborhood evaluates one nearest-neighborhood group per "
-            "scene/room/trajectory; anchor preserves the older random-anchor behavior."
+            "anchor evaluates the full indexed multi-pano set when --limit-per-dataset=0 "
+            "(the publication/full-eval default); scene_neighborhood is an explicitly "
+            "requested compact diagnostic with one group per scene/room/trajectory."
         ),
     )
     parser.add_argument("--camera-pair-csv", type=Path, default=None, help="Optional streaming PanoVGGT-style camera pair CSV path.")

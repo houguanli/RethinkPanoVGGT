@@ -8,8 +8,8 @@ FOUNDATION_CHECKPOINT="${FOUNDATION_CHECKPOINT:-/home/aoki/RethinkPanoVGGT_omega
 COMMON_PARENT_CHECKPOINT="${COMMON_PARENT_CHECKPOINT:-/home/aoki/RethinkPanoVGGT_omega_multipano_work/Rethink_pano_new_exp_omega/logs/local_tail3_low_to_high_12h_20260718_002_warmup_3h/last.pt}"
 RUN_PREFIX="${RUN_PREFIX:-m1_fovxy_core_ab_20260823}"
 TRAIN_MINUTES="${TRAIN_MINUTES:-180}"
-# Full held-out splits are the default for promotion decisions. Set a positive
-# value explicitly for a quick diagnostic run.
+# Full indexed anchor sets (216/891/1662/6064 = 8833 sets) are the default for
+# promotion decisions. Set a positive value explicitly for a quick diagnostic.
 EVAL_LIMIT_PER_DATASET="${EVAL_LIMIT_PER_DATASET:-0}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export CUDA_VISIBLE_DEVICES
@@ -61,7 +61,7 @@ run_eval() {
   local arm="$1"
   local config="$2"
   local output="$3"
-  local eval_scope="fullsplit"
+  local eval_scope="full8833_anchor"
   if (( EVAL_LIMIT_PER_DATASET > 0 )); then
     eval_scope="limit${EVAL_LIMIT_PER_DATASET}"
   fi
@@ -81,7 +81,7 @@ run_eval() {
       --train-loss-csv "${output}/loss.csv" \
       --datasets all \
       --limit-per-dataset "${EVAL_LIMIT_PER_DATASET}" \
-      --sample-policy scene_neighborhood \
+      --sample-policy anchor \
       --pano-count-policy panovggt \
       --camera-eval-max-panos 3 \
       --window-size 384 \
@@ -94,6 +94,10 @@ run_eval() {
       --seed 123 \
       --resume \
       --no-print-each-sample
+  fi
+
+  if (( EVAL_LIMIT_PER_DATASET == 0 )); then
+    "${PYTHON_BIN}" scripts/validate_eval_cardinality.py "${eval_dir}/summary.json"
   fi
 
   local preview_dir="${output}/preview_canonical_panocity_test0"

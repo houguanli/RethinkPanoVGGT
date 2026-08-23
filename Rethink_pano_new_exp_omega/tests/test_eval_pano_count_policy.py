@@ -14,6 +14,7 @@ class EvalPanoCountPolicyTest(unittest.TestCase):
         )
 
         self.assertEqual(args.pano_count_policy, "panovggt")
+        self.assertEqual(args.sample_policy, "anchor")
         self.assertEqual(
             resolve_dataset_pano_counts(args.pano_count_policy, None),
             {

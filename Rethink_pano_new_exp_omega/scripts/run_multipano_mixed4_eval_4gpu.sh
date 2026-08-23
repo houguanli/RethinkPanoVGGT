@@ -32,6 +32,17 @@ NUM_YAW="${NUM_YAW:-4}"
 PRINT_EACH_SAMPLE="${PRINT_EACH_SAMPLE:-1}"
 RESUME="${RESUME:-1}"
 
+if [[ "$LIMIT_PER_DATASET" == "0" && "$EVAL_DATASETS" == "all" ]]; then
+  if [[ "$SAMPLE_POLICY" != "anchor" ]]; then
+    echo "[eval-4gpu] formal 8,833-set eval requires SAMPLE_POLICY=anchor" >&2
+    exit 2
+  fi
+  if [[ "$PANO_COUNT_POLICY" != "panovggt" || -n "$DATASET_PANO_COUNTS" ]]; then
+    echo "[eval-4gpu] formal 8,833-set eval requires PANO_COUNT_POLICY=panovggt and no DATASET_PANO_COUNTS override" >&2
+    exit 2
+  fi
+fi
+
 mkdir -p "$EVAL_OUT/shards" "$EVAL_OUT/progress" "$EVAL_OUT/dataset_summaries"
 rm -f "$EVAL_OUT"/progress/shard_*.json
 rm -f "$EVAL_OUT"/shards/shard_*_stanford2d3ds.json \
@@ -450,6 +461,10 @@ fi
 if [[ ! -s "$PER_SAMPLE_CSV" ]]; then
   echo "[eval-4gpu] missing merged per-sample CSV: $PER_SAMPLE_CSV" | tee -a "$EVAL_OUT/eval_4gpu.log"
   exit 1
+fi
+
+if [[ "$LIMIT_PER_DATASET" == "0" && "$EVAL_DATASETS" == "all" ]]; then
+  "$PYTHON" scripts/validate_eval_cardinality.py "$SUMMARY_JSON" | tee -a "$EVAL_OUT/eval_4gpu.log"
 fi
 
 echo "[eval-4gpu] finished $(date --iso-8601=seconds)" | tee -a "$EVAL_OUT/eval_4gpu.log"
