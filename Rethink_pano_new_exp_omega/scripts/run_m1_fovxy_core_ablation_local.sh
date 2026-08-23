@@ -11,6 +11,10 @@ TRAIN_MINUTES="${TRAIN_MINUTES:-180}"
 # Full indexed anchor sets (216/891/1662/6064 = 8833 sets) are the default for
 # promotion decisions. Set a positive value explicitly for a quick diagnostic.
 EVAL_LIMIT_PER_DATASET="${EVAL_LIMIT_PER_DATASET:-0}"
+# A=75x75 matches the VGGT-Omega perspective input distribution and is the M1
+# milestone. The wider-FoV treatment is opt-in so a formal A run never spends
+# another full 8833-set pass on B unless explicitly requested.
+RUN_B_ARM="${RUN_B_ARM:-0}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export CUDA_VISIBLE_DEVICES
 export SKIP_INDEX_BUILD="${SKIP_INDEX_BUILD:-1}"
@@ -125,8 +129,13 @@ run_eval() {
 }
 
 run_training A_fov75x75 "${CONFIG_A}" "${OUTPUT_A}"
-run_training B_fov95x75 "${CONFIG_B}" "${OUTPUT_B}"
 run_eval A_fov75x75 "${CONFIG_A}" "${OUTPUT_A}"
-run_eval B_fov95x75 "${CONFIG_B}" "${OUTPUT_B}"
 
-echo "[COMPLETE] M1 A/B training, canonical eval, and previews finished."
+if [[ "${RUN_B_ARM}" == "1" ]]; then
+  run_training B_fov95x75 "${CONFIG_B}" "${OUTPUT_B}"
+  run_eval B_fov95x75 "${CONFIG_B}" "${OUTPUT_B}"
+else
+  echo "[SKIP] B_fov95x75 is opt-in (set RUN_B_ARM=1 to run it)."
+fi
+
+echo "[COMPLETE] M1 milestone training, canonical eval, and previews finished."

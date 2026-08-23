@@ -60,6 +60,9 @@ from training.train_pano_omega import (  # noqa: E402
 from vggt_omega.utils.rotation import mat_to_quat, quat_to_mat  # noqa: E402
 from vggt_omega.models.layers.pano_position import pinhole_rays, yaw_pitch_to_axes  # noqa: E402
 from vggt_omega.data.pano_sampler import resolve_fov_degrees  # noqa: E402
+from vggt_omega.models.erp_completion import (  # noqa: E402
+    splat_omega_window_depth_to_erp,
+)
 
 
 DEPTH_METRIC_PROTOCOL = "dual_covered_sphere_and_erp_stable_polar_prior_v2"
@@ -575,6 +578,8 @@ def evaluate_run(
     print_each_sample: bool = True,
     exact_group_manifest: list[dict[str, Any]] | None = None,
     resume: bool = False,
+    erp_completion_head: torch.nn.Module | None = None,
+    erp_completion_head_args: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if int(num_shards) < 1:
         raise ValueError(f"num_shards must be >= 1, got {num_shards}")
@@ -707,18 +712,30 @@ def evaluate_run(
                     target_valid,
                     spherical_weights=spherical_weights,
                 )
-                erp_prior_metrics = compute_erp_prior_depth_metrics(
-                    pred_window_z=pred_depth_base,
-                    gt_erp_depth=moved["pano_depth"],
-                    source_depth_semantics=eval_args.gt_depth_semantics,
-                    max_range_depth=eval_args.depth_max_m,
-                    camera_meta=target_camera_meta,
-                    dataset_name=canonical_eval_dataset_name(
-                        (row_context or {}).get("dataset")
-                        or getattr(eval_args, "minimal_datasets", "unknown")
-                    ),
-                    align_corners=False,
-                )
+                if erp_completion_head is None:
+                    erp_prior_metrics = compute_erp_prior_depth_metrics(
+                        pred_window_z=pred_depth_base,
+                        gt_erp_depth=moved["pano_depth"],
+                        source_depth_semantics=eval_args.gt_depth_semantics,
+                        max_range_depth=eval_args.depth_max_m,
+                        camera_meta=target_camera_meta,
+                        dataset_name=canonical_eval_dataset_name(
+                            (row_context or {}).get("dataset")
+                            or getattr(eval_args, "minimal_datasets", "unknown")
+                        ),
+                        align_corners=False,
+                    )
+                else:
+                    erp_prior_metrics = compute_erp_completion_depth_metrics(
+                        pred_window_z=pred_depth_base,
+                        pano_rgb=moved["pano_image"],
+                        gt_erp_depth=moved["pano_depth"],
+                        source_depth_semantics=eval_args.gt_depth_semantics,
+                        max_range_depth=eval_args.depth_max_m,
+                        camera_meta=target_camera_meta,
+                        completion_head=erp_completion_head,
+                        completion_head_args=erp_completion_head_args or {},
+                    )
                 camera_scale = base_depth_scale.detach() * sample_depth_scale
                 with torch.autocast(device_type=device.type, enabled=False):
                     camera_losses = camera_alignment_loss(
@@ -1246,6 +1263,90 @@ def compute_erp_prior_depth_metrics(
         "erp_prior_region_abs_rel": prior_abs_rel(prior_fill_mask),
         "erp_prior_north_abs_rel": prior_abs_rel(prior_fill_mask & north),
         "erp_prior_south_abs_rel": prior_abs_rel(prior_fill_mask & south),
+    }
+
+
+def compute_erp_completion_depth_metrics(
+    *,
+    pred_window_z: torch.Tensor,
+    pano_rgb: torch.Tensor,
+    gt_erp_depth: torch.Tensor,
+    source_depth_semantics: str,
+    max_range_depth: float,
+    camera_meta: dict[str, torch.Tensor],
+    completion_head: torch.nn.Module,
+    completion_head_args: dict[str, Any],
+) -> dict[str, float]:
+    """Evaluate learned completion over every valid ERP pixel.
+
+    Scale is fitted only on the trusted Omega core, matching the previous ERP
+    protocol while replacing the fixed polar prior with a learned prediction.
+    """
+    gt_range = erp_depth_to_range_depth(gt_erp_depth.detach().float(), source_depth_semantics)
+    if gt_range.ndim == 5 and gt_range.shape[2] == 1:
+        gt_range = gt_range[:, :, 0]
+    batch, num_panos, erp_height, erp_width = gt_range.shape
+    splat = splat_omega_window_depth_to_erp(
+        pred_window_z,
+        camera_meta,
+        num_panos=num_panos,
+        erp_height=erp_height,
+        erp_width=erp_width,
+    )
+    target_h = int(completion_head_args.get("height", min(256, erp_height)))
+    target_w = int(completion_head_args.get("width_erp", min(512, erp_width)))
+    blend_width = int(completion_head_args.get("blend_width_pixels", 12))
+    rgb = pano_rgb.reshape(batch * num_panos, 3, erp_height, erp_width)
+    rgb_small = F.interpolate(rgb, size=(target_h, target_w), mode="bilinear", align_corners=False)
+    mask_float = splat.valid_mask.float()
+    depth_small = F.interpolate(splat.depth * mask_float, size=(target_h, target_w), mode="area")
+    mask_small = F.interpolate(mask_float, size=(target_h, target_w), mode="area")
+    depth_small = depth_small / mask_small.clamp_min(1e-6)
+    completed_small = completion_head(
+        rgb_small,
+        depth_small,
+        mask_small > 0.05,
+        blend_width_pixels=blend_width,
+    )["depth"].float()
+    completed = F.interpolate(completed_small, size=(erp_height, erp_width), mode="bilinear", align_corners=False)
+    final_depth = torch.where(splat.valid_mask, splat.depth, completed)
+    final_depth = final_depth.reshape(batch, num_panos, erp_height, erp_width)
+    window_depth = splat.depth.reshape(batch, num_panos, erp_height, erp_width)
+    window_valid_raw = splat.valid_mask.reshape(batch, num_panos, erp_height, erp_width)
+    gt_valid = torch.isfinite(gt_range) & (gt_range > 0)
+    if float(max_range_depth) > 0:
+        gt_valid &= gt_range <= float(max_range_depth)
+    window_mask = window_valid_raw & gt_valid
+    learned_fill = ~window_valid_raw & gt_valid & torch.isfinite(final_depth) & (final_depth > 0)
+    eval_mask = window_mask | learned_fill
+    metrics = compute_depth_metrics(final_depth, gt_range, eval_mask, alignment_valid=window_mask)
+    window_only = compute_depth_metrics(window_depth, gt_range, window_mask)
+    scale = float(metrics.get("depth_irls_scale", 1.0))
+
+    def region_abs_rel(mask: torch.Tensor) -> float:
+        if not bool(mask.any()):
+            return 0.0
+        pred = final_depth[mask] * scale
+        return float(((pred - gt_range[mask]).abs() / gt_range[mask].clamp_min(1e-6)).mean().cpu())
+
+    row_latitudes = 90.0 - (
+        torch.arange(erp_height, device=gt_range.device, dtype=torch.float32) + 0.5
+    ) * 180.0 / float(erp_height)
+    north = (row_latitudes >= 75.0).reshape(1, 1, erp_height, 1)
+    south = (row_latitudes <= -75.0).reshape(1, 1, erp_height, 1)
+    gt_count = gt_valid.sum().clamp_min(1).float()
+    return {
+        **{f"erp_prior_{key}": value for key, value in metrics.items()},
+        "erp_window_coverage_fraction": float(window_mask.sum().float().div(gt_count).cpu()),
+        "erp_prior_fill_fraction": float(learned_fill.sum().float().div(gt_count).cpu()),
+        "erp_evaluated_gt_fraction": float(eval_mask.sum().float().div(gt_count).cpu()),
+        "erp_window_only_depth_irls_abs_rel": window_only["depth_irls_abs_rel"],
+        "erp_window_only_depth_irls_delta_1p25": window_only["depth_irls_delta_1p25"],
+        "erp_no_prior_depth_irls_abs_rel": metrics["depth_irls_abs_rel"],
+        "erp_no_prior_depth_irls_delta_1p25": metrics["depth_irls_delta_1p25"],
+        "erp_prior_region_abs_rel": region_abs_rel(learned_fill),
+        "erp_prior_north_abs_rel": region_abs_rel(learned_fill & north),
+        "erp_prior_south_abs_rel": region_abs_rel(learned_fill & south),
     }
 
 

@@ -54,6 +54,7 @@ from training.train_pano_omega import (  # noqa: E402
     set_seed,
 )
 from vggt_omega.data.pano_sampler import resolve_fov_degrees  # noqa: E402
+from vggt_omega.models.erp_completion import load_erp_completion_head  # noqa: E402
 
 
 DATASETS = [
@@ -97,6 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="Training config used to build model/datasets.")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Checkpoint to validate.")
+    parser.add_argument(
+        "--erp-completion-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional learned remaining-band head; enables learned full-ERP metrics.",
+    )
     parser.add_argument(
         "--dataset-root",
         type=Path,
@@ -210,6 +217,14 @@ def main() -> None:
     apply_eval_sampler_overrides(train_args, args)
     model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
     model.eval()
+    erp_completion_head = None
+    erp_completion_payload: dict[str, Any] = {}
+    if args.erp_completion_checkpoint is not None:
+        erp_completion_head, erp_completion_payload = load_erp_completion_head(
+            args.erp_completion_checkpoint,
+            device,
+        )
+        print(f"[INFO] learned ERP completion = {args.erp_completion_checkpoint}", flush=True)
 
     camera_pair_csv = args.camera_pair_csv
     if camera_pair_csv is None and args.per_sample_csv is not None:
@@ -312,6 +327,8 @@ def main() -> None:
             print_each_sample=args.print_each_sample,
             exact_group_manifest=manifest_rows_for_dataset(manifest_rows, display_name, minimal_name),
             resume=args.resume,
+            erp_completion_head=erp_completion_head,
+            erp_completion_head_args=erp_completion_payload.get("head_args", {}),
         )
         run["dataset"] = display_name
         run["minimal_dataset"] = minimal_name
@@ -341,6 +358,10 @@ def main() -> None:
     result = {
         "config": str(args.config),
         "checkpoint": str(args.checkpoint),
+        "erp_completion_checkpoint": (
+            str(args.erp_completion_checkpoint) if args.erp_completion_checkpoint is not None else None
+        ),
+        "erp_completion_mode": "learned_remaining_band" if erp_completion_head is not None else "stable_polar_prior",
         "device": str(device),
         "seed": args.seed,
         "limit_per_dataset": int(args.limit_per_dataset),

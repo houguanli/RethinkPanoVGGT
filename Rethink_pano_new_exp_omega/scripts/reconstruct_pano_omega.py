@@ -24,6 +24,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from training.data import PanoCityPairedOmegaDataset, PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E402
 from training.train_pano_omega import build_model, load_checkpoint, sample_depth_targets, set_seed  # noqa: E402
 from vggt_omega.models.layers.pano_position import pinhole_rays, rays_to_equirectangular  # noqa: E402
+from vggt_omega.models.erp_completion import (  # noqa: E402
+    load_erp_completion_head,
+    splat_omega_window_depth_to_erp,
+)
 
 
 DEFAULT_PANOCITY_PRED_DEPTH_SCALE = 5.491308212280273
@@ -51,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="For --dataset-format pano_minimal: split index to read.",
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--erp-completion-checkpoint", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument(
@@ -206,6 +211,50 @@ def main() -> None:
         pano_hw=pano_np.shape[:2],
     )
     save_depth_image(pred_erp, valid_erp, output_dir / "pred_z_depth_erp_splat.png", max_depth=args.depth_max_m)
+    if args.erp_completion_checkpoint is not None:
+        completion_head, completion_payload = load_erp_completion_head(args.erp_completion_checkpoint, device)
+        head_args = completion_payload.get("head_args", {})
+        completion_h = int(head_args.get("height", 256))
+        completion_w = int(head_args.get("width_erp", 512))
+        blend_width = int(head_args.get("blend_width_pixels", 12))
+        num_panos = int(pano_image.shape[1])
+        splat = splat_omega_window_depth_to_erp(
+            predictions["depth"] * float(pred_depth_scale),
+            predictions["pano_camera_meta"],
+            num_panos=num_panos,
+            erp_height=pano_np.shape[0],
+            erp_width=pano_np.shape[1],
+        )
+        rgb = pano_image.reshape(num_panos, 3, pano_np.shape[0], pano_np.shape[1])
+        rgb_small = F.interpolate(rgb, size=(completion_h, completion_w), mode="bilinear", align_corners=False)
+        coverage_float = splat.valid_mask.float()
+        depth_small = F.interpolate(splat.depth * coverage_float, size=(completion_h, completion_w), mode="area")
+        coverage_small = F.interpolate(coverage_float, size=(completion_h, completion_w), mode="area")
+        depth_small = depth_small / coverage_small.clamp_min(1e-6)
+        with torch.no_grad():
+            completed_small = completion_head(
+                rgb_small,
+                depth_small,
+                coverage_small > 0.05,
+                blend_width_pixels=blend_width,
+            )["depth"].float()
+        completed = F.interpolate(
+            completed_small,
+            size=(pano_np.shape[0], pano_np.shape[1]),
+            mode="bilinear",
+            align_corners=False,
+        )
+        completed = torch.where(splat.valid_mask, splat.depth, completed)
+        completed_np = completed[0, 0].detach().cpu().numpy()
+        completed_valid = np.isfinite(completed_np) & (completed_np > 0)
+        save_depth_image(
+            completed_np,
+            completed_valid,
+            output_dir / "pred_range_depth_erp_completed.png",
+            max_depth=args.depth_max_m,
+        )
+        coverage_np = splat.valid_mask[0, 0].detach().cpu().numpy()
+        Image.fromarray((coverage_np.astype(np.uint8) * 255)).save(output_dir / "omega_erp_coverage.png")
     if target_available:
         target_range_erp = erp_range_depth_image(sample["pano_depth"][0].numpy(), args.gt_depth_semantics)
         target_range_valid = np.isfinite(target_range_erp) & (target_range_erp > 0) & (target_range_erp <= args.depth_max_m)
