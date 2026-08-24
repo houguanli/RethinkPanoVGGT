@@ -30,20 +30,23 @@ mkdir -p "${WARMUP_OUTPUT}" "${MAIN_OUTPUT}" "${REFINE_OUTPUT}" "${QUICK_EVAL}" 
 exec > >(tee -a "${PIPELINE_LOG}") 2>&1
 cd "${PROJECT_ROOT}"
 
-wait_for_idle_gpu() {
+wait_for_gpu_capacity() {
+  local minimum_free_mib="$1"
   local consecutive=0
-  local memory_used utilization
+  local memory_used memory_total utilization memory_free
   while (( consecutive < 2 )); do
-    IFS=',' read -r memory_used utilization < <(
-      nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits | head -n 1
+    IFS=',' read -r memory_used memory_total utilization < <(
+      nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits | head -n 1
     )
     memory_used="${memory_used//[[:space:]]/}"
+    memory_total="${memory_total//[[:space:]]/}"
     utilization="${utilization//[[:space:]]/}"
-    if (( memory_used <= 1024 && utilization <= 10 )); then
+    memory_free=$((memory_total - memory_used))
+    if (( memory_free >= minimum_free_mib && utilization <= 50 )); then
       consecutive=$((consecutive + 1))
     else
       consecutive=0
-      echo "[WAIT] GPU busy: memory=${memory_used}MiB utilization=${utilization}%"
+      echo "[WAIT] GPU capacity: free=${memory_free}MiB required=${minimum_free_mib}MiB utilization=${utilization}%"
     fi
     (( consecutive >= 2 )) || sleep 30
   done
@@ -66,7 +69,7 @@ done
 # Another user pipeline was already queued behind the M1 evaluator. Give it a
 # deterministic head start, then require two consecutive idle checks.
 sleep "${POST_M1_GRACE_SECONDS:-90}"
-wait_for_idle_gpu
+wait_for_gpu_capacity "${PREFLIGHT_MIN_FREE_MIB:-12000}"
 
 if [[ ! -s "${PREFLIGHT}/last.pt" ]]; then
   echo "[PREFLIGHT] one real frozen-Omega completion update"
@@ -77,6 +80,10 @@ if [[ ! -s "${PREFLIGHT}/last.pt" ]]; then
     --duration-minutes 5 --max-steps 1 --stage main --head-width 8 \
     --height 128 --width 256 --num-workers 0 2>&1 | tee -a "${PREFLIGHT}/train.log"
 fi
+
+# Full 1B-parameter backpropagation is substantially heavier than the frozen
+# teacher preflight. Keep a separate conservative gate for the 2h warm-up.
+wait_for_gpu_capacity "${WARMUP_MIN_FREE_MIB:-21000}"
 
 if [[ ! -s "${WARMUP_OUTPUT}/last.pt" ]]; then
   echo "[STAGE 1/5] canonical full-Omega warm-up (${WARMUP_MINUTES} minutes)"
