@@ -176,6 +176,8 @@ def main() -> None:
     result = {
         "config": first.get("config"),
         "checkpoint": first.get("checkpoint"),
+        "erp_completion_checkpoint": first.get("erp_completion_checkpoint"),
+        "erp_completion_mode": first.get("erp_completion_mode"),
         "device": "merged_shards",
         "seed": first.get("seed"),
         "limit_per_dataset": first.get("limit_per_dataset"),

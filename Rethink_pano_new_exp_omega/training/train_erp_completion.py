@@ -7,13 +7,16 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -44,6 +47,7 @@ CSV_FIELDS = [
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="Canonical Omega/data config.")
+    parser.add_argument("--dataset-root", type=Path, default=None)
     parser.add_argument("--omega-checkpoint", type=Path, required=True)
     parser.add_argument("--base-checkpoint", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -69,10 +73,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    set_seed(args.seed)
-    device = torch.device(args.device)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+    if distributed:
+        dist.init_process_group(backend="nccl")
+    if args.device == "cuda":
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        if distributed:
+            raise ValueError("Distributed ERP completion currently requires CUDA/NCCL")
+        device = torch.device("cpu")
+    is_main = rank == 0
+    set_seed(args.seed + rank)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     omega_args = parse_omega_args(["--config", str(args.config)])
+    if args.dataset_root is not None:
+        omega_args.dataset_root = str(args.dataset_root)
     # Completion always uses the distribution-aligned canonical Omega windows.
     omega_args.pitch_degrees = "-15"
     omega_args.fov_degrees = 75.0
@@ -87,7 +106,21 @@ def main() -> None:
     omega_args.batch_size = 1
     omega_args.num_workers = args.num_workers
     dataset = build_dataset(omega_args, (512, 1024))
-    loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=args.num_workers, pin_memory=device.type == "cuda")
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        drop_last=False,
+    ) if distributed else None
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+    )
 
     omega = build_model(omega_args).to(device)
     if args.base_checkpoint is not None and args.base_checkpoint.resolve() != args.omega_checkpoint.resolve():
@@ -98,40 +131,56 @@ def main() -> None:
         parameter.requires_grad_(False)
 
     head = ERPRemainingBandHead(args.head_width, args.max_log_residual).to(device)
-    optimizer = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     global_step = 0
     total_elapsed_before = 0.0
+    resume_payload = None
     if args.resume is not None:
-        payload = torch.load(args.resume, map_location="cpu", weights_only=False)
-        head.load_state_dict(payload["completion_head"])
-        if "optimizer" in payload:
-            optimizer.load_state_dict(payload["optimizer"])
-        global_step = int(payload.get("step", 0))
-        total_elapsed_before = float(payload.get("total_elapsed_minutes", 0.0))
-        print(f"[INFO] resumed completion head from {args.resume} at step {global_step}", flush=True)
+        resume_payload = torch.load(args.resume, map_location="cpu", weights_only=False)
+        head.load_state_dict(resume_payload["completion_head"])
+        global_step = int(resume_payload.get("step", 0))
+        total_elapsed_before = float(resume_payload.get("total_elapsed_minutes", 0.0))
+        if is_main:
+            print(f"[INFO] resumed completion head from {args.resume} at step {global_step}", flush=True)
+    if distributed:
+        head = DistributedDataParallel(head, device_ids=[local_rank], output_device=local_rank)
+    optimizer = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if resume_payload is not None and "optimizer" in resume_payload:
+        optimizer.load_state_dict(resume_payload["optimizer"])
 
     log_path = args.output_dir / "loss.csv"
     append = log_path.exists() and log_path.stat().st_size > 0
-    log_file = log_path.open("a", newline="", encoding="utf-8")
-    writer = csv.DictWriter(log_file, fieldnames=CSV_FIELDS)
-    if not append:
+    log_file = log_path.open("a", newline="", encoding="utf-8") if is_main else None
+    writer = csv.DictWriter(log_file, fieldnames=CSV_FIELDS) if log_file is not None else None
+    if writer is not None and not append:
         writer.writeheader()
     start = time.monotonic()
     stop_reason = "duration"
     amp_enabled = device.type == "cuda" and args.amp_dtype == "bfloat16"
     iterator = iter(loader)
+    loader_epoch = 0
     head.train()
     try:
         while True:
             elapsed = (time.monotonic() - start) / 60.0
-            if elapsed >= args.duration_minutes:
-                break
-            if args.max_steps > 0 and global_step >= args.max_steps:
-                stop_reason = "max_steps"
+            reached_duration = elapsed >= args.duration_minutes
+            reached_max_steps = args.max_steps > 0 and global_step >= args.max_steps
+            should_stop = reached_duration or reached_max_steps
+            if distributed:
+                stop_tensor = torch.tensor(int(should_stop), device=device)
+                dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX)
+                should_stop = bool(stop_tensor.item())
+            if should_stop:
+                if reached_max_steps:
+                    stop_reason = "max_steps"
+                elif not reached_duration:
+                    stop_reason = "peer_duration"
                 break
             try:
                 batch = next(iterator)
             except StopIteration:
+                loader_epoch += 1
+                if sampler is not None:
+                    sampler.set_epoch(loader_epoch)
                 iterator = iter(loader)
                 batch = next(iterator)
             pano_image = batch["pano_image"].to(device, non_blocking=True)
@@ -171,22 +220,27 @@ def main() -> None:
                 "stage": args.stage,
                 **{key: float(value.detach().float().cpu()) for key, value in losses.items()},
             }
-            writer.writerow(row)
-            log_file.flush()
-            if global_step % args.log_every == 0:
+            if writer is not None:
+                writer.writerow(row)
+                log_file.flush()
+            if is_main and global_step % args.log_every == 0:
                 print(
                     f"[TRAIN completion:{args.stage}] step={global_step} elapsed={elapsed:.1f}m "
                     f"loss={row['loss']:.5f} remaining={row['loss_remaining']:.5f} "
                     f"boundary={row['loss_boundary']:.5f} coverage={row['coverage_ratio']:.3f}",
                     flush=True,
                 )
-            if args.save_every > 0 and global_step % args.save_every == 0:
+            if is_main and args.save_every > 0 and global_step % args.save_every == 0:
                 save_checkpoint(args.output_dir / f"step_{global_step:06d}.pt", head, optimizer, args, global_step, total_elapsed_before + elapsed)
     finally:
         elapsed = (time.monotonic() - start) / 60.0
-        save_checkpoint(args.output_dir / "last.pt", head, optimizer, args, global_step, total_elapsed_before + elapsed)
-        log_file.close()
-        print(f"[INFO] completion stop_reason={stop_reason} step={global_step} checkpoint={args.output_dir / 'last.pt'}", flush=True)
+        if is_main:
+            save_checkpoint(args.output_dir / "last.pt", head, optimizer, args, global_step, total_elapsed_before + elapsed)
+            if log_file is not None:
+                log_file.close()
+            print(f"[INFO] completion stop_reason={stop_reason} step={global_step} checkpoint={args.output_dir / 'last.pt'}", flush=True)
+        if distributed and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def completion_losses(output, target, target_valid, rgb, stage: str, blend_width: int):
@@ -246,7 +300,7 @@ def save_checkpoint(path, head, optimizer, args, step, elapsed):
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "format": "erp_remaining_band_head_v1",
-        "completion_head": head.state_dict(),
+        "completion_head": unwrap_completion_head(head).state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": int(step),
         "total_elapsed_minutes": float(elapsed),
@@ -264,6 +318,10 @@ def save_checkpoint(path, head, optimizer, args, step, elapsed):
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
     temporary.replace(path)
+
+
+def unwrap_completion_head(head):
+    return head.module if isinstance(head, DistributedDataParallel) else head
 
 
 if __name__ == "__main__":

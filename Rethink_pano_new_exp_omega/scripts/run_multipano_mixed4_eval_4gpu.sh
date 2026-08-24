@@ -10,6 +10,7 @@ CONFIG="${CONFIG:-configs/multipano_rtx5000x4_mixed4_pano_all384_luna_after_full
 DATASET_ROOT="${DATASET_ROOT:-}"
 LUNA_OUT="${LUNA_OUT:-logs/mixed4_pano_all384_4xrtx5000_multipano_after_full_warmup_9h}"
 CHECKPOINT="${CHECKPOINT:-$LUNA_OUT/last.pt}"
+ERP_COMPLETION_CHECKPOINT="${ERP_COMPLETION_CHECKPOINT:-}"
 TRAIN_LOSS_CSV="${TRAIN_LOSS_CSV:-$LUNA_OUT/loss.csv}"
 EVAL_OUT="${EVAL_OUT:-$LUNA_OUT/eval_full_4gpu}"
 LIMIT_PER_DATASET="${LIMIT_PER_DATASET:-0}"
@@ -94,6 +95,7 @@ fi
   echo "[eval-4gpu] config=$CONFIG"
   echo "[eval-4gpu] dataset_root=${DATASET_ROOT:-<config>}"
   echo "[eval-4gpu] checkpoint=$EVAL_CHECKPOINT"
+  echo "[eval-4gpu] erp_completion_checkpoint=${ERP_COMPLETION_CHECKPOINT:-<disabled>}"
   echo "[eval-4gpu] train_loss_csv=$TRAIN_LOSS_CSV"
   echo "[eval-4gpu] eval_out=$EVAL_OUT"
   echo "[eval-4gpu] gpus=$GPUS num_shards=$NUM_SHARDS"
@@ -159,10 +161,15 @@ PY
     if [[ -n "$DATASET_ROOT" ]]; then
       dataset_root_args=(--dataset-root "$DATASET_ROOT")
     fi
+    completion_args=()
+    if [[ -n "$ERP_COMPLETION_CHECKPOINT" ]]; then
+      completion_args=(--erp-completion-checkpoint "$ERP_COMPLETION_CHECKPOINT")
+    fi
     CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$gpu" PYTHONUNBUFFERED=1 PYTHONPATH="$LUNA${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/evaluate_mixed4_depth_checkpoint.py \
       --config "$CONFIG" \
       "${dataset_root_args[@]}" \
       --checkpoint "$EVAL_CHECKPOINT" \
+      "${completion_args[@]}" \
       --output "$shard_json" \
       --per-sample-csv "$shard_csv" \
       --train-loss-csv "$TRAIN_LOSS_CSV" \
