@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-/whitehole/AOKI/RethinkPanoVGGT_omega_multipano_work_pro/Rethink_pano_new_exp_omega}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-PANOVGGT_ROOT="${PANOVGGT_ROOT:-/whitehole/AOKI/PanoVGGT_minimal_datasets/datasets}"
+PANOVGGT_ROOT="${PANOVGGT_ROOT:-/whitehole/AOKI/panovggt}"
 FOUNDATION_CHECKPOINT="${FOUNDATION_CHECKPOINT:-/whitehole/AOKI/vggt-omega/ckpt/vggt_omega_1b_512.pt}"
 # Set this to the retained FoV75 A milestone when it is available on the server.
 # Otherwise the canonical warm-up starts directly from the Omega foundation.

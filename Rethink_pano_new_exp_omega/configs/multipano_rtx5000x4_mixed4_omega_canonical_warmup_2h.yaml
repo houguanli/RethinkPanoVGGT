@@ -1,6 +1,6 @@
 # Four-card RTX 5000 server configuration for the canonical Omega warm-up.
 data:
-  dataset_root: /whitehole/AOKI/PanoVGGT_minimal_datasets/datasets
+  dataset_root: /whitehole/AOKI/panovggt
   dataset_format: pano_minimal
   minimal_datasets: all
   dataset_sampling_weights: "panocity:0.64,matterport3d:0.18,structured3d:0.09,stanford2d3ds:0.09"
@@ -18,6 +18,10 @@ data:
   output_depth_scale: 1000.0
   invalid_depth_value: 65535.0
   pano_position_step_m: 1.0
+
+checkpoints:
+  checkpoint: /whitehole/AOKI/vggt-omega/ckpt/vggt_omega_1b_512.pt
+  base_checkpoint: /whitehole/AOKI/vggt-omega/ckpt/vggt_omega_1b_512.pt
 
 sampler:
   patch_size: 16
