@@ -17,6 +17,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
+from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -68,6 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--max-steps", type=int, default=0)
+    parser.add_argument("--progress-bar", dest="progress_bar", action="store_true", default=True)
+    parser.add_argument("--no-progress-bar", dest="progress_bar", action="store_false")
     return parser
 
 
@@ -158,6 +161,16 @@ def main() -> None:
     amp_enabled = device.type == "cuda" and args.amp_dtype == "bfloat16"
     iterator = iter(loader)
     loader_epoch = 0
+    progress = None
+    last_progress_elapsed = 0.0
+    if is_main and args.progress_bar:
+        progress = tqdm(
+            total=max(1, int(args.duration_minutes * 60.0)),
+            desc=f"ERP completion {args.stage}",
+            unit="s",
+            dynamic_ncols=True,
+            leave=True,
+        )
     head.train()
     try:
         while True:
@@ -223,18 +236,37 @@ def main() -> None:
             if writer is not None:
                 writer.writerow(row)
                 log_file.flush()
+            if progress is not None:
+                elapsed_seconds = time.monotonic() - start
+                update = max(0, int(elapsed_seconds) - int(last_progress_elapsed))
+                if update:
+                    progress.update(update)
+                    last_progress_elapsed = elapsed_seconds
+                progress.set_postfix(
+                    step=global_step,
+                    loss=f"{row['loss']:.4f}",
+                    remaining=f"{row['loss_remaining']:.4f}",
+                    boundary=f"{row['loss_boundary']:.4f}",
+                    coverage=f"{row['coverage_ratio']:.3f}",
+                    finite=f"{row['pred_finite_ratio']:.3f}",
+                )
             if is_main and global_step % args.log_every == 0:
-                print(
+                message = (
                     f"[TRAIN completion:{args.stage}] step={global_step} elapsed={elapsed:.1f}m "
                     f"loss={row['loss']:.5f} remaining={row['loss_remaining']:.5f} "
-                    f"boundary={row['loss_boundary']:.5f} coverage={row['coverage_ratio']:.3f}",
-                    flush=True,
+                    f"boundary={row['loss_boundary']:.5f} coverage={row['coverage_ratio']:.3f}"
                 )
+                if progress is not None:
+                    progress.write(message)
+                else:
+                    print(message, flush=True)
             if is_main and args.save_every > 0 and global_step % args.save_every == 0:
                 save_checkpoint(args.output_dir / f"step_{global_step:06d}.pt", head, optimizer, args, global_step, total_elapsed_before + elapsed)
     finally:
         elapsed = (time.monotonic() - start) / 60.0
         if is_main:
+            if progress is not None:
+                progress.close()
             save_checkpoint(args.output_dir / "last.pt", head, optimizer, args, global_step, total_elapsed_before + elapsed)
             if log_file is not None:
                 log_file.close()

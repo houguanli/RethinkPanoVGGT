@@ -16,6 +16,7 @@ COMPLETION_MAIN_MINUTES="${COMPLETION_MAIN_MINUTES:-480}"
 COMPLETION_REFINE_MINUTES="${COMPLETION_REFINE_MINUTES:-120}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 EVAL_WORKERS_PER_GPU="${EVAL_WORKERS_PER_GPU:-2}"
+CHECKPOINT_EVERY_STEPS="${CHECKPOINT_EVERY_STEPS:-2000}"
 CONFIG="${CONFIG:-configs/multipano_rtx5000x4_mixed4_omega_canonical_warmup_2h.yaml}"
 
 export CUDA_VISIBLE_DEVICES
@@ -30,9 +31,10 @@ QUICK_EVAL="${PROJECT_ROOT}/logs/${RUN_NAME}_eval_quick20_full_erp_4gpu"
 FULL_EVAL="${PROJECT_ROOT}/logs/${RUN_NAME}_eval_full8833_anchor_full_erp_4gpu"
 PREVIEW="${PROJECT_ROOT}/logs/${RUN_NAME}_preview_panocity_test0"
 PIPELINE_LOG="${PROJECT_ROOT}/logs/${RUN_NAME}_pipeline.log"
+LOSS_ANALYSIS="${PROJECT_ROOT}/logs/${RUN_NAME}_loss_analysis"
 
 cd "$PROJECT_ROOT"
-mkdir -p "$WARMUP_OUTPUT" "$MAIN_OUTPUT" "$REFINE_OUTPUT" "$QUICK_EVAL" "$FULL_EVAL" "$PREVIEW"
+mkdir -p "${PROJECT_ROOT}/logs" "$WARMUP_OUTPUT" "$MAIN_OUTPUT" "$REFINE_OUTPUT" "$QUICK_EVAL" "$FULL_EVAL" "$PREVIEW" "$LOSS_ANALYSIS"
 exec > >(tee -a "$PIPELINE_LOG") 2>&1
 
 require_file() { [[ -s "$1" ]] || { echo "[ERROR] missing/empty file: $1"; exit 2; }; }
@@ -56,6 +58,7 @@ fi
 echo "[PIPELINE] root=$PROJECT_ROOT run=$RUN_NAME"
 echo "[PIPELINE] dataset=$PANOVGGT_ROOT foundation=$FOUNDATION_CHECKPOINT init=$WARMUP_INIT_CHECKPOINT"
 echo "[PIPELINE] GPUs=$CUDA_VISIBLE_DEVICES schedule=${WARMUP_MINUTES}m+${COMPLETION_MAIN_MINUTES}m+${COMPLETION_REFINE_MINUTES}m"
+echo "[PIPELINE] checkpoint_every_steps=$CHECKPOINT_EVERY_STEPS; eval=quick20+full8833"
 
 if [[ ! -s "$WARMUP_OUTPUT/last.pt" ]]; then
   echo "[STAGE 1/6] four-GPU canonical Omega warm-up"
@@ -65,7 +68,8 @@ if [[ ! -s "$WARMUP_OUTPUT/last.pt" ]]; then
     --base-checkpoint "$FOUNDATION_CHECKPOINT" --checkpoint "$WARMUP_INIT_CHECKPOINT" \
     --output-dir "$WARMUP_OUTPUT" --tensorboard-dir "$WARMUP_OUTPUT/tensorboard" \
     --debug-dir "$WARMUP_OUTPUT/debug" --max-duration-minutes "$WARMUP_MINUTES" \
-    --num-workers "$NUM_WORKERS" --no-inherit-checkpoint-training-defaults \
+    --num-workers "$NUM_WORKERS" --save-every-steps "$CHECKPOINT_EVERY_STEPS" --progress-bar \
+    --no-inherit-checkpoint-training-defaults \
     2>&1 | tee -a "$WARMUP_OUTPUT/train.log"
 fi
 require_file "$WARMUP_OUTPUT/last.pt"
@@ -77,7 +81,8 @@ if [[ ! -s "$MAIN_OUTPUT/last.pt" ]]; then
     --config "$CONFIG" --dataset-root "$PANOVGGT_ROOT" \
     --omega-checkpoint "$WARMUP_OUTPUT/last.pt" --base-checkpoint "$FOUNDATION_CHECKPOINT" \
     --output-dir "$MAIN_OUTPUT" --duration-minutes "$COMPLETION_MAIN_MINUTES" \
-    --stage main --num-workers "$NUM_WORKERS" 2>&1 | tee -a "$MAIN_OUTPUT/train.log"
+    --stage main --num-workers "$NUM_WORKERS" --save-every "$CHECKPOINT_EVERY_STEPS" --progress-bar \
+    2>&1 | tee -a "$MAIN_OUTPUT/train.log"
 fi
 require_file "$MAIN_OUTPUT/last.pt"
 
@@ -89,9 +94,17 @@ if [[ ! -s "$REFINE_OUTPUT/last.pt" ]]; then
     --omega-checkpoint "$WARMUP_OUTPUT/last.pt" --base-checkpoint "$FOUNDATION_CHECKPOINT" \
     --output-dir "$REFINE_OUTPUT" --resume "$MAIN_OUTPUT/last.pt" \
     --duration-minutes "$COMPLETION_REFINE_MINUTES" --stage refine --lr 5e-5 \
-    --num-workers "$NUM_WORKERS" 2>&1 | tee -a "$REFINE_OUTPUT/train.log"
+    --num-workers "$NUM_WORKERS" --save-every "$CHECKPOINT_EVERY_STEPS" --progress-bar \
+    2>&1 | tee -a "$REFINE_OUTPUT/train.log"
 fi
 require_file "$REFINE_OUTPUT/last.pt"
+
+echo "[ANALYSIS] generating smoothed loss curves and health report"
+"$PYTHON_BIN" scripts/analyze_full_erp_training_losses.py \
+  --series "omega_warmup=$WARMUP_OUTPUT/loss.csv" \
+  --series "completion_main=$MAIN_OUTPUT/loss.csv" \
+  --series "completion_refine=$REFINE_OUTPUT/loss.csv" \
+  --output-dir "$LOSS_ANALYSIS"
 
 if [[ ! -s "$QUICK_EVAL/validation_mixed4_by_dataset_valtestfull_summary.json" ]]; then
   echo "[STAGE 4/6] four-shard learned full-ERP quick eval"
