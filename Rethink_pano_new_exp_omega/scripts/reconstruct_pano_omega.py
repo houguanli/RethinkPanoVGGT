@@ -138,7 +138,7 @@ def main() -> None:
         model_args.fov_y_degrees = args.fov_y_degrees
     if args.window_size is not None:
         model_args.window_size = args.window_size
-    validate_completion_sampler_args(model_args, completion_payload)
+    validate_completion_sampler_args(model_args, completion_payload, args.checkpoint)
 
     pano_size = pano_size_from_args(model_args)
     if args.pano_path is not None:

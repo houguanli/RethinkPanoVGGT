@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -27,9 +29,11 @@ from training.train_pano_omega import (
     build_dataset,
     build_model,
     load_checkpoint,
+    load_checkpoint_payload,
     parse_args as parse_omega_args,
     set_seed,
 )
+from training.matched_warmup import validate_teacher, interrupt_on_term
 from vggt_omega.models.erp_completion import (
     ERPRemainingBandHead,
     soft_coverage_distance,
@@ -37,6 +41,7 @@ from vggt_omega.models.erp_completion import (
     splat_omega_window_depth_to_erp,
     SAMPLER_KEYS,
     canonical_alignment_mask,
+    validate_completion_sampler_args,
 )
 
 
@@ -73,12 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--core-latitude-degrees", type=float, default=90.0,
                         help="Trust Omega splats only within this absolute latitude; 90 preserves legacy behavior.")
     parser.add_argument("--max-steps", type=int, default=0)
+    parser.add_argument("--matched-warmup-arm", choices=["A", "B"], default=None)
     parser.add_argument("--progress-bar", dest="progress_bar", action="store_true", default=True)
     parser.add_argument("--no-progress-bar", dest="progress_bar", action="store_false")
     return parser
 
 
 def main() -> None:
+    signal.signal(signal.SIGTERM, interrupt_on_term)
     args = build_parser().parse_args()
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -109,6 +116,9 @@ def main() -> None:
     omega_args.batch_size = 1
     omega_args.num_workers = args.num_workers
     args.sampler_args = {key: getattr(omega_args, key) for key in SAMPLER_KEYS}
+    teacher_payload = load_checkpoint_payload(args.omega_checkpoint)
+    if args.matched_warmup_arm:
+        validate_teacher(omega_args, teacher_payload, args.matched_warmup_arm)
     print(f"[INFO] sampler={args.sampler_args} core_latitude={args.core_latitude_degrees}", flush=True)
     dataset = build_dataset(omega_args, (512, 1024))
     sampler = DistributedSampler(
@@ -130,7 +140,8 @@ def main() -> None:
     omega = build_model(omega_args).to(device)
     if args.base_checkpoint is not None and args.base_checkpoint.resolve() != args.omega_checkpoint.resolve():
         load_checkpoint(omega, args.base_checkpoint, strict=False)
-    load_checkpoint(omega, args.omega_checkpoint, strict=False)
+    load_checkpoint(omega, args.omega_checkpoint, strict=False, payload=teacher_payload)
+    del teacher_payload
     omega.eval()
     for parameter in omega.parameters():
         parameter.requires_grad_(False)
@@ -138,11 +149,19 @@ def main() -> None:
     # Crop geometry must not affect small-head initialization or data order.
     set_seed(args.seed + rank)
     head = ERPRemainingBandHead(args.head_width, args.max_log_residual).to(device)
+    args.initial_head_sha256 = hashlib.sha256(b"".join(value.detach().cpu().numpy().tobytes()
+                                                      for value in head.state_dict().values())).hexdigest()
     global_step = 0
     total_elapsed_before = 0.0
     resume_payload = None
     if args.resume is not None:
         resume_payload = torch.load(args.resume, map_location="cpu", weights_only=False)
+        validate_completion_sampler_args(omega_args, resume_payload)
+        if args.matched_warmup_arm and (
+            resume_payload.get("matched_warmup_arm") != args.matched_warmup_arm
+            or Path(resume_payload["omega_checkpoint"]).resolve() != args.omega_checkpoint.resolve()
+        ):
+            raise ValueError("Refinement must resume the same arm and matched Omega teacher")
         head.load_state_dict(resume_payload["completion_head"])
         global_step = int(resume_payload.get("step", 0))
         total_elapsed_before = float(resume_payload.get("total_elapsed_minutes", 0.0))
@@ -164,6 +183,8 @@ def main() -> None:
     if writer is not None and not append:
         writer.writeheader()
     start = time.monotonic()
+    starting_step = global_step
+    gpu_seconds = 0.0
     stop_reason = "duration"
     amp_enabled = device.type == "cuda" and args.amp_dtype == "bfloat16"
     iterator = iter(loader)
@@ -210,6 +231,9 @@ def main() -> None:
             pano_depth = batch["pano_depth"].to(device, non_blocking=True)
             common_mask = batch["pano_rgb_depth_common_mask"].to(device, non_blocking=True)
             batch_size, num_panos = pano_image.shape[:2]
+            if device.type == "cuda":
+                gpu_start, gpu_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                gpu_start.record()
             with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
                 prediction = omega(pano_images=pano_image, return_sampler_output=True)
                 splat = splat_omega_window_depth_to_erp(
@@ -240,7 +264,12 @@ def main() -> None:
             losses["loss"].backward()
             torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
             optimizer.step()
+            if device.type == "cuda":
+                gpu_end.record()
+                gpu_end.synchronize()
+                gpu_seconds += gpu_start.elapsed_time(gpu_end) / 1000
             global_step += 1
+            elapsed = (time.monotonic() - start) / 60.0
             row = {
                 "step": global_step,
                 "elapsed_minutes": total_elapsed_before + elapsed,
@@ -288,6 +317,12 @@ def main() -> None:
             status = {"state": "completed" if completed else "failed", "step": global_step,
                       "stop_reason": stop_reason if completed else "exception",
                       "elapsed_minutes": elapsed, "sampler_args": args.sampler_args,
+                      "stage_steps": global_step - starting_step, "gpu_step_seconds_total": gpu_seconds,
+                      "steps_per_second": (global_step - starting_step) / max(elapsed * 60, 1e-6),
+                      "seed": args.seed, "stage": args.stage, "pano_count": omega_args.pano_max_count,
+                      "omega_checkpoint": str(args.omega_checkpoint), "resume": str(args.resume),
+                      "trainable_parameters": sum(p.numel() for p in head.parameters() if p.requires_grad),
+                      "initial_head_sha256": args.initial_head_sha256,
                       "peak_cuda_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else 0,
                       "peak_cuda_reserved_mib": torch.cuda.max_memory_reserved(device) / 2**20 if device.type == "cuda" else 0}
             (args.output_dir / "status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
@@ -371,6 +406,10 @@ def save_checkpoint(path, head, optimizer, args, step, elapsed):
         "omega_checkpoint": str(args.omega_checkpoint),
         "base_checkpoint": str(args.base_checkpoint) if args.base_checkpoint else None,
         "config": str(args.config),
+        "matched_warmup_arm": args.matched_warmup_arm,
+        "initial_head_sha256": args.initial_head_sha256,
+        "seed": args.seed,
+        "stage": args.stage,
         "sampler_args": args.sampler_args,
         "loss_protocol": "core_group_log_scale_v2",
         "head_args": {

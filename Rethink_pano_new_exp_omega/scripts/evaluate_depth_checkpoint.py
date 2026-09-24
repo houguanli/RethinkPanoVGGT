@@ -1393,19 +1393,11 @@ def compute_depth_metrics(
     )
     if valid.sum().item() == 0:
         return {
-            "depth_mae": 0.0,
-            "depth_rmse": 0.0,
-            "depth_abs_rel": 0.0,
-            "depth_delta_1p25": 0.0,
-            "depth_delta_1p25_2": 0.0,
-            "depth_delta_1p25_3": 0.0,
-            "depth_irls_scale": 0.0,
-            "depth_irls_mae": 0.0,
-            "depth_irls_rmse": 0.0,
-            "depth_irls_abs_rel": 0.0,
-            "depth_irls_delta_1p25": 0.0,
-            "depth_irls_delta_1p25_2": 0.0,
-            "depth_irls_delta_1p25_3": 0.0,
+            **{key: float("nan") for key in (
+                "depth_mae", "depth_rmse", "depth_abs_rel", "depth_delta_1p25", "depth_delta_1p25_2",
+                "depth_delta_1p25_3", "depth_irls_scale", "depth_irls_mae", "depth_irls_rmse",
+                "depth_irls_abs_rel", "depth_irls_delta_1p25", "depth_irls_delta_1p25_2", "depth_irls_delta_1p25_3",
+            )},
             "depth_valid_pixels": 0,
             **{key: 0.0 for key in DEPTH_ACCUMULATOR_KEYS},
         }
@@ -1610,7 +1602,7 @@ def compute_panovggt_camera_pose_metrics(
 
 
 def empty_camera_pose_sample_metrics() -> dict[str, float]:
-    return {key: 0.0 for key in CAMERA_POSE_SAMPLE_KEYS}
+    return {key: 0.0 if key == "camera_pose_pair_count" else float("nan") for key in CAMERA_POSE_SAMPLE_KEYS}
 
 
 def camera_w2c_from_center_quat(center: torch.Tensor, quat_w2c: torch.Tensor) -> torch.Tensor:

@@ -226,7 +226,7 @@ def main() -> None:
         apply_completion_sampler_args(train_args, erp_completion_payload)
         print(f"[INFO] learned ERP completion = {args.erp_completion_checkpoint}", flush=True)
     apply_eval_sampler_overrides(train_args, args)
-    validate_completion_sampler_args(train_args, erp_completion_payload)
+    validate_completion_sampler_args(train_args, erp_completion_payload, args.checkpoint)
     model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
     model.eval()
 

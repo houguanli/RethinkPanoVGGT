@@ -1,5 +1,5 @@
-# Belt60 pilot: frozen warmed-up Omega, 12 FoV75 windows; head fills |latitude| > 60.
-# Do not use this config for full-model warm-up before profiling GPU memory.
+# Belt60 geometry: 12 FoV75 windows; completion trusts Omega only within +/-60.
+# Formal use requires a full-backward preflight and its own foundation warm-up.
 data:
   dataset_root: /mnt/e/PanoVGGT_minimal_datasets/datasets
   dataset_format: pano_minimal
@@ -84,7 +84,7 @@ optimization:
   optimizer_type: adafactor
   batch_size: 1
   training_stages:
-    - name: omega_canonical_full_warmup_2h
+    - name: omega_belt60_full_warmup_2h
       window_size: 384
       num_yaw: 6
       pitch_degrees: "-25,25"
@@ -117,7 +117,7 @@ runtime:
   num_workers: 0
   seed: 57
   max_duration_minutes: 120.0
-  save_every_steps: 1000
+  save_every_steps: 2000
   save_last: true
   checkpoint_format: trainable_delta
   inherit_checkpoint_training_defaults: false
@@ -125,7 +125,7 @@ runtime:
   progress_bar: true
   progress_log_every: 10
   tensorboard: true
-  tensorboard_dir: logs/full_erp_v1_omega_warmup_2h/tensorboard
+  tensorboard_dir: logs/belt60_omega_warmup_2h/tensorboard
 
 output:
-  output_dir: logs/full_erp_v1_omega_warmup_2h
+  output_dir: logs/belt60_omega_warmup_2h

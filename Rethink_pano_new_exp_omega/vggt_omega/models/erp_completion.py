@@ -32,7 +32,10 @@ def apply_completion_sampler_args(args, payload):
             setattr(args, key, value)
 
 
-def validate_completion_sampler_args(args, payload):
+def validate_completion_sampler_args(args, payload, omega_checkpoint=None):
+    if payload.get("matched_warmup_arm") and omega_checkpoint is not None:
+        if Path(omega_checkpoint).resolve() != Path(payload["omega_checkpoint"]).resolve():
+            raise ValueError("Matched completion head must be evaluated with its own Omega teacher")
     for key, expected in payload.get("sampler_args", {}).items():
         if key in SAMPLER_KEYS and getattr(args, key) != expected:
             raise ValueError(f"Completion checkpoint requires {key}={expected}, got {getattr(args, key)}")

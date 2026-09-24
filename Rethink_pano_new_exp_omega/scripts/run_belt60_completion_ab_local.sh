@@ -27,6 +27,10 @@ cleanup() {
 }
 trap cleanup EXIT
 [[ ! -e "${OUTPUT}/COMPLETE" ]] || { echo "[COMPLETE] Already finished; no rerun."; exit 0; }
+[[ ! -e "${OUTPUT}/FROZEN_OLD_CANONICAL_TRANSFER.json" ]] || {
+  echo "[FROZEN] Historical canonical-warmup transfer diagnostic; use run_belt60_matched_ab_local.sh for formal A/B."
+  exit 2
+}
 for required in "${FOUNDATION_CHECKPOINT}" "${OMEGA_CHECKPOINT}"; do
   test -s "${required}"
 done

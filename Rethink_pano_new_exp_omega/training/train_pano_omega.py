@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
 import random
+import signal
 import sys
 import tempfile
 import time
@@ -32,6 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from training.data import MixedPanoDataset, PanoCityPairedOmegaDataset, PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E402
+from training.matched_warmup import validate_start, input_metadata, interrupt_on_term  # noqa: E402
 from vggt_omega.data.pano_sampler import make_default_view_grid, resolve_fov_degrees  # noqa: E402
 from vggt_omega.models.heads.dense_head import DenseHead  # noqa: E402
 from vggt_omega.models.layers import PatchEmbed  # noqa: E402
@@ -255,6 +258,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="luna_heads",
     )
     parser.add_argument("--strict-checkpoint", action="store_true")
+    parser.add_argument("--matched-warmup-arm", choices=["A", "B"], default=None)
     parser.add_argument(
         "--inherit-checkpoint-training-defaults",
         dest="inherit_checkpoint_training_defaults",
@@ -601,6 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Iterable[str] | None = None) -> None:
+    signal.signal(signal.SIGTERM, interrupt_on_term)
     args = parse_args(argv)
     set_seed(args.seed)
 
@@ -683,6 +688,10 @@ def load_config_defaults(path: Path, parser: argparse.ArgumentParser) -> Dict:
 def train(args: argparse.Namespace) -> None:
     dist_state = setup_distributed(args)
     device = resolve_device(args.device, dist_state)
+    checkpoint_payload = load_checkpoint_payload(args.checkpoint) if args.checkpoint is not None else {}
+    validate_start(args, checkpoint_payload)
+    if args.inherit_checkpoint_training_defaults:
+        apply_checkpoint_training_defaults(args, checkpoint_payload)
     pano_size = (args.pano_height, args.pano_width) if args.pano_height > 0 and args.pano_width > 0 else None
     normalize_pano_sampling_args(args)
     normalize_camera_supervision_args(args)
@@ -712,16 +721,32 @@ def train(args: argparse.Namespace) -> None:
         )
 
         model = build_model(args).to(device)
-        checkpoint_payload = load_checkpoint_payload(args.checkpoint) if args.checkpoint is not None else {}
-        if args.inherit_checkpoint_training_defaults:
-            apply_checkpoint_training_defaults(args, checkpoint_payload)
-            normalize_pred_depth_scale_args(args)
+        if args.matched_warmup_arm:
+            def record_rgb_windows(module, inputs, sampled):
+                if sampled.windows.shape[2] == 3 and not hasattr(args, "sampled_rgb_metadata"):
+                    args.sampled_rgb_metadata = {
+                        "flat_pano_window_shape": list(sampled.windows.shape),
+                        "pitch_degrees": sampled.camera_meta["pitch"].detach().cpu().rad2deg().tolist(),
+                        "yaw_degrees": sampled.camera_meta["yaw"].detach().cpu().rad2deg().tolist(),
+                        "fov_x_degrees": sampled.camera_meta["fov_x"].detach().cpu().rad2deg().tolist(),
+                        "fov_y_degrees": sampled.camera_meta["fov_y"].detach().cpu().rad2deg().tolist(),
+                    }
+                    print(f"[SAMPLED RGB] {args.sampled_rgb_metadata}", flush=True)
+            model.pano_sampler.register_forward_hook(record_rgb_windows)
         if args.base_checkpoint is not None and (
             args.checkpoint is None or args.base_checkpoint.resolve() != args.checkpoint.resolve()
         ):
             load_checkpoint(model, args.base_checkpoint, strict=False)
         if args.checkpoint is not None:
-            load_checkpoint(model, args.checkpoint, strict=args.strict_checkpoint)
+            load_checkpoint(model, args.checkpoint, strict=args.strict_checkpoint, payload=checkpoint_payload)
+        if args.matched_warmup_arm:
+            initial_hash = hashlib.sha256()
+            state = model.state_dict()
+            for name in sorted(model._checkpoint_missing_keys):
+                initial_hash.update(name.encode())
+                initial_hash.update(state[name].detach().cpu().numpy().tobytes())
+            args.foundation_new_state_sha256 = initial_hash.hexdigest()
+            print(f"[INITIALIZATION] new foundation-missing state sha256={args.foundation_new_state_sha256}", flush=True)
 
         dataset_depth_scales = parse_dataset_depth_scales(args.dataset_depth_scales)
         if args.dataset_depth_scale_mode != "none" and not dataset_depth_scales:
@@ -743,6 +768,7 @@ def train(args: argparse.Namespace) -> None:
                 store_residual_debug=args.store_depth_residual_debug,
             ).to(device)
             load_adapter_state_if_present(model, checkpoint_payload, args.checkpoint)
+        del checkpoint_payload
 
         active_stage_index = None
         active_stage_name = "default"
@@ -914,6 +940,8 @@ def train(args: argparse.Namespace) -> None:
 
         model.train()
         global_step = 0
+        completed = False
+        gpu_seconds = 0.0
         stop_reason = "max_steps"
         progress = None
         last_progress_elapsed = 0.0
@@ -969,14 +997,21 @@ def train(args: argparse.Namespace) -> None:
                             dist_state,
                         )
 
-                global_step += 1
                 batch = limit_batch_panos(batch, active_stage)
                 batch = move_batch_to_device(batch, device)
+                if device.type == "cuda":
+                    gpu_start, gpu_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    gpu_start.record()
                 try:
-                    loss_dict = train_step(model, batch, optimizer, args, global_step=global_step)
+                    loss_dict = train_step(model, batch, optimizer, args, global_step=global_step + 1)
                 except torch.cuda.OutOfMemoryError:
                     print_cuda_memory(f"[OOM] rank={dist_state['rank']} step={global_step}", device)
                     raise
+                if device.type == "cuda":
+                    gpu_end.record()
+                    gpu_end.synchronize()
+                    gpu_seconds += gpu_start.elapsed_time(gpu_end) / 1000
+                global_step += 1
                 local_camera_records = camera_diag_records_from_batch(
                     loss_dict=loss_dict,
                     batch=batch,
@@ -1001,6 +1036,8 @@ def train(args: argparse.Namespace) -> None:
                     "step": global_step,
                     "epoch": epoch + 1,
                     "elapsed_seconds": elapsed_seconds,
+                    "gpu_step_seconds_total": gpu_seconds,
+                    "steps_per_second": global_step / max(elapsed_seconds, 1e-6),
                     "loss": float(loss_dict["loss"].item()),
                     "loss_comparable": float(loss_dict.get("loss_comparable", loss_dict["loss"]).item()),
                     "loss_depth": float(loss_dict["loss_depth"].item()),
@@ -1175,6 +1212,7 @@ def train(args: argparse.Namespace) -> None:
                 break
         else:
             stop_reason = "epochs_complete"
+        completed = True
     finally:
         if "progress" in locals() and progress is not None:
             progress.close()
@@ -1182,16 +1220,31 @@ def train(args: argparse.Namespace) -> None:
             tensorboard_writer.flush()
             tensorboard_writer.close()
         if "metrics_history" in locals() and is_main_process(dist_state):
+            args.training_status = {
+                "state": "completed" if completed else "failed", "step": global_step,
+                "stop_reason": stop_reason if completed else "exception",
+                "elapsed_seconds": time.time() - started_at, "gpu_step_seconds_total": gpu_seconds,
+                "sampler_args": current_sampler_status(unwrap_model(model), args),
+                "input_metadata": getattr(args, "actual_input_metadata", None),
+                "sampled_rgb_metadata": getattr(args, "sampled_rgb_metadata", None),
+                "trainable_parameters": trainable_count, "frozen_parameters": frozen_count,
+                "parent_checkpoint": str(args.checkpoint), "foundation_checkpoint": str(args.base_checkpoint),
+                "seed": args.seed, "stage": active_stage_name,
+                "foundation_new_state_sha256": getattr(args, "foundation_new_state_sha256", None),
+                "peak_cuda_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else 0,
+                "peak_cuda_reserved_mib": torch.cuda.max_memory_reserved(device) / 2**20 if device.type == "cuda" else 0,
+            }
+            (args.output_dir / "status.json").write_text(json.dumps(args.training_status, indent=2))
             if metrics_history:
                 save_loss_plot(loss_plot, metrics_history)
             if "camera_stats" in locals() and camera_stats.total_records > 0:
                 camera_stats.write(camera_stats_json)
                 print(f"[INFO] saved camera stats = {camera_stats_json}")
             if args.save_last and not args.smoke:
-                ckpt_path = args.output_dir / "last.pt"
+                ckpt_path = args.output_dir / ("last.pt" if completed else "interrupted.pt")
                 save_checkpoint(ckpt_path, unwrap_model(model), args, global_step)
                 print(f"[INFO] saved checkpoint = {ckpt_path}")
-            print(f"[INFO] stop_reason = {stop_reason}; steps = {global_step}")
+            print(f"[INFO] state = {args.training_status['state']}; stop_reason = {args.training_status['stop_reason']}; steps = {global_step}")
         cleanup_distributed(dist_state)
 
 
@@ -2202,6 +2255,9 @@ def train_step(
         if dataset_names_for_scale is not None:
             model_kwargs["dataset_names"] = dataset_names_for_scale
         predictions = model(**model_kwargs)
+        if global_step == 1:
+            args.actual_input_metadata = input_metadata(predictions, pano_images, args)
+            print(f"[INPUT] {args.actual_input_metadata}", flush=True)
         pred_depth_scale = predictions.get(
             "_pred_depth_scale",
             predictions["depth"].new_tensor(float(args.pred_depth_scale)),
@@ -2392,6 +2448,8 @@ def train_step(
             + float(args.global_point_loss_weight) * loss_global_point
             + float(args.camera_comparable_weight) * loss_camera
         )
+    if not torch.isfinite(loss):
+        raise FloatingPointError(f"Non-finite warm-up loss at step {global_step}")
     loss.backward()
 
     if args.grad_clip > 0:
@@ -3511,6 +3569,7 @@ def save_loss_plot(path: Path, metrics_history: list[Dict[str, float]]) -> None:
 
 def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace, step: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
     pred_depth_scale = current_pred_depth_scale(model, args)
     args_payload = vars(args).copy()
     args_payload["pred_depth_scale"] = pred_depth_scale
@@ -3546,9 +3605,11 @@ def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace
                 "adapter_state": adapter_state,
                 "args": args_payload,
                 "step": step,
+                "training_status": getattr(args, "training_status", {}),
             },
-            path,
+            temporary,
         )
+        temporary.replace(path)
         return
 
     cpu_state = {key: value.detach().cpu() for key, value in checkpoint_model.state_dict().items()}
@@ -3566,9 +3627,11 @@ def save_checkpoint(path: Path, model: torch.nn.Module, args: argparse.Namespace
             "adapter_state": adapter_state,
             "args": args_payload,
             "step": step,
+            "training_status": getattr(args, "training_status", {}),
         },
-        path,
+        temporary,
     )
+    temporary.replace(path)
 
 
 def current_pred_depth_scale(model: torch.nn.Module, args: argparse.Namespace) -> float:
@@ -4894,16 +4957,19 @@ def resolve_checkpoint_reference(reference: str | Path, owner_checkpoint: Path) 
     return unique_candidates[0]
 
 
-def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path, strict: bool) -> None:
+def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path, strict: bool, payload=None) -> None:
     if not checkpoint_path.exists():
         raise FileNotFoundError(
             f"Checkpoint not found: {checkpoint_path}. "
             "Place vggt_omega_1b_512.pt under project/ckpt or pass --checkpoint."
         )
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    except TypeError:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if payload is not None:
+        checkpoint = payload
+    else:
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
     if isinstance(checkpoint, dict) and "model_delta" in checkpoint:
         foundation_checkpoint = checkpoint.get("foundation_checkpoint")
@@ -4947,6 +5013,7 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path, strict: bool)
                 break
     state_dict = strip_state_dict_prefix(state_dict)
     missing, unexpected = model.load_state_dict(state_dict, strict=strict)
+    model._checkpoint_missing_keys = list(missing)
     print(f"[INFO] loaded checkpoint = {checkpoint_path}")
     print(f"[INFO] missing_keys = {len(missing)}; unexpected_keys = {len(unexpected)}")
     print_checkpoint_key_analysis(missing, unexpected)
