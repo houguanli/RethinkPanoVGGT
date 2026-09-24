@@ -34,7 +34,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from training.data import MixedPanoDataset, PanoCityPairedOmegaDataset, PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E402
-from training.matched_warmup import validate_start, input_metadata, interrupt_on_term  # noqa: E402
+from training.matched_warmup import (validate_start, input_metadata, interrupt_on_term,
+                                    capture_update_paths, finish_update_paths)  # noqa: E402
 from vggt_omega.data.pano_sampler import make_default_view_grid, resolve_fov_degrees  # noqa: E402
 from vggt_omega.models.heads.dense_head import DenseHead  # noqa: E402
 from vggt_omega.models.layers import PatchEmbed  # noqa: E402
@@ -259,6 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--strict-checkpoint", action="store_true")
     parser.add_argument("--matched-warmup-arm", choices=["A", "B"], default=None)
+    parser.add_argument("--verify-update-paths", action="store_true", help="Preflight-only gradient/update and fixed-initializer audit.")
     parser.add_argument(
         "--inherit-checkpoint-training-defaults",
         dest="inherit_checkpoint_training_defaults",
@@ -1231,6 +1233,7 @@ def train(args: argparse.Namespace) -> None:
                 "parent_checkpoint": str(args.checkpoint), "foundation_checkpoint": str(args.base_checkpoint),
                 "seed": args.seed, "stage": active_stage_name,
                 "foundation_new_state_sha256": getattr(args, "foundation_new_state_sha256", None),
+                "update_path_audit": getattr(args, "update_path_audit", []),
                 "peak_cuda_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else 0,
                 "peak_cuda_reserved_mib": torch.cuda.max_memory_reserved(device) / 2**20 if device.type == "cuda" else 0,
             }
@@ -2451,13 +2454,19 @@ def train_step(
     if not torch.isfinite(loss):
         raise FloatingPointError(f"Non-finite warm-up loss at step {global_step}")
     loss.backward()
+    audit = capture_update_paths(unwrap_model(model), optimizer) if args.verify_update_paths else None
 
     if args.grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(
             [param for param in model.parameters() if param.requires_grad],
             max_norm=args.grad_clip,
+            error_if_nonfinite=True,
         )
     optimizer.step()
+    if audit is not None:
+        record = {"step": global_step, **finish_update_paths(unwrap_model(model), optimizer, audit)}
+        args.update_path_audit = getattr(args, "update_path_audit", []) + [record]
+        print(f"[UPDATE AUDIT] {record}", flush=True)
     unwrapped_model = unwrap_model(model)
     if isinstance(unwrapped_model, DepthPredictionAdapter):
         unwrapped_model.sanitize_parameters()

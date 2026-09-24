@@ -1,6 +1,7 @@
 """Fail-closed provenance checks for the foundation-started belt60 comparison."""
 from pathlib import Path
 import math
+import hashlib
 
 
 def interrupt_on_term(signum, frame):
@@ -69,4 +70,47 @@ def input_metadata(predictions, pano_images, args):
         assert panos == 2 and windows.shape[1] == panos * yaw * len(pitches), result
         assert list(windows.shape[-2:]) == [384, 384], result
         assert values["pitch"] == pitches and values["fov_x"] == [75.0] and values["fov_y"] == [75.0], result
+    return result
+
+
+def fixed_camera_hash(model, optimizer):
+    optimizer_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+    digest = hashlib.sha256()
+    for name, parameter in model.named_parameters():
+        if name.startswith("camera_head."):
+            if parameter.requires_grad or parameter.grad is not None or id(parameter) in optimizer_ids:
+                raise ValueError(f"Fixed initializer unexpectedly trainable: {name}")
+            digest.update(name.encode())
+            digest.update(parameter.detach().cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def capture_update_paths(model, optimizer):
+    """Preflight-only CPU snapshots of representative nonzero-gradient parameters."""
+    import torch
+    paths = ("aggregator.patch_embed.", "aggregator.frame_blocks.",
+             "aggregator.inter_frame_blocks.", "dense_head.", "pano_camera_head.")
+    selected = {}
+    for name, parameter in model.named_parameters():
+        for prefix in paths:
+            if prefix in selected or not name.startswith(prefix) or parameter.grad is None:
+                continue
+            grad = parameter.grad.detach()
+            if not torch.isfinite(grad).all():
+                raise FloatingPointError(f"Non-finite gradient: {name}")
+            grad_max = float(grad.abs().max())
+            if grad_max > 0:
+                selected[prefix] = (name, parameter, parameter.detach().cpu().clone(), grad_max)
+    return selected, fixed_camera_hash(model, optimizer)
+
+
+def finish_update_paths(model, optimizer, captured):
+    selected, before_hash = captured
+    after_hash = fixed_camera_hash(model, optimizer)
+    if before_hash != after_hash:
+        raise ValueError("Fixed window-camera initializer changed during an optimizer update")
+    result = {"fixed_camera_sha256": after_hash, "fixed_camera_unchanged": True, "paths": {}}
+    for prefix, (name, parameter, before, grad_max) in selected.items():
+        change = float((parameter.detach().cpu() - before).abs().max())
+        result["paths"][prefix] = {"parameter": name, "gradient_abs_max": grad_max, "update_abs_max": change}
     return result

@@ -39,12 +39,18 @@ check_status() {
 import json,sys
 s=json.load(open(sys.argv[1])); mode=sys.argv[2]; minutes=float(sys.argv[3])
 assert s['state']=='completed',s
-if mode=='preflight':
-    assert s['step']==1 and s['stop_reason']=='max_steps',s
+if mode in ('preflight','stability'):
+    assert s['step']==(3 if mode=='stability' else 1) and s['stop_reason']=='max_steps',s
     inputs=s['input_metadata']; arm='B' if 'preflight_B' in sys.argv[1] else 'A'
     assert inputs['pano_count']==2 and inputs['window_shape']==[1,24 if arm=='B' else 8,3,384,384],s
     assert inputs['degrees']['pitch']==([-25,25] if arm=='B' else [-15]),s
     assert inputs['degrees']['fov_x']==[75] and inputs['degrees']['fov_y']==[75],s
+    if mode=='stability':
+        records=s['update_path_audit']
+        assert len(records)==3 and all(r['fixed_camera_unchanged'] for r in records),s
+        assert len({r['fixed_camera_sha256'] for r in records})==1,s
+        for prefix in ('aggregator.patch_embed.','aggregator.frame_blocks.','aggregator.inter_frame_blocks.','dense_head.','pano_camera_head.'):
+            assert any(r['paths'].get(prefix,{}).get('update_abs_max',0)>0 for r in records),prefix
 else:
     assert s['stop_reason'] in ('duration','max_duration'),s
     elapsed=s.get('elapsed_seconds',s.get('elapsed_minutes',0)*60)
@@ -119,6 +125,20 @@ for arm in B A; do
       --save-every-steps 2000 --no-progress-bar 2>&1 | tee -a "$dest/train.log"
   fi
   check_status "$dest/status.json" preflight 0
+  dest="$OUTPUT/preflight_${arm}_stability"
+  phase "preflight_${arm}_stability"
+  if [[ ! -s "$dest/status.json" ]]; then
+    fresh_stage "$dest"
+    gpu_gate
+    "$PYTHON_BIN" training/train_pano_omega.py --config "$OUTPUT/$arm.yaml" \
+      --dataset-root "$DATASET_ROOT" --checkpoint "$FOUNDATION" --base-checkpoint "$FOUNDATION" \
+      --matched-warmup-arm "$arm" --no-inherit-checkpoint-training-defaults --verify-update-paths \
+      --output-dir "$dest" --tensorboard-dir "$dest/tensorboard" --debug-dir "$dest/debug" \
+      --max-steps 3 --max-duration-minutes 120 --num-workers 0 --save-last \
+      --save-every-steps 2000 --no-progress-bar 2>&1 | tee -a "$dest/train.log"
+  fi
+  test -s "$dest/last.pt"
+  check_status "$dest/status.json" stability 0
 done
 [[ "${PREFLIGHT_ONLY:-0}" != 1 ]] || { phase PREFLIGHT_COMPLETE; exit 0; }
 phase test_index_audit

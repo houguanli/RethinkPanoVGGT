@@ -98,6 +98,21 @@ class MatchedWarmupTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_completion_sampler_args(args, payload, Path("A.pt"))
 
+    def test_update_audit_detects_trainable_changes_and_fixed_initializer(self):
+        from training.matched_warmup import capture_update_paths, finish_update_paths
+        model = torch.nn.Module()
+        model.dense_head = torch.nn.Linear(2, 2)
+        model.pano_camera_head = torch.nn.Linear(2, 2)
+        model.camera_head = torch.nn.Linear(2, 2).requires_grad_(False)
+        optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=.1)
+        sum(p.sum() for p in model.parameters() if p.requires_grad).backward()
+        captured = capture_update_paths(model, optimizer)
+        optimizer.step()
+        result = finish_update_paths(model, optimizer, captured)
+        self.assertTrue(result["fixed_camera_unchanged"])
+        self.assertGreater(result["paths"]["dense_head."]["update_abs_max"], 0)
+        self.assertGreater(result["paths"]["pano_camera_head."]["gradient_abs_max"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
