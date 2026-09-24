@@ -51,6 +51,16 @@ if mode in ('preflight','stability'):
         assert len({r['fixed_camera_sha256'] for r in records})==1,s
         for prefix in ('aggregator.patch_embed.','aggregator.frame_blocks.','aggregator.inter_frame_blocks.','dense_head.','pano_camera_head.'):
             assert any(r['paths'].get(prefix,{}).get('update_abs_max',0)>0 for r in records),prefix
+        import pathlib,torch
+        checkpoint=pathlib.Path(sys.argv[1]).with_name('last.pt')
+        payload=torch.load(checkpoint,map_location='cpu',weights_only=False)
+        tensors=payload['model_delta']
+        assert payload['step']==3 and payload['args']['matched_warmup_arm']==arm
+        assert sum(t.numel() for t in tensors.values())==s['trainable_parameters']
+        assert all(bool(torch.isfinite(t).all()) for t in tensors.values()),'Nonfinite checkpoint tensor'
+        integrity={'cpu_load':'passed','all_tensors_finite':True,'step':payload['step'],
+                   'parameters':s['trainable_parameters'],'tensor_count':len(tensors),'bytes':checkpoint.stat().st_size}
+        checkpoint.with_name('checkpoint_integrity.json').write_text(json.dumps(integrity,indent=2))
 else:
     assert s['stop_reason'] in ('duration','max_duration'),s
     elapsed=s.get('elapsed_seconds',s.get('elapsed_minutes',0)*60)
@@ -110,25 +120,13 @@ PY
 ) >> "$OUTPUT/resources.log" 2>&1 &
 monitor_pid=$!
 
-# B must pass a real full-model optimizer update before spending either formal budget.
-for arm in B A; do
-  dest="$OUTPUT/preflight_$arm"
-  phase "preflight_$arm"
-  if [[ ! -s "$dest/status.json" ]]; then
-    fresh_stage "$dest"
-    gpu_gate
-    "$PYTHON_BIN" training/train_pano_omega.py --config "$OUTPUT/$arm.yaml" \
-      --dataset-root "$DATASET_ROOT" --checkpoint "$FOUNDATION" --base-checkpoint "$FOUNDATION" \
-      --matched-warmup-arm "$arm" --no-inherit-checkpoint-training-defaults \
-      --output-dir "$dest" --tensorboard-dir "$dest/tensorboard" --debug-dir "$dest/debug" \
-      --max-steps 1 --max-duration-minutes 15 --num-workers 0 --no-save-last \
-      --save-every-steps 2000 --no-progress-bar 2>&1 | tee -a "$dest/train.log"
-  fi
-  check_status "$dest/status.json" preflight 0
-  [[ -s "$OUTPUT/RESOURCE_RECHECK_ACCEPTED" ]] || {
-    echo '[BLOCKED] inspect the optimized B recheck memory margin, throughput, updates and checkpoint before stability/formal stages'
-    exit 2
-  }
+# Inspect the optimized complete B recheck before any stability/formal stage.
+[[ -s "$OUTPUT/RESOURCE_RECHECK_ACCEPTED" ]] || {
+  echo '[BLOCKED] optimized B resource recheck has not been accepted'; exit 2;
+}
+check_status "$OUTPUT/preflight_B_recheck/status.json" preflight 0
+for arm in ${PREFLIGHT_ARMS:-B A}; do
+  [[ "$arm" == A || "$arm" == B ]] || exit 2
   dest="$OUTPUT/preflight_${arm}_stability"
   phase "preflight_${arm}_stability"
   if [[ ! -s "$dest/status.json" ]]; then
@@ -145,6 +143,8 @@ for arm in B A; do
   check_status "$dest/status.json" stability 0
 done
 [[ "${PREFLIGHT_ONLY:-0}" != 1 ]] || { phase PREFLIGHT_COMPLETE; exit 0; }
+[[ -s "$OUTPUT/FORMAL_TRAINING_ACCEPTED" ]] || { phase WAITING_FOR_FORMAL_ACCEPTANCE; exit 2; }
+for arm in A B; do check_status "$OUTPUT/preflight_${arm}_stability/status.json" stability 0; done
 phase test_index_audit
 "$PYTHON_BIN" scripts/validate_eval_cardinality.py --config "$OUTPUT/A.yaml" \
   --dataset-root "$DATASET_ROOT" --index-audit "$OUTPUT/test_index_audit.json"
