@@ -125,6 +125,10 @@ for arm in B A; do
       --save-every-steps 2000 --no-progress-bar 2>&1 | tee -a "$dest/train.log"
   fi
   check_status "$dest/status.json" preflight 0
+  [[ -s "$OUTPUT/RESOURCE_RECHECK_ACCEPTED" ]] || {
+    echo '[BLOCKED] inspect the optimized B recheck memory margin, throughput, updates and checkpoint before stability/formal stages'
+    exit 2
+  }
   dest="$OUTPUT/preflight_${arm}_stability"
   phase "preflight_${arm}_stability"
   if [[ ! -s "$dest/status.json" ]]; then

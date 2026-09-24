@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn.init
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from . import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbedding, SelfAttentionBlock, SwiGLUFFN
 from .utils import named_apply
@@ -225,7 +226,7 @@ class DinoVisionTransformer(nn.Module):
 
         return x, (H, W)
 
-    def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor]) -> List[Dict[str, Tensor]]:
+    def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor], use_checkpoint: bool = False) -> List[Dict[str, Tensor]]:
         x = []
         rope = []
         for t_x, t_masks in zip(x_list, masks_list):
@@ -237,7 +238,12 @@ class DinoVisionTransformer(nn.Module):
                 rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]
             else:
                 rope_sincos = [None for r in rope]
-            x = blk(x, rope_sincos)
+            if use_checkpoint and self.training and torch.is_grad_enabled():
+                # Passing the current block directly avoids late-bound loop
+                # closures; default RNG preservation also covers stochastic depth.
+                x = checkpoint(blk, x, rope_sincos, use_reentrant=False)
+            else:
+                x = blk(x, rope_sincos)
         all_x = x
         output = []
         for idx, (x, masks) in enumerate(zip(all_x, masks_list)):
@@ -266,11 +272,11 @@ class DinoVisionTransformer(nn.Module):
             )
         return output
 
-    def forward_features(self, x: Tensor | List[Tensor], masks: Optional[Tensor] = None) -> List[Dict[str, Tensor]]:
+    def forward_features(self, x: Tensor | List[Tensor], masks: Optional[Tensor] = None, use_checkpoint: bool = False) -> List[Dict[str, Tensor]]:
         if isinstance(x, torch.Tensor):
-            return self.forward_features_list([x], [masks])[0]
+            return self.forward_features_list([x], [masks], use_checkpoint=use_checkpoint)[0]
         else:
-            return self.forward_features_list(x, masks)
+            return self.forward_features_list(x, masks, use_checkpoint=use_checkpoint)
 
     def _get_intermediate_layers_not_chunked(self, x: Tensor, n: int = 1) -> List[Tensor]:
         x, (H, W) = self.prepare_tokens_with_masks(x)

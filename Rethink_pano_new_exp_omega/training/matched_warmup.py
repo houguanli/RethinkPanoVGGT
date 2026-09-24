@@ -2,6 +2,7 @@
 from pathlib import Path
 import math
 import hashlib
+import time
 
 
 def interrupt_on_term(signum, frame):
@@ -114,3 +115,17 @@ def finish_update_paths(model, optimizer, captured):
         change = float((parameter.detach().cpu() - before).abs().max())
         result["paths"][prefix] = {"parameter": name, "gradient_abs_max": grad_max, "update_abs_max": change}
     return result
+
+
+def record_phase_memory(args, label, device):
+    import torch
+    if not getattr(args, "verify_update_paths", False) or device.type != "cuda":
+        return
+    torch.cuda.synchronize(device)
+    row = {"phase": label, "monotonic_seconds": time.monotonic(),
+           "allocated_mib": torch.cuda.memory_allocated(device) / 2**20,
+           "reserved_mib": torch.cuda.memory_reserved(device) / 2**20,
+           "peak_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20,
+           "peak_reserved_mib": torch.cuda.max_memory_reserved(device) / 2**20}
+    args.phase_memory_audit = getattr(args, "phase_memory_audit", []) + [row]
+    print(f"[PHASE MEMORY] {row}", flush=True)

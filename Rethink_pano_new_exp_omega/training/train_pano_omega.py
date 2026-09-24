@@ -35,7 +35,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from training.data import MixedPanoDataset, PanoCityPairedOmegaDataset, PanoMinimalDataset, PanoVKittiOmegaDataset  # noqa: E402
 from training.matched_warmup import (validate_start, input_metadata, interrupt_on_term,
-                                    capture_update_paths, finish_update_paths)  # noqa: E402
+                                    capture_update_paths, finish_update_paths, record_phase_memory)  # noqa: E402
 from vggt_omega.data.pano_sampler import make_default_view_grid, resolve_fov_degrees  # noqa: E402
 from vggt_omega.models.heads.dense_head import DenseHead  # noqa: E402
 from vggt_omega.models.layers import PatchEmbed  # noqa: E402
@@ -1234,6 +1234,7 @@ def train(args: argparse.Namespace) -> None:
                 "seed": args.seed, "stage": active_stage_name,
                 "foundation_new_state_sha256": getattr(args, "foundation_new_state_sha256", None),
                 "update_path_audit": getattr(args, "update_path_audit", []),
+                "phase_memory_audit": getattr(args, "phase_memory_audit", []),
                 "peak_cuda_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else 0,
                 "peak_cuda_reserved_mib": torch.cuda.max_memory_reserved(device) / 2**20 if device.type == "cuda" else 0,
             }
@@ -1245,7 +1246,11 @@ def train(args: argparse.Namespace) -> None:
                 print(f"[INFO] saved camera stats = {camera_stats_json}")
             if args.save_last and not args.smoke:
                 ckpt_path = args.output_dir / ("last.pt" if completed else "interrupted.pt")
+                checkpoint_started = time.monotonic()
                 save_checkpoint(ckpt_path, unwrap_model(model), args, global_step)
+                args.training_status["checkpoint_seconds"] = time.monotonic() - checkpoint_started
+                args.training_status["checkpoint_bytes"] = ckpt_path.stat().st_size
+                (args.output_dir / "status.json").write_text(json.dumps(args.training_status, indent=2))
                 print(f"[INFO] saved checkpoint = {ckpt_path}")
             print(f"[INFO] state = {args.training_status['state']}; stop_reason = {args.training_status['stop_reason']}; steps = {global_step}")
         cleanup_distributed(dist_state)
@@ -2257,7 +2262,9 @@ def train_step(
         }
         if dataset_names_for_scale is not None:
             model_kwargs["dataset_names"] = dataset_names_for_scale
+        record_phase_memory(args, f"step{global_step}/before_forward", pano_images.device)
         predictions = model(**model_kwargs)
+        record_phase_memory(args, f"step{global_step}/after_forward", pano_images.device)
         if global_step == 1:
             args.actual_input_metadata = input_metadata(predictions, pano_images, args)
             print(f"[INPUT] {args.actual_input_metadata}", flush=True)
@@ -2454,6 +2461,7 @@ def train_step(
     if not torch.isfinite(loss):
         raise FloatingPointError(f"Non-finite warm-up loss at step {global_step}")
     loss.backward()
+    record_phase_memory(args, f"step{global_step}/after_backward", pano_images.device)
     audit = capture_update_paths(unwrap_model(model), optimizer) if args.verify_update_paths else None
 
     if args.grad_clip > 0:
@@ -2463,6 +2471,7 @@ def train_step(
             error_if_nonfinite=True,
         )
     optimizer.step()
+    record_phase_memory(args, f"step{global_step}/after_optimizer", pano_images.device)
     if audit is not None:
         record = {"step": global_step, **finish_update_paths(unwrap_model(model), optimizer, audit)}
         args.update_path_audit = getattr(args, "update_path_audit", []) + [record]

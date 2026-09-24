@@ -1,4 +1,5 @@
 import json
+import copy
 from pathlib import Path
 import tempfile
 import unittest
@@ -112,6 +113,95 @@ class MatchedWarmupTest(unittest.TestCase):
         self.assertTrue(result["fixed_camera_unchanged"])
         self.assertGreater(result["paths"]["dense_head."]["update_abs_max"], 0)
         self.assertGreater(result["paths"]["pano_camera_head."]["gradient_abs_max"], 0)
+
+    def test_checkpoint_covers_dino_and_preserves_outputs_and_gradients(self):
+        from vggt_omega.models.aggregator import Aggregator
+        from vggt_omega.models.layers.vision_transformer import DinoVisionTransformer, init_weights_vit
+        torch.manual_seed(57)
+        encoder = DinoVisionTransformer(patch_size=16, embed_dim=32, depth=2, num_heads=4,
+                                        n_storage_tokens=1, drop_path_rate=0)
+        encoder.init_weights()
+        with patch("vggt_omega.models.aggregator._build_patch_embed", return_value=encoder):
+            plain = Aggregator(patch_size=16, embed_dim=32, depth=2, num_heads=4,
+                               num_register_tokens=1, register_attention_block_indices=(),
+                               cached_layer_indices=(0, 1), enable_luna=False,
+                               luna_patch_layers="none", luna_camera_layers="none",
+                               enable_pano_global_token=False)
+        plain.apply(init_weights_vit)
+        plain.rope_embed._init_weights()
+        checked = copy.deepcopy(plain)
+        checked.use_checkpoint = True
+        calls = []
+        checked.patch_embed.blocks[0].register_forward_pre_hook(lambda *unused: calls.append(1))
+        images = torch.rand(1, 4, 3, 32, 32)
+        def forward_with_saved_activation_bytes(model):
+            parameters = {p.untyped_storage().data_ptr() for p in model.parameters()}
+            saved = {}
+            def pack(tensor):
+                storage = tensor.untyped_storage()
+                if storage.data_ptr() not in parameters:
+                    saved[storage.data_ptr()] = storage.nbytes()
+                return tensor
+            with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+                outputs, _ = model(images)
+            return outputs, sum(saved.values())
+        baseline, plain_bytes = forward_with_saved_activation_bytes(plain)
+        actual, checked_bytes = forward_with_saved_activation_bytes(checked)
+        self.assertLess(checked_bytes, plain_bytes)
+        print(f"[CHECKPOINT ACTIVATIONS] tiny DINO+aggregator saved non-parameter storage: {plain_bytes} -> {checked_bytes} bytes")
+        for left, right in zip(baseline, actual):
+            torch.testing.assert_close(left, right)
+        sum(x.square().mean() for x in baseline).backward()
+        sum(x.square().mean() for x in actual).backward()
+        self.assertGreaterEqual(len(calls), 2, "DINO was not recomputed during backward")
+        for (name, p), (other_name, q) in zip(plain.named_parameters(), checked.named_parameters()):
+            self.assertEqual(name, other_name)
+            if p.grad is not None:
+                torch.testing.assert_close(p.grad, q.grad)
+
+    def test_camera_slice_before_float_preserves_outputs_and_gradients(self):
+        from vggt_omega.models.heads.camera_head import CameraHead
+        from vggt_omega.models.layers.vision_transformer import init_weights_vit
+        head = CameraHead(dim_in=32).apply(init_weights_vit)
+        other = copy.deepcopy(head)
+        x = torch.randn(1, 4, 20, 32, dtype=torch.bfloat16, requires_grad=True)
+        y = x.detach().clone().requires_grad_()
+        old = head([x.float()], patch_token_start=3)
+        new = other([y], patch_token_start=3)
+        torch.testing.assert_close(old, new)
+        old.square().mean().backward()
+        new.square().mean().backward()
+        torch.testing.assert_close(x.grad, y.grad)
+        for p, q in zip(head.parameters(), other.parameters()):
+            torch.testing.assert_close(p.grad, q.grad)
+
+    def test_unused_fixed_pose_graph_preserves_all_returned_gradients(self):
+        from vggt_omega.models.layers.vision_transformer import init_weights_vit
+        args = train.parse_args([])
+        args.smoke, args.window_size, args.num_yaw = True, 32, 2
+        model = train.build_model(args).apply(init_weights_vit)
+        model.aggregator.rope_embed._init_weights()
+        model.camera_head.requires_grad_(False)
+        other = copy.deepcopy(model)
+        grad_modes = []
+        other.camera_head.register_forward_pre_hook(lambda *unused: grad_modes.append(torch.is_grad_enabled()))
+        images = torch.rand(1, 2, 3, 32, 64)
+        old = model(pano_images=images, return_window_pose=False, window_camera_grad_enabled=True)
+        new = other(pano_images=images, return_window_pose=False)
+        self.assertFalse(grad_modes[-1])
+        for key in old:
+            if torch.is_tensor(old[key]):
+                torch.testing.assert_close(old[key], new[key])
+        (old['depth'].square().mean() + old['pano_pose_enc'].square().mean()).backward()
+        (new['depth'].square().mean() + new['pano_pose_enc'].square().mean()).backward()
+        for (name, p), (_, q) in zip(model.named_parameters(), other.named_parameters()):
+            if p.grad is None:
+                self.assertIsNone(q.grad, name)
+            else:
+                torch.testing.assert_close(p.grad, q.grad, msg=name)
+        returned_pose = other(pano_images=images, return_window_pose=True)
+        self.assertTrue(grad_modes[-1])
+        self.assertTrue(returned_pose['pose_enc'].requires_grad)
 
 
 if __name__ == "__main__":

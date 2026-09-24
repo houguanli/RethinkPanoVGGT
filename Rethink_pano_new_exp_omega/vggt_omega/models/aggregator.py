@@ -209,7 +209,13 @@ class Aggregator(nn.Module):
         camera_token = slice_expand_and_flatten(self.camera_token, batch_size, num_frames)
         register_token = slice_expand_and_flatten(self.register_token, batch_size, num_frames)
 
-        patch_tokens = self.patch_embed(images)
+        # Include the trainable DINO encoder in the existing memory setting.
+        # Checkpoint individual blocks so backward need not retain an entire
+        # recomputed encoder's activations at once.
+        if isinstance(self.patch_embed, DinoVisionTransformer):
+            patch_tokens = self.patch_embed(images, use_checkpoint=self.use_checkpoint)
+        else:
+            patch_tokens = self.patch_embed(images)
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 

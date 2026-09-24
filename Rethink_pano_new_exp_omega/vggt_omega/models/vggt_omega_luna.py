@@ -124,6 +124,10 @@ class VGGTOmega_LUNA(VGGTOmega):
             # pretrained window camera head as the initial pano pose.
             kwargs = dict(kwargs)
             kwargs["return_window_pose"] = True
+            # The unreturned window pose is used only by the detached initializer
+            # below. Keep shared tokens live for depth and the trainable pano head.
+            if not requested_return_window_pose and not any(p.requires_grad for p in self.camera_head.parameters()):
+                kwargs.setdefault("window_camera_grad_enabled", False)
         predictions = super().forward(
             sampler_output.windows,
             pano_view_params=sampler_output.camera_meta["view_params"],

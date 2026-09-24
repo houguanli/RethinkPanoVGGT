@@ -107,6 +107,7 @@ class VGGTOmega(nn.Module):
         dense_head_use_checkpoint: Optional[bool] = None,
         dense_head_return_confidence: Optional[bool] = None,
         return_window_pose: bool = True,
+        window_camera_grad_enabled: bool = True,
     ) -> Dict[str, torch.Tensor]:
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
@@ -141,10 +142,11 @@ class VGGTOmega(nn.Module):
         }
         with torch.autocast(device_type="cuda", enabled=False):
             if self.camera_head is not None and return_window_pose:
-                predictions["pose_enc"] = self.camera_head(
-                    aggregated_tokens_list,
-                    patch_token_start=patch_token_start,
-                )
+                with torch.set_grad_enabled(torch.is_grad_enabled() and window_camera_grad_enabled):
+                    predictions["pose_enc"] = self.camera_head(
+                        aggregated_tokens_list,
+                        patch_token_start=patch_token_start,
+                    )
 
             if self.dense_head is not None:
                 frames_chunk_size = (
