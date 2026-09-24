@@ -26,6 +26,8 @@ from training.train_pano_omega import build_model, load_checkpoint, sample_depth
 from vggt_omega.models.layers.pano_position import pinhole_rays, rays_to_equirectangular  # noqa: E402
 from vggt_omega.models.erp_completion import (  # noqa: E402
     load_erp_completion_head,
+    apply_completion_sampler_args,
+    validate_completion_sampler_args,
     splat_omega_window_depth_to_erp,
 )
 
@@ -112,6 +114,10 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     ckpt_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
     model_args = model_args_from_checkpoint(ckpt_args)
+    completion_head, completion_payload = None, {}
+    if args.erp_completion_checkpoint is not None:
+        completion_head, completion_payload = load_erp_completion_head(args.erp_completion_checkpoint, device)
+        apply_completion_sampler_args(model_args, completion_payload)
     pred_depth_scale = resolve_pred_depth_scale(args, ckpt_args)
     if args.pano_height is not None and args.pano_width is not None:
         model_args.pano_height = args.pano_height
@@ -132,6 +138,7 @@ def main() -> None:
         model_args.fov_y_degrees = args.fov_y_degrees
     if args.window_size is not None:
         model_args.window_size = args.window_size
+    validate_completion_sampler_args(model_args, completion_payload)
 
     pano_size = pano_size_from_args(model_args)
     if args.pano_path is not None:
@@ -212,18 +219,18 @@ def main() -> None:
     )
     save_depth_image(pred_erp, valid_erp, output_dir / "pred_z_depth_erp_splat.png", max_depth=args.depth_max_m)
     if args.erp_completion_checkpoint is not None:
-        completion_head, completion_payload = load_erp_completion_head(args.erp_completion_checkpoint, device)
         head_args = completion_payload.get("head_args", {})
         completion_h = int(head_args.get("height", 256))
         completion_w = int(head_args.get("width_erp", 512))
         blend_width = int(head_args.get("blend_width_pixels", 12))
-        num_panos = int(pano_image.shape[1])
+        num_panos = int(pano_image.shape[1]) if pano_image.ndim == 5 else 1
         splat = splat_omega_window_depth_to_erp(
             predictions["depth"] * float(pred_depth_scale),
             predictions["pano_camera_meta"],
             num_panos=num_panos,
             erp_height=pano_np.shape[0],
             erp_width=pano_np.shape[1],
+            core_latitude_degrees=float(head_args.get("core_latitude_degrees", 90)),
         )
         rgb = pano_image.reshape(num_panos, 3, pano_np.shape[0], pano_np.shape[1])
         rgb_small = F.interpolate(rgb, size=(completion_h, completion_w), mode="bilinear", align_corners=False)

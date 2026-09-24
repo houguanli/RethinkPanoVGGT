@@ -54,7 +54,9 @@ from training.train_pano_omega import (  # noqa: E402
     set_seed,
 )
 from vggt_omega.data.pano_sampler import resolve_fov_degrees  # noqa: E402
-from vggt_omega.models.erp_completion import load_erp_completion_head  # noqa: E402
+from vggt_omega.models.erp_completion import (  # noqa: E402
+    load_erp_completion_head, apply_completion_sampler_args, validate_completion_sampler_args,
+)
 
 
 DATASETS = [
@@ -214,9 +216,6 @@ def main() -> None:
 
     checkpoint_payload = load_checkpoint_payload(args.checkpoint)
     apply_checkpoint_eval_defaults(train_args, checkpoint_payload)
-    apply_eval_sampler_overrides(train_args, args)
-    model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
-    model.eval()
     erp_completion_head = None
     erp_completion_payload: dict[str, Any] = {}
     if args.erp_completion_checkpoint is not None:
@@ -224,7 +223,12 @@ def main() -> None:
             args.erp_completion_checkpoint,
             device,
         )
+        apply_completion_sampler_args(train_args, erp_completion_payload)
         print(f"[INFO] learned ERP completion = {args.erp_completion_checkpoint}", flush=True)
+    apply_eval_sampler_overrides(train_args, args)
+    validate_completion_sampler_args(train_args, erp_completion_payload)
+    model = build_eval_model(train_args, args.checkpoint, checkpoint_payload, device)
+    model.eval()
 
     camera_pair_csv = args.camera_pair_csv
     if camera_pair_csv is None and args.per_sample_csv is not None:
@@ -333,6 +337,7 @@ def main() -> None:
         run["dataset"] = display_name
         run["minimal_dataset"] = minimal_name
         run["requested_eval_max_panos"] = dataset_eval_max_panos
+        run["erp_completion_head_args"] = erp_completion_payload.get("head_args", {})
         run["effective_eval_pano_min_count"] = int(getattr(dataset_args, "pano_min_count", 1))
         run["effective_eval_pano_max_count"] = int(getattr(dataset_args, "pano_max_count", 1))
         runs.append(run)
@@ -362,6 +367,7 @@ def main() -> None:
             str(args.erp_completion_checkpoint) if args.erp_completion_checkpoint is not None else None
         ),
         "erp_completion_mode": "learned_remaining_band" if erp_completion_head is not None else "stable_polar_prior",
+        "erp_completion_head_args": erp_completion_payload.get("head_args", {}),
         "device": str(device),
         "seed": args.seed,
         "limit_per_dataset": int(args.limit_per_dataset),
@@ -376,7 +382,11 @@ def main() -> None:
         "depth_evaluation_domain": "covered_sphere_sampled_pinhole_windows",
         "depth_evaluation_domains": {
             "covered_sphere": "sampled pinhole windows with solid-angle weights and overlap de-duplication",
-            "erp_with_polar_prior": "uniform ERP pixels after window splat and stable-cap prior completion",
+            "erp_with_polar_prior": (
+                "uniform valid ERP pixels after window splat and learned completion; see erp_completion_head_args"
+                if erp_completion_head is not None
+                else "uniform ERP pixels after window splat and stable-cap prior completion"
+            ),
         },
         "depth_metric_protocol": DEPTH_METRIC_PROTOCOL,
         "depth_pixel_weighting": "pinhole_solid_angle_divided_by_same_pano_window_coverage_count",

@@ -62,6 +62,7 @@ from vggt_omega.models.layers.pano_position import pinhole_rays, yaw_pitch_to_ax
 from vggt_omega.data.pano_sampler import resolve_fov_degrees  # noqa: E402
 from vggt_omega.models.erp_completion import (  # noqa: E402
     splat_omega_window_depth_to_erp,
+    canonical_alignment_mask,
 )
 
 
@@ -155,6 +156,12 @@ ERP_PRIOR_DIAGNOSTIC_KEYS = [
     "erp_prior_region_abs_rel",
     "erp_prior_north_abs_rel",
     "erp_prior_south_abs_rel",
+    "erp_canonical_depth_irls_abs_rel",
+    "erp_canonical_depth_irls_delta_1p25",
+    "erp_cap60_abs_rel",
+    "erp_cap60_valid_pixels",
+    "erp_prior_north_valid_pixels",
+    "erp_prior_south_valid_pixels",
 ]
 
 PANOVGGT_PRIMARY_METRICS = [
@@ -735,6 +742,7 @@ def evaluate_run(
                         camera_meta=target_camera_meta,
                         completion_head=erp_completion_head,
                         completion_head_args=erp_completion_head_args or {},
+                        gt_common_mask=moved.get("pano_rgb_depth_common_mask"),
                     )
                 camera_scale = base_depth_scale.detach() * sample_depth_scale
                 with torch.autocast(device_type=device.type, enabled=False):
@@ -1276,6 +1284,7 @@ def compute_erp_completion_depth_metrics(
     camera_meta: dict[str, torch.Tensor],
     completion_head: torch.nn.Module,
     completion_head_args: dict[str, Any],
+    gt_common_mask: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Evaluate learned completion over every valid ERP pixel.
 
@@ -1292,6 +1301,7 @@ def compute_erp_completion_depth_metrics(
         num_panos=num_panos,
         erp_height=erp_height,
         erp_width=erp_width,
+        core_latitude_degrees=float(completion_head_args.get("core_latitude_degrees", 90)),
     )
     target_h = int(completion_head_args.get("height", min(256, erp_height)))
     target_w = int(completion_head_args.get("width_erp", min(512, erp_width)))
@@ -1314,18 +1324,25 @@ def compute_erp_completion_depth_metrics(
     window_depth = splat.depth.reshape(batch, num_panos, erp_height, erp_width)
     window_valid_raw = splat.valid_mask.reshape(batch, num_panos, erp_height, erp_width)
     gt_valid = torch.isfinite(gt_range) & (gt_range > 0)
+    if completion_head_args.get("gt_validity") == "rgb_depth_common" and gt_common_mask is not None:
+        gt_valid &= gt_common_mask.reshape_as(gt_valid).bool()
     if float(max_range_depth) > 0:
         gt_valid &= gt_range <= float(max_range_depth)
     window_mask = window_valid_raw & gt_valid
     learned_fill = ~window_valid_raw & gt_valid & torch.isfinite(final_depth) & (final_depth > 0)
     eval_mask = window_mask | learned_fill
-    metrics = compute_depth_metrics(final_depth, gt_range, eval_mask, alignment_valid=window_mask)
+    alignment_mask = window_mask
+    if completion_head_args.get("alignment_domain") == "canonical_pitch15_fov75x75":
+        alignment_mask = window_mask & canonical_alignment_mask(erp_height, erp_width).to(gt_range.device)
+    metrics = compute_depth_metrics(final_depth, gt_range, eval_mask, alignment_valid=alignment_mask)
     window_only = compute_depth_metrics(window_depth, gt_range, window_mask)
     scale = float(metrics.get("depth_irls_scale", 1.0))
+    canonical_mask = gt_valid & canonical_alignment_mask(erp_height, erp_width).to(gt_range.device)
+    canonical_metrics = compute_depth_metrics(final_depth, gt_range, canonical_mask, alignment_valid=alignment_mask)
 
     def region_abs_rel(mask: torch.Tensor) -> float:
         if not bool(mask.any()):
-            return 0.0
+            return float("nan")
         pred = final_depth[mask] * scale
         return float(((pred - gt_range[mask]).abs() / gt_range[mask].clamp_min(1e-6)).mean().cpu())
 
@@ -1334,6 +1351,7 @@ def compute_erp_completion_depth_metrics(
     ) * 180.0 / float(erp_height)
     north = (row_latitudes >= 75.0).reshape(1, 1, erp_height, 1)
     south = (row_latitudes <= -75.0).reshape(1, 1, erp_height, 1)
+    caps = (row_latitudes.abs() > 60.0).reshape(1, 1, erp_height, 1) & gt_valid
     gt_count = gt_valid.sum().clamp_min(1).float()
     return {
         **{f"erp_prior_{key}": value for key, value in metrics.items()},
@@ -1347,6 +1365,12 @@ def compute_erp_completion_depth_metrics(
         "erp_prior_region_abs_rel": region_abs_rel(learned_fill),
         "erp_prior_north_abs_rel": region_abs_rel(learned_fill & north),
         "erp_prior_south_abs_rel": region_abs_rel(learned_fill & south),
+        "erp_canonical_depth_irls_abs_rel": canonical_metrics["depth_irls_abs_rel"],
+        "erp_canonical_depth_irls_delta_1p25": canonical_metrics["depth_irls_delta_1p25"],
+        "erp_cap60_abs_rel": region_abs_rel(caps),
+        "erp_cap60_valid_pixels": int(caps.sum().item()),
+        "erp_prior_north_valid_pixels": int((learned_fill & north).sum().item()),
+        "erp_prior_south_valid_pixels": int((learned_fill & south).sum().item()),
     }
 
 

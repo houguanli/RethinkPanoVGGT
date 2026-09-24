@@ -35,6 +35,8 @@ from vggt_omega.models.erp_completion import (
     soft_coverage_distance,
     spherical_pixel_weights,
     splat_omega_window_depth_to_erp,
+    SAMPLER_KEYS,
+    canonical_alignment_mask,
 )
 
 
@@ -67,7 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amp-dtype", choices=["bfloat16", "none"], default="bfloat16")
     parser.add_argument("--seed", type=int, default=57)
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--save-every", type=int, default=500)
+    parser.add_argument("--save-every", type=int, default=2000)
+    parser.add_argument("--core-latitude-degrees", type=float, default=90.0,
+                        help="Trust Omega splats only within this absolute latitude; 90 preserves legacy behavior.")
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--progress-bar", dest="progress_bar", action="store_true", default=True)
     parser.add_argument("--no-progress-bar", dest="progress_bar", action="store_false")
@@ -95,19 +99,17 @@ def main() -> None:
     omega_args = parse_omega_args(["--config", str(args.config)])
     if args.dataset_root is not None:
         omega_args.dataset_root = str(args.dataset_root)
-    # Completion always uses the distribution-aligned canonical Omega windows.
-    omega_args.pitch_degrees = "-15"
-    omega_args.fov_degrees = 75.0
-    omega_args.fov_x_degrees = 75.0
-    omega_args.fov_y_degrees = 75.0
-    omega_args.num_yaw = 4
-    omega_args.window_size = 384
+    # Respect the configured crop geometry, including multi-ring experiments.
+    if not 0 < args.core_latitude_degrees <= 90:
+        raise ValueError("--core-latitude-degrees must be in (0, 90]")
     omega_args.pano_height = 512
     omega_args.pano_width = 1024
     omega_args.pano_sample_mode = "fixed_neighborhood"
     omega_args.randomize_pano_order = False
     omega_args.batch_size = 1
     omega_args.num_workers = args.num_workers
+    args.sampler_args = {key: getattr(omega_args, key) for key in SAMPLER_KEYS}
+    print(f"[INFO] sampler={args.sampler_args} core_latitude={args.core_latitude_degrees}", flush=True)
     dataset = build_dataset(omega_args, (512, 1024))
     sampler = DistributedSampler(
         dataset,
@@ -133,6 +135,8 @@ def main() -> None:
     for parameter in omega.parameters():
         parameter.requires_grad_(False)
 
+    # Crop geometry must not affect small-head initialization or data order.
+    set_seed(args.seed + rank)
     head = ERPRemainingBandHead(args.head_width, args.max_log_residual).to(device)
     global_step = 0
     total_elapsed_before = 0.0
@@ -149,6 +153,9 @@ def main() -> None:
     optimizer = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if resume_payload is not None and "optimizer" in resume_payload:
         optimizer.load_state_dict(resume_payload["optimizer"])
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr
+            group["weight_decay"] = args.weight_decay
 
     log_path = args.output_dir / "loss.csv"
     append = log_path.exists() and log_path.stat().st_size > 0
@@ -172,6 +179,9 @@ def main() -> None:
             leave=True,
         )
     head.train()
+    alignment_mask = F.interpolate(canonical_alignment_mask(512, 1024).float(),
+                                   size=(args.height, args.width), mode="nearest").to(device) > 0.5
+    completed = False
     try:
         while True:
             elapsed = (time.monotonic() - start) / 60.0
@@ -205,6 +215,7 @@ def main() -> None:
                 splat = splat_omega_window_depth_to_erp(
                     prediction["depth"], prediction["pano_camera_meta"], num_panos=num_panos,
                     erp_height=512, erp_width=1024,
+                    core_latitude_degrees=args.core_latitude_degrees,
                 )
             rgb = pano_image.reshape(batch_size * num_panos, 3, 512, 1024)
             gt = pano_depth.reshape(batch_size * num_panos, 1, 512, 1024)
@@ -221,7 +232,11 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
                 output = head(rgb, omega_depth, coverage, blend_width_pixels=args.blend_width_pixels)
-                losses = completion_losses(output, gt, gt_valid, rgb, args.stage, args.blend_width_pixels)
+                losses = completion_losses(output, gt, gt_valid & (gt <= omega_args.depth_max_m),
+                                           rgb, args.stage, args.blend_width_pixels, num_panos=num_panos,
+                                           alignment_valid=alignment_mask)
+            if not torch.isfinite(losses["loss"]):
+                raise FloatingPointError(f"Non-finite completion loss at step {global_step}")
             losses["loss"].backward()
             torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
             optimizer.step()
@@ -262,36 +277,53 @@ def main() -> None:
                     print(message, flush=True)
             if is_main and args.save_every > 0 and global_step % args.save_every == 0:
                 save_checkpoint(args.output_dir / f"step_{global_step:06d}.pt", head, optimizer, args, global_step, total_elapsed_before + elapsed)
+        completed = True
     finally:
         elapsed = (time.monotonic() - start) / 60.0
         if is_main:
             if progress is not None:
                 progress.close()
-            save_checkpoint(args.output_dir / "last.pt", head, optimizer, args, global_step, total_elapsed_before + elapsed)
+            checkpoint_name = "last.pt" if completed else "interrupted.pt"
+            save_checkpoint(args.output_dir / checkpoint_name, head, optimizer, args, global_step, total_elapsed_before + elapsed)
+            status = {"state": "completed" if completed else "failed", "step": global_step,
+                      "stop_reason": stop_reason if completed else "exception",
+                      "elapsed_minutes": elapsed, "sampler_args": args.sampler_args,
+                      "peak_cuda_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else 0,
+                      "peak_cuda_reserved_mib": torch.cuda.max_memory_reserved(device) / 2**20 if device.type == "cuda" else 0}
+            (args.output_dir / "status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
             if log_file is not None:
                 log_file.close()
-            print(f"[INFO] completion stop_reason={stop_reason} step={global_step} checkpoint={args.output_dir / 'last.pt'}", flush=True)
+            print(f"[INFO] completion {status} checkpoint={args.output_dir / checkpoint_name}", flush=True)
         if distributed and dist.is_initialized():
             dist.destroy_process_group()
 
 
-def completion_losses(output, target, target_valid, rgb, stage: str, blend_width: int):
+def completion_losses(output, target, target_valid, rgb, stage: str, blend_width: int,
+                      num_panos: int = 1, alignment_valid=None):
     pred = output["depth"].float().clamp_min(1e-6)
     completion = output["completion_depth"].float().clamp_min(1e-6)
     coverage = output["coverage"] > 0.5
     valid = target_valid & torch.isfinite(target) & (target > 0)
-    remaining = valid & ~coverage
-    boundary = remaining & (soft_coverage_distance(coverage.float(), blend_width) > 0)
-    # Scale-only alignment preserves Omega-relative geometry without leaking an absolute scale at inference.
+    # Anchor scale on immutable Omega pixels, NEVER on the predicted remainder:
+    # otherwise a uniformly wrong remainder can align its own error away.
+    # A multi-pano set shares one scale, as in evaluation.
+    if pred.shape[0] % num_panos:
+        raise ValueError("Completion batch must contain whole panorama sets")
     aligned = []
-    for index in range(pred.shape[0]):
-        values = valid[index]
+    valid = valid.clone()
+    anchors = coverage if alignment_valid is None else coverage & alignment_valid
+    for start in range(0, pred.shape[0], num_panos):
+        group = slice(start, start + num_panos)
+        values = valid[group] & anchors[group]
         if values.any():
-            shift = (torch.log(target[index][values]) - torch.log(pred[index][values])).median().detach()
+            shift = (torch.log(target[group][values]) - torch.log(pred[group][values])).median().detach()
         else:
             shift = pred.new_tensor(0.0)
-        aligned.append(pred[index] * torch.exp(shift))
-    aligned_pred = torch.stack(aligned)
+            valid[group] = False
+        aligned.append(pred[group] * torch.exp(shift))
+    aligned_pred = torch.cat(aligned)
+    remaining = valid & ~coverage
+    boundary = remaining & (soft_coverage_distance(coverage.float(), blend_width) > 0)
     error = F.smooth_l1_loss(torch.log(aligned_pred), torch.log(target.clamp_min(1e-6)), reduction="none", beta=0.2)
     sphere = spherical_pixel_weights(pred.shape[-2], pred.shape[-1], pred.device, pred.dtype)
     loss_remaining = masked_weighted_mean(error, remaining, sphere)
@@ -339,12 +371,17 @@ def save_checkpoint(path, head, optimizer, args, step, elapsed):
         "omega_checkpoint": str(args.omega_checkpoint),
         "base_checkpoint": str(args.base_checkpoint) if args.base_checkpoint else None,
         "config": str(args.config),
+        "sampler_args": args.sampler_args,
+        "loss_protocol": "core_group_log_scale_v2",
         "head_args": {
             "width": int(args.head_width),
             "max_log_residual": float(args.max_log_residual),
             "height": int(args.height),
             "width_erp": int(args.width),
             "blend_width_pixels": int(args.blend_width_pixels),
+            "core_latitude_degrees": float(args.core_latitude_degrees),
+            "alignment_domain": "canonical_pitch15_fov75x75",
+            "gt_validity": "rgb_depth_common",
         },
     }
     temporary = path.with_suffix(path.suffix + ".tmp")

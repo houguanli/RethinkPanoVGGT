@@ -12,12 +12,43 @@ import math
 from dataclasses import dataclass
 from typing import Dict
 from pathlib import Path
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from vggt_omega.models.layers.pano_position import pinhole_rays, rays_to_equirectangular
+
+
+SAMPLER_KEYS = ("pitch_degrees", "num_yaw", "fov_degrees", "fov_x_degrees",
+                "fov_y_degrees", "window_size", "pano_height", "pano_width")
+
+
+def apply_completion_sampler_args(args, payload):
+    """New heads own their crop geometry; old checkpoints retain prior defaults."""
+    for key, value in payload.get("sampler_args", {}).items():
+        if key in SAMPLER_KEYS:
+            setattr(args, key, value)
+
+
+def validate_completion_sampler_args(args, payload):
+    for key, expected in payload.get("sampler_args", {}).items():
+        if key in SAMPLER_KEYS and getattr(args, key) != expected:
+            raise ValueError(f"Completion checkpoint requires {key}={expected}, got {getattr(args, key)}")
+
+
+@lru_cache(maxsize=4)
+def canonical_alignment_mask(height, width):
+    """CPU mask shared by A/B: old -15/75/yaw4 crop domain, independent of GT."""
+    from vggt_omega.data.pano_sampler import PanoWindowSampler
+    with torch.no_grad():
+        sampler = PanoWindowSampler(window_size=384, num_yaw=4, pitch_degrees=[-15], fov_degrees=75)
+        meta = sampler(torch.zeros(1, 3, 8, 16)).camera_meta
+        return splat_omega_window_depth_to_erp(
+            torch.ones(1, 4, 384, 384, 1), meta, num_panos=1,
+            erp_height=height, erp_width=width,
+        ).valid_mask
 
 
 def _pad_erp(x: torch.Tensor, padding: int) -> torch.Tensor:
@@ -188,8 +219,11 @@ def splat_omega_window_depth_to_erp(
     num_panos: int,
     erp_height: int,
     erp_width: int,
+    core_latitude_degrees: float = 90.0,
 ) -> ERPSplat:
     """Differentiable-value nearest splat from Omega z-depth windows to ERP range depth."""
+    if not 0 < float(core_latitude_degrees) <= 90:
+        raise ValueError("core_latitude_degrees must be in (0, 90]")
     if pred_window_z.ndim == 5:
         pred_window_z = pred_window_z[..., 0]
     batch, views, win_h, win_w = pred_window_z.shape
@@ -224,4 +258,6 @@ def splat_omega_window_depth_to_erp(
     valid = out_count > 0
     out_depth = out_depth / out_count.clamp_min(1.0)
     shape = (batch * num_panos, 1, erp_height, erp_width)
-    return ERPSplat(out_depth.view(shape), valid.view(shape), out_count.view(shape))
+    lat = 90.0 - (torch.arange(erp_height, device=out_depth.device) + 0.5) * 180.0 / erp_height
+    belt = (lat.abs() <= float(core_latitude_degrees)).view(1, 1, erp_height, 1)
+    return ERPSplat(out_depth.view(shape) * belt, valid.view(shape) & belt, out_count.view(shape) * belt)
