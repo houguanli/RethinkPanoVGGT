@@ -17,7 +17,7 @@ COMPLETION_REFINE_MINUTES="${COMPLETION_REFINE_MINUTES:-120}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 EVAL_WORKERS_PER_GPU="${EVAL_WORKERS_PER_GPU:-2}"
 CHECKPOINT_EVERY_STEPS="${CHECKPOINT_EVERY_STEPS:-2000}"
-CONFIG="${CONFIG:-configs/multipano_rtx5000x4_mixed4_omega_canonical_warmup_2h.yaml}"
+CONFIG="${CONFIG:-configs/multipano_rtx5000x4_mixed4_belt60_6pano_panocity.yaml}"
 
 export CUDA_VISIBLE_DEVICES
 export SKIP_INDEX_BUILD="${SKIP_INDEX_BUILD:-1}"
@@ -58,10 +58,10 @@ fi
 echo "[PIPELINE] root=$PROJECT_ROOT run=$RUN_NAME"
 echo "[PIPELINE] dataset=$PANOVGGT_ROOT foundation=$FOUNDATION_CHECKPOINT init=$WARMUP_INIT_CHECKPOINT"
 echo "[PIPELINE] GPUs=$CUDA_VISIBLE_DEVICES schedule=${WARMUP_MINUTES}m+${COMPLETION_MAIN_MINUTES}m+${COMPLETION_REFINE_MINUTES}m"
-echo "[PIPELINE] checkpoint_every_steps=$CHECKPOINT_EVERY_STEPS; eval=quick20+full8833"
+echo "[PIPELINE] checkpoint_every_steps=$CHECKPOINT_EVERY_STEPS; input=12 windows/pano, Panocity=6 panos, indoor=3 panos; eval=quick20+full8833"
 
 if [[ ! -s "$WARMUP_OUTPUT/last.pt" ]]; then
-  echo "[STAGE 1/6] four-GPU canonical Omega warm-up"
+  echo "[STAGE 1/6] four-GPU B-geometry Omega warm-up (12 windows; Panocity=6, other datasets=3)"
   "$PYTHON_BIN" -m torch.distributed.run --standalone --nproc_per_node="$NPROC_PER_NODE" \
     training/train_pano_omega.py \
     --config "$CONFIG" --dataset-root "$PANOVGGT_ROOT" \
