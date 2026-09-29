@@ -6,7 +6,7 @@ one NVIDIA RTX 4090. No packages were installed.
 
 | Experiment | Regression tests | CUDA synthetic smoke | Updated active parameter tensors |
 |---|---|---|---:|
-| Full reference | 103 passed | completed before test-initialization hardening | — |
+| Full reference | 103 passed | passed | 962 |
 | A1 no GeoRA | 103 passed | passed | 934 |
 | A2 no Camera GeoRA | 103 passed | passed | 955 |
 | A3 no Patch GeoRA | 103 passed | passed | 941 |
@@ -38,6 +38,8 @@ Local evidence:
 `logs/verification_20260929.json` and each experiment's
 `logs/verification_20260929/{tests.log,smoke.log,smoke/smoke_summary.json}`.
 These logs and test checkpoints are ignored by Git.
+The Full-reference smoke output is under
+`Rethink_pano_new_exp_omega/logs/smoke_full_verified_20260929`.
 
 No 4-GPU RTX 5000 job, long training, or full dataset evaluation was launched
 locally. Server readiness was checked via configs, command plans and tests;

@@ -55,7 +55,9 @@ def main():
                                stdout=log, stderr=subprocess.STDOUT, check=True)
             report[folder]["smoke"] = json.loads((log_dir / "smoke/smoke_summary.json").read_text())
         print(f"{folder}: independent config/code verified; tests={args.test}, smoke={args.smoke}", flush=True)
-    output = ROOT / "logs/verification_20260929.json"
+    # A later layout-only check must not overwrite the expensive test evidence.
+    report_name = "verification_20260929.json" if args.test or args.smoke else "layout_verification_20260929.json"
+    output = ROOT / "logs" / report_name
     output.parent.mkdir(exist_ok=True)
     output.write_text(json.dumps(report, indent=2))
 
