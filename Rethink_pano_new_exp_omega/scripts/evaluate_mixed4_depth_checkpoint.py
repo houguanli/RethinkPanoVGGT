@@ -237,6 +237,8 @@ def main() -> None:
     per_sample_rows = [
         row for row in loaded_sample_rows if str(row.get("depth_metric_protocol", "")) == DEPTH_METRIC_PROTOCOL
     ]
+    dataset_pano_counts = resolve_dataset_pano_counts(args.pano_count_policy, args.dataset_pano_counts)
+    validate_evaluated_pano_counts(per_sample_rows, dataset_pano_counts)
     dropped_legacy_rows = len(loaded_sample_rows) - len(per_sample_rows)
     camera_pair_rows = read_csv_rows(camera_pair_csv) if args.resume else []
     if dropped_legacy_rows:
@@ -266,7 +268,6 @@ def main() -> None:
 
     selected_datasets = select_datasets(args.datasets)
     manifest_rows = load_sample_manifest(args.sample_manifest)
-    dataset_pano_counts = resolve_dataset_pano_counts(args.pano_count_policy, args.dataset_pano_counts)
     write_eval_progress(
         args.progress_file,
         {
@@ -335,6 +336,7 @@ def main() -> None:
             erp_completion_head_args=erp_completion_payload.get("head_args", {}),
         )
         run["dataset"] = display_name
+        validate_evaluated_pano_counts(per_sample_rows[before_count:], dataset_pano_counts)
         run["minimal_dataset"] = minimal_name
         run["requested_eval_max_panos"] = dataset_eval_max_panos
         run["erp_completion_head_args"] = erp_completion_payload.get("head_args", {})
@@ -610,6 +612,21 @@ def apply_exact_eval_pano_count(args: argparse.Namespace, count: int, dataset_na
     args.pano_min_count = count
     args.pano_max_count = count
     args.dataset_pano_counts = f"{dataset_name}:{count}"
+    # The loader reads this training cap as well; an exact eval policy must win.
+    args.dataset_pano_max_counts = f"{dataset_name}:{count}"
+
+
+def validate_evaluated_pano_counts(rows: list[dict[str, Any]], counts: dict[str, int]) -> None:
+    """Do not silently reuse or report evaluations clamped by training caps."""
+    for row in rows:
+        name = str(row.get("dataset") or str(row.get("run", "")).split("_")[0]).lower()
+        expected = counts.get(name)
+        if expected is not None and int(float(row.get("input_pano_count") or 0)) != expected:
+            raise ValueError(
+                f"Eval input_pano_count mismatch for {name}: expected {expected}, "
+                f"got {row.get('input_pano_count')}. Preserve these results and use a new EVAL_OUT; "
+                "do not resume CSVs produced with a different pano-count policy."
+            )
 
 
 def torch_cuda_device_count() -> int:

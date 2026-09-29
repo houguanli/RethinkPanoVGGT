@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LUNA="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$LUNA"
 
 PYTHON="${PYTHON:-/home/aoki/miniconda3/envs/RethinkPanoVGGT_omega/bin/python}"
 GPUS="${GPUS:-0,1,2,3}"
@@ -28,8 +29,9 @@ SAMPLE_POLICY="${SAMPLE_POLICY:-anchor}"
 PANO_COUNT_POLICY="${PANO_COUNT_POLICY:-panovggt}"
 DATASET_PANO_COUNTS="${DATASET_PANO_COUNTS:-}"
 CAMERA_EVAL_MAX_PANOS="${CAMERA_EVAL_MAX_PANOS:-3}"
-WINDOW_SIZE="${WINDOW_SIZE:-384}"
-NUM_YAW="${NUM_YAW:-4}"
+# Zero means inherit checkpoint/config geometry, including the B dual belt.
+WINDOW_SIZE="${WINDOW_SIZE:-0}"
+NUM_YAW="${NUM_YAW:-0}"
 PRINT_EACH_SAMPLE="${PRINT_EACH_SAMPLE:-1}"
 RESUME="${RESUME:-1}"
 
@@ -104,18 +106,16 @@ fi
   echo "[eval-4gpu] sample_policy=$SAMPLE_POLICY"
   echo "[eval-4gpu] pano_count_policy=$PANO_COUNT_POLICY"
   echo "[eval-4gpu] camera_eval_max_panos=$CAMERA_EVAL_MAX_PANOS"
-  echo "[eval-4gpu] window_size=$WINDOW_SIZE"
-  echo "[eval-4gpu] num_yaw=$NUM_YAW"
+  echo "[eval-4gpu] window_size=$WINDOW_SIZE num_yaw=$NUM_YAW (0=inherit checkpoint)"
   echo "[eval-4gpu] print_each_sample=$PRINT_EACH_SAMPLE"
   echo "[eval-4gpu] resume=$RESUME"
   echo "[eval-4gpu] progress_interval_seconds=$PROGRESS_INTERVAL_SECONDS"
   echo "[eval-4gpu] progress_style=$PROGRESS_STYLE"
-} | tee "$EVAL_OUT/eval_4gpu.log"
+} | tee -a "$EVAL_OUT/eval_4gpu.log"
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi -L 2>/dev/null | sed 's/^/[eval-4gpu][gpu] /' | tee -a "$EVAL_OUT/eval_4gpu.log" || true
 fi
 
-cd "$LUNA"
 PIDS=()
 sample_output_args=(--print-each-sample)
 if [[ "$PRINT_EACH_SAMPLE" != "1" ]]; then
@@ -193,7 +193,7 @@ PY
       "${sample_output_args[@]}" \
       --no-progress
   ) > >(
-    tee "$shard_log" |
+    tee -a "$shard_log" |
       awk -v prefix="[eval-4gpu][shard=$rank] " '/^\[EVAL-SAMPLE\]/{print prefix $0; fflush()}'
   ) 2>&1 &
   child_pid="$!"
@@ -413,9 +413,14 @@ else
 fi
 
 status=0
-for pid in "${PIDS[@]}"; do
-  if ! wait "$pid"; then
+for rank in "${!PIDS[@]}"; do
+  if wait "${PIDS[$rank]}"; then
+    :
+  else
+    shard_status=$?
     status=1
+    echo "[eval-4gpu] shard=$rank exit=$shard_status; last log lines:" | tee -a "$EVAL_OUT/eval_4gpu.log"
+    tail -n 60 "$EVAL_OUT/shards/shard_${rank}.log" | tee -a "$EVAL_OUT/eval_4gpu.log"
   fi
 done
 if [[ "$status" -ne 0 ]]; then

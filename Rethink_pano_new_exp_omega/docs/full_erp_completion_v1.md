@@ -1,5 +1,55 @@
 # Learned full-ERP completion v1
 
+## Current four-GPU server entry point
+
+The server launcher now uses B geometry (pitch `-25,25`, yaw6 per ring,
+FoV75x75, 12 windows/pano) from the start of warm-up. Training uses Panocity=6
+panos and indoor=3, ERP input 1024x512. The original canonical v1 design below
+is historical, not the current server sampler configuration.
+
+From an activated training environment:
+
+```bash
+cd /whitehole/AOKI/RethinkPanoVGGT_omega_multipano_work_pro/Rethink_pano_new_exp_omega
+git pull --ff-only origin codex/multipano-work-pro
+bash scripts/run_full_erp_completion_v1_4xrtx5000.sh
+```
+
+Default paths are built in. Logs are created automatically. The pipeline runs
+2h warm-up + 8h completion + 2h refinement, optional loss analysis, quick20,
+formal full evaluation, then optional preview. Evaluation and preview inherit
+the saved crop geometry; they must not force the legacy yaw4/pitch=-15 sampler.
+Plot/preview errors are warned about but do not block the formal evaluation.
+Evaluator failures remain fatal and their shard log tails appear in the console.
+
+### Recover evaluation after training has finished
+
+Use the **same RUN_NAME as the completed training** (below is the default):
+
+```bash
+EVAL_ONLY=1 RUN_NAME=full_erp_completion_v1_4xrtx5000_2h8h2h \
+  bash scripts/run_full_erp_completion_v1_4xrtx5000.sh
+```
+
+This skips all training and quick20. It requires nonempty
+`logs/${RUN_NAME}_omega_warmup_2h/last.pt` and
+`logs/${RUN_NAME}_completion_refine_2h/last.pt`; missing files cause an error,
+never a training restart. Existing compatible shard CSV rows are resumed and
+an existing full summary is retained and validated. Do not reuse a run/output
+directory for a different checkpoint or evaluation protocol. CSVs containing
+Panocity=6 from the old training-cap bug cannot be resumed as Panocity=10.
+
+Formal evaluation remains `anchor`, `panovggt`, limit=0:
+Stanford2D3DS=216, Matterport3D=891, Structured3D=1662, Panocity=6064
+(8,833 sets). Evaluation pano counts remain Panocity=10 and indoor=3,
+independent of the training cap of 6. An OOM must be reported, not worked
+around by silently reducing inputs.
+
+The result is
+`logs/${RUN_NAME}_eval_full8833_anchor_full_erp_4gpu/validation_mixed4_by_dataset_valtestfull_summary.json`.
+Failures can be inspected in `logs/${RUN_NAME}_pipeline.log` and the eval
+directory's `shards/shard_*.log`.
+
 ## Geometry and knowledge transfer
 
 VGGT-Omega keeps the canonical M1 input distribution: pitch `-15`, FoV

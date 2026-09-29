@@ -5,10 +5,11 @@ PROJECT_ROOT="${PROJECT_ROOT:-/whitehole/AOKI/RethinkPanoVGGT_omega_multipano_wo
 PYTHON_BIN="${PYTHON_BIN:-python}"
 PANOVGGT_ROOT="${PANOVGGT_ROOT:-/whitehole/AOKI/panovggt}"
 FOUNDATION_CHECKPOINT="${FOUNDATION_CHECKPOINT:-/whitehole/AOKI/vggt-omega/ckpt/vggt_omega_1b_512.pt}"
-# Set this to the retained FoV75 A milestone when it is available on the server.
-# Otherwise the canonical warm-up starts directly from the Omega foundation.
+# Warm up with the configured B crop geometry, starting from the foundation.
 WARMUP_INIT_CHECKPOINT="${WARMUP_INIT_CHECKPOINT:-$FOUNDATION_CHECKPOINT}"
 RUN_NAME="${RUN_NAME:-full_erp_completion_v1_4xrtx5000_2h8h2h}"
+EVAL_ONLY="${EVAL_ONLY:-0}"
+[[ "$EVAL_ONLY" == "0" || "$EVAL_ONLY" == "1" ]] || { echo "[ERROR] EVAL_ONLY must be 0 or 1"; exit 2; }
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 WARMUP_MINUTES="${WARMUP_MINUTES:-120}"
@@ -36,13 +37,21 @@ LOSS_ANALYSIS="${PROJECT_ROOT}/logs/${RUN_NAME}_loss_analysis"
 cd "$PROJECT_ROOT"
 mkdir -p "${PROJECT_ROOT}/logs" "$WARMUP_OUTPUT" "$MAIN_OUTPUT" "$REFINE_OUTPUT" "$QUICK_EVAL" "$FULL_EVAL" "$PREVIEW" "$LOSS_ANALYSIS"
 exec > >(tee -a "$PIPELINE_LOG") 2>&1
+trap 'code=$?; echo "[ERROR] pipeline exited with status=$code at line=$LINENO; inspect $PIPELINE_LOG and eval shards/shard_*.log"; exit "$code"' ERR
 
 require_file() { [[ -s "$1" ]] || { echo "[ERROR] missing/empty file: $1"; exit 2; }; }
 require_dir() { [[ -d "$1" ]] || { echo "[ERROR] missing directory: $1"; exit 2; }; }
 require_dir "$PANOVGGT_ROOT"
 require_file "$FOUNDATION_CHECKPOINT"
-require_file "$WARMUP_INIT_CHECKPOINT"
 require_file "$CONFIG"
+if [[ "$EVAL_ONLY" == "1" ]]; then
+  # Never start training when recovering an evaluation, even if a file is missing.
+  require_file "$WARMUP_OUTPUT/last.pt"
+  require_file "$REFINE_OUTPUT/last.pt"
+  echo "[EVAL-ONLY] reusing warm-up + refined head; skipping all training and quick20"
+else
+  require_file "$WARMUP_INIT_CHECKPOINT"
+fi
 
 IFS=',' read -r -a GPU_LIST <<< "$CUDA_VISIBLE_DEVICES"
 if [[ "${#GPU_LIST[@]}" -ne "$NPROC_PER_NODE" ]]; then
@@ -60,7 +69,7 @@ echo "[PIPELINE] dataset=$PANOVGGT_ROOT foundation=$FOUNDATION_CHECKPOINT init=$
 echo "[PIPELINE] GPUs=$CUDA_VISIBLE_DEVICES schedule=${WARMUP_MINUTES}m+${COMPLETION_MAIN_MINUTES}m+${COMPLETION_REFINE_MINUTES}m"
 echo "[PIPELINE] checkpoint_every_steps=$CHECKPOINT_EVERY_STEPS; input=12 windows/pano, Panocity=6 panos, indoor=3 panos; eval=quick20+full8833"
 
-if [[ ! -s "$WARMUP_OUTPUT/last.pt" ]]; then
+if [[ "$EVAL_ONLY" == "0" && ! -s "$WARMUP_OUTPUT/last.pt" ]]; then
   echo "[STAGE 1/6] four-GPU B-geometry Omega warm-up (12 windows; Panocity=6, other datasets=3)"
   "$PYTHON_BIN" -m torch.distributed.run --standalone --nproc_per_node="$NPROC_PER_NODE" \
     training/train_pano_omega.py \
@@ -74,7 +83,7 @@ if [[ ! -s "$WARMUP_OUTPUT/last.pt" ]]; then
 fi
 require_file "$WARMUP_OUTPUT/last.pt"
 
-if [[ ! -s "$MAIN_OUTPUT/last.pt" ]]; then
+if [[ "$EVAL_ONLY" == "0" && ! -s "$MAIN_OUTPUT/last.pt" ]]; then
   echo "[STAGE 2/6] four-GPU frozen-Omega completion main"
   "$PYTHON_BIN" -m torch.distributed.run --standalone --nproc_per_node="$NPROC_PER_NODE" \
     training/train_erp_completion.py \
@@ -84,9 +93,9 @@ if [[ ! -s "$MAIN_OUTPUT/last.pt" ]]; then
     --stage main --num-workers "$NUM_WORKERS" --save-every "$CHECKPOINT_EVERY_STEPS" --progress-bar \
     2>&1 | tee -a "$MAIN_OUTPUT/train.log"
 fi
-require_file "$MAIN_OUTPUT/last.pt"
+if [[ "$EVAL_ONLY" == "0" ]]; then require_file "$MAIN_OUTPUT/last.pt"; fi
 
-if [[ ! -s "$REFINE_OUTPUT/last.pt" ]]; then
+if [[ "$EVAL_ONLY" == "0" && ! -s "$REFINE_OUTPUT/last.pt" ]]; then
   echo "[STAGE 3/6] four-GPU boundary/polar refinement"
   "$PYTHON_BIN" -m torch.distributed.run --standalone --nproc_per_node="$NPROC_PER_NODE" \
     training/train_erp_completion.py \
@@ -100,13 +109,15 @@ fi
 require_file "$REFINE_OUTPUT/last.pt"
 
 echo "[ANALYSIS] generating smoothed loss curves and health report"
-"$PYTHON_BIN" scripts/analyze_full_erp_training_losses.py \
+if ! "$PYTHON_BIN" scripts/analyze_full_erp_training_losses.py \
   --series "omega_warmup=$WARMUP_OUTPUT/loss.csv" \
   --series "completion_main=$MAIN_OUTPUT/loss.csv" \
   --series "completion_refine=$REFINE_OUTPUT/loss.csv" \
-  --output-dir "$LOSS_ANALYSIS"
+  --output-dir "$LOSS_ANALYSIS"; then
+  echo "[WARN] loss analysis failed; continuing evaluation. See traceback above; curves/report may be missing."
+fi
 
-if [[ ! -s "$QUICK_EVAL/validation_mixed4_by_dataset_valtestfull_summary.json" ]]; then
+if [[ "$EVAL_ONLY" == "0" && ! -s "$QUICK_EVAL/validation_mixed4_by_dataset_valtestfull_summary.json" ]]; then
   echo "[STAGE 4/6] four-shard learned full-ERP quick eval"
   GPUS="$CUDA_VISIBLE_DEVICES" PYTHON="$PYTHON_BIN" CONFIG="$CONFIG" \
     DATASET_ROOT="$PANOVGGT_ROOT" CHECKPOINT="$WARMUP_OUTPUT/last.pt" \
@@ -116,19 +127,9 @@ if [[ ! -s "$QUICK_EVAL/validation_mixed4_by_dataset_valtestfull_summary.json" ]
     RESUME=1 bash scripts/run_multipano_mixed4_eval_4gpu.sh
 fi
 
-if [[ ! -s "$PREVIEW/pred_range_depth_erp_completed.png" ]]; then
-  echo "[STAGE 5/6] preview"
-  CUDA_VISIBLE_DEVICES="${GPU_LIST[0]}" "$PYTHON_BIN" scripts/reconstruct_pano_omega.py \
-    --dataset-root "$PANOVGGT_ROOT" --dataset-format pano_minimal --minimal-datasets panocity \
-    --dataset-split test --sample-index 0 --checkpoint "$WARMUP_OUTPUT/last.pt" \
-    --erp-completion-checkpoint "$REFINE_OUTPUT/last.pt" --output-dir "$PREVIEW" \
-    --device cuda --pano-height 512 --pano-width 1024 --window-size 384 --num-yaw 4 \
-    --pitch-degrees=-15 --fov-degrees 75 --fov-x-degrees 75 --fov-y-degrees 75
-fi
-
 SUMMARY="$FULL_EVAL/validation_mixed4_by_dataset_valtestfull_summary.json"
 if [[ ! -s "$SUMMARY" ]]; then
-  echo "[STAGE 6/6] formal learned full-ERP 8,833-set eval on four shards"
+  echo "[STAGE 5/6] formal learned full-ERP 8,833-set eval on four shards"
   GPUS="$CUDA_VISIBLE_DEVICES" PYTHON="$PYTHON_BIN" CONFIG="$CONFIG" \
     DATASET_ROOT="$PANOVGGT_ROOT" CHECKPOINT="$WARMUP_OUTPUT/last.pt" \
     ERP_COMPLETION_CHECKPOINT="$REFINE_OUTPUT/last.pt" TRAIN_LOSS_CSV="$REFINE_OUTPUT/loss.csv" \
@@ -138,4 +139,18 @@ if [[ ! -s "$SUMMARY" ]]; then
 fi
 require_file "$SUMMARY"
 "$PYTHON_BIN" scripts/validate_eval_cardinality.py "$SUMMARY"
-echo "[COMPLETE] summary=$SUMMARY preview=$PREVIEW/pred_range_depth_erp_completed.png"
+
+if [[ ! -s "$PREVIEW/pred_range_depth_erp_completed.png" ]]; then
+  echo "[STAGE 6/6] preview (inherit checkpoint geometry)"
+  if ! CUDA_VISIBLE_DEVICES="${GPU_LIST[0]}" "$PYTHON_BIN" scripts/reconstruct_pano_omega.py \
+    --dataset-root "$PANOVGGT_ROOT" --dataset-format pano_minimal --minimal-datasets panocity \
+    --dataset-split test --sample-index 0 --checkpoint "$WARMUP_OUTPUT/last.pt" \
+    --erp-completion-checkpoint "$REFINE_OUTPUT/last.pt" --output-dir "$PREVIEW" \
+    --device cuda; then
+    echo "[WARN] preview failed; formal evaluation is saved. See traceback above."
+  fi
+fi
+echo "[COMPLETE] summary=$SUMMARY"
+if [[ -s "$PREVIEW/pred_range_depth_erp_completed.png" ]]; then
+  echo "[PREVIEW] $PREVIEW/pred_range_depth_erp_completed.png"
+fi
