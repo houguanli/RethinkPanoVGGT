@@ -6,4 +6,7 @@ __pycache__/
 .ruff_cache/
 /ckpt/
 /Rethink_pano_new_exp_omega/logs/
+logs/
+outputs/
+ckpt/
 *:Zone.Identifier

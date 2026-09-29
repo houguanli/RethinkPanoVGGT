@@ -1,0 +1,132 @@
+# M1 treatment: only horizontal FoV changes from 75 to 95 degrees.
+# Pitch, vertical FoV, yaw count, data order, seed, loss, and parent checkpoint
+# are identical to the fov75x75 control.
+data:
+  dataset_root: /mnt/e/PanoVGGT_minimal_datasets/datasets
+  dataset_format: pano_minimal
+  minimal_datasets: all
+  dataset_sampling_weights: "panocity:0.64,matterport3d:0.18,structured3d:0.09,stanford2d3ds:0.09"
+  dataset_split: train
+  train_split_fraction: 0.95
+  split_seed: 42
+  metadata_path: null
+  bad_sample_list: configs/structured3d_bad_scenes.txt
+  use_metadata_weights: false
+  pano_sample_mode: fixed_neighborhood
+  pano_min_count: 2
+  pano_max_count: 2
+  pano_grouping: nearest
+  randomize_pano_order: false
+  output_depth_scale: 1000.0
+  invalid_depth_value: 65535.0
+  pano_position_step_m: 1.0
+
+sampler:
+  patch_size: 16
+  window_size: 384
+  num_yaw: 4
+  pitch_degrees: "-15"
+  fov_degrees: 75.0
+  fov_x_degrees: 95.0
+  fov_y_degrees: 75.0
+  pano_height: 512
+  pano_width: 1024
+  luna_patch_layers: last3
+  luna_camera_layers: "23"
+
+model:
+  enable_pano_global_token: true
+  enable_pano_geometry_residual: false
+  aggregator_use_checkpoint: true
+  dense_head_frames_chunk_size: 1
+  dense_head_use_checkpoint: true
+  dense_head_return_confidence: false
+
+supervision:
+  gt_depth_semantics: range
+  depth_max_m: 80.0
+  depth_loss_mode: log_huber
+  depth_log_huber_delta: 0.2
+  depth_scale_alignment: none
+  depth_scale_diagnostics_alignment: sample_l1_depth_weighted
+  loss_sample_weighting: true
+  min_window_valid_ratio: 0.05
+  valid_ratio_loss_power: 0.5
+  sample_weight_min: 0.25
+  sample_weight_max: 1.25
+  overlap_consistency_weight: 0.0
+  global_point_loss_weight: 0.0
+  normalize_scene_scale: true
+  pred_depth_scale: 1.0
+  learn_pred_depth_scale: false
+  dataset_depth_scale_mode: none
+  depth_residual_mode: none
+  enable_camera_head: true
+  camera_supervision_mode: pano_relative
+  camera_loss_weight: 0.25
+  camera_comparable_weight: 0.25
+  camera_translation_weight: 1.0
+  camera_rotation_weight: 0.5
+  camera_translation_normalization: target_rms
+  camera_translation_normalization_eps: 1.0
+  camera_translation_min_baseline_m: 0.05
+  camera_translation_loss_mode: vector_smooth_l1
+  camera_center_residual_weight: 0.5
+  camera_center_residual_max_ratio: 0.25
+  camera_center_residual_max_abs: 0.02
+  camera_depth_scale_alignment: false
+  camera_position_mode: relative_anchor
+
+optimization:
+  trainable: luna_residual_heads
+  lr: 2.0e-5
+  weight_decay: 0.05
+  grad_clip: 1.0
+  optimizer_type: adafactor
+  batch_size: 1
+  training_stages:
+    - name: m1_fov95x75_pitch15_luna
+      window_size: 384
+      num_yaw: 4
+      pitch_degrees: "-15"
+      fov_degrees: 75.0
+      fov_x_degrees: 95.0
+      fov_y_degrees: 75.0
+      dense_head_frames_chunk_size: 1
+      pano_min_count: 2
+      pano_max_count: 2
+      trainable: luna_residual_heads
+      lr: 2.0e-5
+      weight_decay: 0.05
+      optimizer_type: adafactor
+      camera_loss_weight: 0.25
+      global_point_loss_weight: 0.0
+      enable_luna_forward: true
+      enable_depth_residual: false
+      train_depth_residual: false
+      learn_pred_depth_scale: false
+      learn_dataset_depth_scale: false
+
+runtime:
+  device: cuda
+  distributed: auto
+  dist_backend: nccl
+  find_unused_parameters: true
+  amp_dtype: bfloat16
+  epochs: 100000
+  max_steps: 1000000
+  num_workers: 0
+  seed: 47
+  max_duration_minutes: 180.0
+  save_every_steps: 1000
+  save_last: true
+  checkpoint_format: trainable_delta
+  inherit_checkpoint_training_defaults: false
+  debug_depth_dump: false
+  progress_bar: true
+  progress_log_every: 10
+  tensorboard: true
+  tensorboard_dir: logs/m1_fov95x75_pitch15_luna_3h/tensorboard
+
+output:
+  output_dir: logs/m1_fov95x75_pitch15_luna_3h
