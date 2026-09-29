@@ -46,3 +46,19 @@ locally. Server readiness was checked via configs, command plans and tests;
 server filesystem availability cannot be verified from this WSL host.
 Historical no-camera checkpoint and merged summary remain in their original
 Rethink_pano_new_exp_omega/logs directory.
+
+## Follow-up: upstream eval handoff fix 8665b56
+
+Full + A1 + A2 + A3 + A4 each pass **108 tests** after the evaluation-only fix.
+The additional tests cover exact pano-count override (training cap 6 -> eval 10),
+rejection of incompatible resume CSV rows, completion-native geometry after
+reusing an older teacher, preservation of the explicit geometry-conflict error,
+and the real Bash shard launcher with a tiny substitute evaluator. The shell
+test exercises two shards, execution from another working directory, native
+geometry flags, append-only logs, summary creation, nonzero failure propagation
+and visible error details without merging failed shards.
+
+Evidence: each directory's `logs/eval_handoff_fix_20260929/tests.log`.
+The independent-copy/config consistency check and Bash syntax checks passed.
+No training configurations, intervention definitions, model code or checkpoint
+files were changed. No server full evaluation was launched for this fix.

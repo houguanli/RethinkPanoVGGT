@@ -76,6 +76,21 @@ numbers are not results of these new configurations.**
 
 ## Tests and recovery
 
+Eval handoff fixes from upstream `8665b56` are included in all five directories:
+the explicit evaluation pano count overrides the training dataset cap (PanoCity
+10, not silently clamped to 6); incompatible old per-sample rows are rejected
+before resume; shard errors are surfaced and logs appended. The checkpoint-native
+window/yaw defaults were already zero in this branch, and the training pipeline
+does not run the upstream's formerly blocking preview step.
+
+No retraining is needed for this evaluation-only fix. If an older eval used the
+wrong pano count, retain that output and re-evaluate the same refined checkpoint
+into a NEW output directory:
+
+```bash
+python scripts/run_ablation_full_eval.py logs/RUN/completion_refine/last.pt logs/RUN/eval_full_fixed
+```
+
 ```bash
 python tests/run_tests.py
 python tests/smoke_ablation.py --device cuda --output-dir logs/smoke_check
