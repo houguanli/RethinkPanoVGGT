@@ -136,6 +136,12 @@ if [[ ! -s "$SUMMARY" ]]; then
     EVAL_OUT="$FULL_EVAL" LIMIT_PER_DATASET=0 EVAL_DATASETS=all \
     NUM_WORKERS_PER_GPU="$EVAL_WORKERS_PER_GPU" SAMPLE_POLICY=anchor PANO_COUNT_POLICY=panovggt \
     CAMERA_EVAL_MAX_PANOS=3 RESUME=1 bash scripts/run_multipano_mixed4_eval_4gpu.sh
+else
+  # Existing metrics can acquire the new text report/examples without full re-inference.
+  "$PYTHON_BIN" scripts/validate_eval_cardinality.py "$SUMMARY"
+  report_args=(--eval-dir "$FULL_EVAL" --examples-per-dataset "${EXAMPLES_PER_DATASET:-3}")
+  if [[ "${EXPORT_EXAMPLES:-1}" == "1" ]]; then report_args+=(--export-examples); fi
+  CUDA_VISIBLE_DEVICES="${GPU_LIST[0]}" "$PYTHON_BIN" scripts/summarize_mixed4_eval.py "${report_args[@]}"
 fi
 require_file "$SUMMARY"
 "$PYTHON_BIN" scripts/validate_eval_cardinality.py "$SUMMARY"
@@ -150,7 +156,10 @@ if [[ ! -s "$PREVIEW/pred_range_depth_erp_completed.png" ]]; then
     echo "[WARN] preview failed; formal evaluation is saved. See traceback above."
   fi
 fi
+cat "$FULL_EVAL/EVAL_REPORT.txt"
 echo "[COMPLETE] summary=$SUMMARY"
+echo "[REPORT] $FULL_EVAL/EVAL_REPORT.txt"
+echo "[CASES] $FULL_EVAL/good_cases.json"
 if [[ -s "$PREVIEW/pred_range_depth_erp_completed.png" ]]; then
   echo "[PREVIEW] $PREVIEW/pred_range_depth_erp_completed.png"
 fi

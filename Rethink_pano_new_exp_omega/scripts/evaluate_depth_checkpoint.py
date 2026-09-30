@@ -587,6 +587,7 @@ def evaluate_run(
     resume: bool = False,
     erp_completion_head: torch.nn.Module | None = None,
     erp_completion_head_args: dict[str, Any] | None = None,
+    example_cases: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if int(num_shards) < 1:
         raise ValueError(f"num_shards must be >= 1, got {num_shards}")
@@ -602,6 +603,13 @@ def evaluate_run(
     if exact_group_manifest is not None:
         apply_exact_group_manifest(dataset, exact_group_manifest)
     indices, sampling_info = select_eval_indices(dataset, limit, seed, sample_policy, limit_fraction=limit_fraction)
+    cases_by_index = {}
+    if example_cases is not None:
+        cases_by_index = {int(case["dataset_index"]): case for case in example_cases}
+        if len(cases_by_index) != len(example_cases) or any(i < 0 or i >= len(dataset) for i in cases_by_index):
+            raise ValueError("Invalid or duplicate dataset indices in example manifest")
+        indices = list(cases_by_index)
+        sampling_info = {"policy": "selected_example_replay", "selected_samples": len(indices)}
     selected_indices = indices[int(shard_rank) :: int(num_shards)]
     selected_index_set = set(selected_indices)
     existing_rows = [
@@ -849,6 +857,10 @@ def evaluate_run(
                 **depth_metrics,
                 **erp_prior_metrics,
             }
+            if example_cases is not None:
+                from scripts.summarize_mixed4_eval import export_depth_example
+                export_depth_example(cases_by_index[row["dataset_index"]], row, moved, predictions,
+                                     pred_depth_base, target_depth, target_valid)
             for pair_row in pose_pair_rows:
                 pair_row.update(
                     {

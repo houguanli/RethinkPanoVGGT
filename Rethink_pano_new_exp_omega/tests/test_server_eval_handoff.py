@@ -46,6 +46,9 @@ elif a[0].endswith('merge_mixed4_eval_shards.py'):
     save(value('--camera-pair-csv'), 'run,pair_index\n')
 elif a[0].endswith(('analyze_full_erp_training_losses.py', 'reconstruct_pano_omega.py')):
     sys.exit('intentional optional artifact failure')
+elif a[0].endswith('summarize_mixed4_eval.py'):
+    save(Path(value('--eval-dir')) / 'EVAL_REPORT.txt', 'report fixture')
+    save(Path(value('--eval-dir')) / 'good_cases.json', '{}')
 elif not a[0].endswith('validate_eval_cardinality.py'):
     sys.exit('unexpected call: ' + repr(a))
 """
@@ -125,6 +128,7 @@ class ServerEvalHandoffTest(unittest.TestCase):
         self.assertIn("[WARN] loss analysis failed", result.stdout)
         self.assertIn("[WARN] preview failed", result.stdout)
         self.assertTrue((self.root / "logs/test_eval_full8833_anchor_full_erp_4gpu" / SUMMARY).is_file())
+        self.assertTrue((self.root / "logs/test_eval_full8833_anchor_full_erp_4gpu/EVAL_REPORT.txt").is_file())
         for path in checkpoints:
             self.assertEqual(path.read_bytes(), b"preserve existing checkpoint")
         # An existing full summary is not overwritten or re-evaluated.

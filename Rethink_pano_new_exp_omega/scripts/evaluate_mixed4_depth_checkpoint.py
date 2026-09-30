@@ -171,6 +171,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-shards", type=int, default=1, help="Split each dataset over this many independent eval workers.")
     parser.add_argument("--shard-rank", type=int, default=0, help="Shard id for this worker, in [0, num_shards).")
     parser.add_argument("--progress-file", type=Path, default=None, help="Optional JSON file updated periodically with shard progress.")
+    parser.add_argument("--example-manifest", type=Path, default=None,
+                        help="Replay only ranked exact dataset indices and export anchor-window comparisons.")
     parser.add_argument("--progress-every", type=int, default=25, help="Samples between progress-file updates.")
     parser.add_argument("--progress", action="store_true", default=True)
     parser.add_argument("--no-progress", dest="progress", action="store_false")
@@ -186,6 +188,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    example_cases = None
+    if args.example_manifest is not None:
+        if args.resume or args.num_shards != 1:
+            raise ValueError("Example replay uses one worker and separate outputs, without --resume")
+        example_cases = json.loads(args.example_manifest.read_text(encoding="utf-8"))["cases"]
     set_seed(args.seed)
     device = resolve_device(args.device, {"distributed": False, "local_rank": 0})
     write_eval_progress(
@@ -334,6 +341,8 @@ def main() -> None:
             resume=args.resume,
             erp_completion_head=erp_completion_head,
             erp_completion_head_args=erp_completion_payload.get("head_args", {}),
+            example_cases=([case for case in example_cases if case["dataset"] == display_name]
+                           if example_cases is not None else None),
         )
         run["dataset"] = display_name
         validate_evaluated_pano_counts(per_sample_rows[before_count:], dataset_pano_counts)
@@ -371,6 +380,7 @@ def main() -> None:
         "erp_completion_mode": "learned_remaining_band" if erp_completion_head is not None else "stable_polar_prior",
         "erp_completion_head_args": erp_completion_payload.get("head_args", {}),
         "device": str(device),
+        "evaluation_purpose": "selected_example_replay" if example_cases is not None else "benchmark",
         "seed": args.seed,
         "limit_per_dataset": int(args.limit_per_dataset),
         "limit_fraction": float(args.limit_fraction or 0.0),

@@ -185,6 +185,9 @@ def main() -> None:
         "num_yaw": first.get("num_yaw"),
         "pitch_degrees": first.get("pitch_degrees"),
         "fov_degrees": first.get("fov_degrees"),
+        "fov_x_degrees": first.get("fov_x_degrees"),
+        "fov_y_degrees": first.get("fov_y_degrees"),
+        "camera_eval_max_panos": first.get("camera_eval_max_panos", 3),
         "depth_evaluation_domain": first.get(
             "depth_evaluation_domain", "covered_sphere_sampled_pinhole_windows"
         ),

@@ -479,4 +479,8 @@ if [[ "$LIMIT_PER_DATASET" == "0" && "$EVAL_DATASETS" == "all" ]]; then
   "$PYTHON" scripts/validate_eval_cardinality.py "$SUMMARY_JSON" | tee -a "$EVAL_OUT/eval_4gpu.log"
 fi
 
-echo "[eval-4gpu] finished $(date --iso-8601=seconds)" | tee -a "$EVAL_OUT/eval_4gpu.log"
+report_args=(--eval-dir "$EVAL_OUT" --examples-per-dataset "${EXAMPLES_PER_DATASET:-3}")
+if [[ "${EXPORT_EXAMPLES:-1}" == "1" ]]; then report_args+=(--export-examples); fi
+CUDA_VISIBLE_DEVICES="${GPU_LIST[0]}" "$PYTHON" scripts/summarize_mixed4_eval.py "${report_args[@]}" \
+  | tee -a "$EVAL_OUT/eval_4gpu.log"
+echo "[eval-4gpu] finished $(date --iso-8601=seconds); report=$EVAL_OUT/EVAL_REPORT.txt cases=$EVAL_OUT/good_cases.json" | tee -a "$EVAL_OUT/eval_4gpu.log"

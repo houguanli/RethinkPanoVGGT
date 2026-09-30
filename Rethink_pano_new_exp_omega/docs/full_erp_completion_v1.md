@@ -50,7 +50,50 @@ The result is
 Failures can be inspected in `logs/${RUN_NAME}_pipeline.log` and the eval
 directory's `shards/shard_*.log`.
 
-## Geometry and knowledge transfer
+## Final report and selected examples (server pipeline)
+
+After the four shards merge, the launcher now writes and prints one
+`EVAL_REPORT.txt` in the eval output directory. It contains all four datasets,
+actual set/pano counts, crop and ERP depth metrics, canonical/polar diagnostics,
+camera AUC and valid-pair counts, and clearly separated overall aggregations
+(equal per set, equal per dataset, and pooled crop valid-pixel/solid-angle
+weighting). Missing camera GT is N/A, never a perfect zero-error score.
+Partial/smoke evaluations are explicitly marked as not full8833.
+
+`good_cases.json` selects up to three examples per dataset by default:
+crop IRLS AbsRel <= 0.15, delta1.25 >= 0.85, valid fraction >= 0.1,
+and positive valid-pixel count. Nonfinite scores are excluded, identical pano
+groups deduplicated, and thresholds are never silently relaxed. These are
+depth-selected good examples, not representative performance or camera-selected
+examples. The formal metrics still include every evaluated set.
+
+Selected sets are replayed with the same ordered multi-pano input (Panocity=10,
+indoor=3), checkpoint geometry and sample index. Each case under `examples/`
+contains `input_panos.jpg`, `comparison.png` (anchor-pano window RGB / GT /
+IRLS-aligned prediction / AbsRel), and `metrics.json` (original and replayed
+scores). GT and predictions share the depth color scale. Invalid GT is masked;
+these panels do not claim full-ERP completion quality. Examples never switch
+the model to single-pano inference. Original benchmark CSVs are not modified.
+
+The server start command is unchanged. With `EVAL_ONLY=1`, an existing complete
+summary is reused and acquires these artifacts without rerunning all 8,833 sets.
+Only selected examples require new inference; completed matching examples are
+cached. `EXAMPLES_PER_DATASET=5` changes the count; `EXPORT_EXAMPLES=0` writes
+the report/selection manifest without rendering images.
+
+To regenerate artifacts directly from an already merged result:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/summarize_mixed4_eval.py \
+  --eval-dir logs/full_erp_completion_v1_4xrtx5000_2h8h2h_eval_full8833_anchor_full_erp_4gpu \
+  --export-examples
+```
+
+The standalone command also accepts `--examples-per-dataset`, `--max-absrel`,
+`--min-delta`, and `--min-valid-fraction`. Failed example export preserves the
+benchmark and reports its error log; it is not reported as successful export.
+
+## Historical v1 geometry and knowledge transfer
 
 VGGT-Omega keeps the canonical M1 input distribution: pitch `-15`, FoV
 `75x75`, and four yaw views. Its window depth is converted to radial depth and
