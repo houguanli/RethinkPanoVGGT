@@ -7,7 +7,8 @@ PANOVGGT_ROOT="${PANOVGGT_ROOT:-/whitehole/AOKI/panovggt}"
 FOUNDATION_CHECKPOINT="${FOUNDATION_CHECKPOINT:-/whitehole/AOKI/vggt-omega/ckpt/vggt_omega_1b_512.pt}"
 # Warm up with the configured B crop geometry, starting from the foundation.
 WARMUP_INIT_CHECKPOINT="${WARMUP_INIT_CHECKPOINT:-$FOUNDATION_CHECKPOINT}"
-RUN_NAME="${RUN_NAME:-full_erp_completion_v1_4xrtx5000_2h8h2h}"
+# Keep the 2-pano/core60 experiment separate from the previous 3/6-pano run.
+RUN_NAME="${RUN_NAME:-full_erp_completion_v1_4xrtx5000_2pano_core60_2h8h2h}"
 EVAL_ONLY="${EVAL_ONLY:-0}"
 [[ "$EVAL_ONLY" == "0" || "$EVAL_ONLY" == "1" ]] || { echo "[ERROR] EVAL_ONLY must be 0 or 1"; exit 2; }
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
@@ -18,7 +19,7 @@ COMPLETION_REFINE_MINUTES="${COMPLETION_REFINE_MINUTES:-120}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 EVAL_WORKERS_PER_GPU="${EVAL_WORKERS_PER_GPU:-2}"
 CHECKPOINT_EVERY_STEPS="${CHECKPOINT_EVERY_STEPS:-2000}"
-CONFIG="${CONFIG:-configs/multipano_rtx5000x4_mixed4_belt60_6pano_panocity.yaml}"
+CONFIG="${CONFIG:-configs/multipano_rtx5000x4_mixed4_belt60_2pano.yaml}"
 
 export CUDA_VISIBLE_DEVICES
 export SKIP_INDEX_BUILD="${SKIP_INDEX_BUILD:-1}"
@@ -67,10 +68,11 @@ fi
 echo "[PIPELINE] root=$PROJECT_ROOT run=$RUN_NAME"
 echo "[PIPELINE] dataset=$PANOVGGT_ROOT foundation=$FOUNDATION_CHECKPOINT init=$WARMUP_INIT_CHECKPOINT"
 echo "[PIPELINE] GPUs=$CUDA_VISIBLE_DEVICES schedule=${WARMUP_MINUTES}m+${COMPLETION_MAIN_MINUTES}m+${COMPLETION_REFINE_MINUTES}m"
-echo "[PIPELINE] checkpoint_every_steps=$CHECKPOINT_EVERY_STEPS; input=12 windows/pano, Panocity=6 panos, indoor=3 panos; eval=quick20+full8833"
+echo "[PIPELINE] config=$CONFIG; checkpoint_every_steps=$CHECKPOINT_EVERY_STEPS; completion_core=+/-60deg"
+echo "[PIPELINE] default training=2 panos for every dataset, 12 windows/pano; eval=Panocity10/indoor3, quick20+full8833"
 
 if [[ "$EVAL_ONLY" == "0" && ! -s "$WARMUP_OUTPUT/last.pt" ]]; then
-  echo "[STAGE 1/6] four-GPU B-geometry Omega warm-up (12 windows; Panocity=6, other datasets=3)"
+  echo "[STAGE 1/6] four-GPU B-geometry Omega warm-up (pano counts from $CONFIG)"
   "$PYTHON_BIN" -m torch.distributed.run --standalone --nproc_per_node="$NPROC_PER_NODE" \
     training/train_pano_omega.py \
     --config "$CONFIG" --dataset-root "$PANOVGGT_ROOT" \
@@ -90,7 +92,8 @@ if [[ "$EVAL_ONLY" == "0" && ! -s "$MAIN_OUTPUT/last.pt" ]]; then
     --config "$CONFIG" --dataset-root "$PANOVGGT_ROOT" \
     --omega-checkpoint "$WARMUP_OUTPUT/last.pt" --base-checkpoint "$FOUNDATION_CHECKPOINT" \
     --output-dir "$MAIN_OUTPUT" --duration-minutes "$COMPLETION_MAIN_MINUTES" \
-    --stage main --num-workers "$NUM_WORKERS" --save-every "$CHECKPOINT_EVERY_STEPS" --progress-bar \
+    --stage main --core-latitude-degrees 60 \
+    --num-workers "$NUM_WORKERS" --save-every "$CHECKPOINT_EVERY_STEPS" --progress-bar \
     2>&1 | tee -a "$MAIN_OUTPUT/train.log"
 fi
 if [[ "$EVAL_ONLY" == "0" ]]; then require_file "$MAIN_OUTPUT/last.pt"; fi
@@ -102,7 +105,7 @@ if [[ "$EVAL_ONLY" == "0" && ! -s "$REFINE_OUTPUT/last.pt" ]]; then
     --config "$CONFIG" --dataset-root "$PANOVGGT_ROOT" \
     --omega-checkpoint "$WARMUP_OUTPUT/last.pt" --base-checkpoint "$FOUNDATION_CHECKPOINT" \
     --output-dir "$REFINE_OUTPUT" --resume "$MAIN_OUTPUT/last.pt" \
-    --duration-minutes "$COMPLETION_REFINE_MINUTES" --stage refine --lr 5e-5 \
+    --duration-minutes "$COMPLETION_REFINE_MINUTES" --stage refine --lr 5e-5 --core-latitude-degrees 60 \
     --num-workers "$NUM_WORKERS" --save-every "$CHECKPOINT_EVERY_STEPS" --progress-bar \
     2>&1 | tee -a "$REFINE_OUTPUT/train.log"
 fi

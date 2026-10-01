@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = "run_full_erp_completion_v1_4xrtx5000.sh"
 EVAL_LAUNCHER = "run_multipano_mixed4_eval_4gpu.sh"
 SUMMARY = "validation_mixed4_by_dataset_valtestfull_summary.json"
+TWO_PANO_CONFIG = "multipano_rtx5000x4_mixed4_belt60_2pano.yaml"
+TWO_PANO_RUN = "full_erp_completion_v1_4xrtx5000_2pano_core60_2h8h2h"
 
 FAKE_PYTHON = r"""
 import json, os, sys
@@ -60,15 +62,17 @@ class ServerEvalHandoffTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         (self.root / "scripts").mkdir()
+        (self.root / "configs").mkdir()
         (self.root / "bin").mkdir()
         (self.root / "data").mkdir()
         for name in (LAUNCHER, EVAL_LAUNCHER):
             shutil.copyfile(ROOT / "scripts" / name, self.root / "scripts" / name)
+        shutil.copyfile(ROOT / "configs" / TWO_PANO_CONFIG, self.root / "configs" / TWO_PANO_CONFIG)
         self.python = self.root / "bin" / "python"
         self.python.write_text(f"#!{sys.executable}\n" + FAKE_PYTHON)
         self.python.chmod(0o755)
         smi = self.root / "bin" / "nvidia-smi"
-        smi.write_text("#!/bin/sh\nprintf 'GPU 0: test\\nGPU 1: test\\n'\n")
+        smi.write_text("#!/bin/sh\nprintf 'GPU 0: test\\nGPU 1: test\\nGPU 2: test\\nGPU 3: test\\n'\n")
         smi.chmod(0o755)
         for name in ("foundation.pt", "config.yaml"):
             (self.root / name).write_text("fixture")
@@ -154,6 +158,59 @@ class ServerEvalHandoffTest(unittest.TestCase):
         self.assertEqual(sorted(c[c.index("--limit-per-dataset") + 1] for c in evals), ["0", "0", "20", "20"])
         for call in evals:
             self.assert_eval_geometry(call)
+
+    def test_four_card_two_pano_defaults_train_core60_and_auto_eval(self):
+        self.env.pop("CONFIG")
+        self.env.pop("RUN_NAME")
+        self.env.update(EVAL_ONLY="0", CUDA_VISIBLE_DEVICES="0,1,2,3", NPROC_PER_NODE="4")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls()
+        training = [call for call in calls if call[0] == "-m"]
+        self.assertEqual(len(training), 3)
+        for call in training:
+            self.assertIn("--nproc_per_node=4", call)
+            self.assertEqual(call[call.index("--config") + 1], "configs/" + TWO_PANO_CONFIG)
+            self.assertIn(TWO_PANO_RUN, call[call.index("--output-dir") + 1])
+        self.assertEqual(training[0][training[0].index("--max-duration-minutes") + 1], "120")
+        self.assertIn("--no-inherit-checkpoint-training-defaults", training[0])
+        self.assertEqual(training[0][training[0].index("--checkpoint") + 1], str(self.root / "foundation.pt"))
+        for call, minutes in zip(training[1:], ("480", "120")):
+            self.assertEqual(call[call.index("--duration-minutes") + 1], minutes)
+            self.assertEqual(call[call.index("--core-latitude-degrees") + 1], "60")
+        self.assertEqual(training[2][training[2].index("--resume") + 1],
+                         training[1][training[1].index("--output-dir") + 1] + "/last.pt")
+        evals = [call for call in calls if call[0].endswith("evaluate_mixed4_depth_checkpoint.py")]
+        self.assertEqual(len(evals), 8)
+        self.assertEqual(sorted(call[call.index("--limit-per-dataset") + 1] for call in evals),
+                         ["0"] * 4 + ["20"] * 4)
+        for call in evals:
+            self.assert_eval_geometry(call)
+        self.assertTrue((self.root / "logs" / (TWO_PANO_RUN + "_eval_full8833_anchor_full_erp_4gpu")
+                         / "EVAL_REPORT.txt").is_file())
+        self.assertFalse((self.root / "logs/full_erp_completion_v1_4xrtx5000_2h8h2h_omega_warmup_2h").exists())
+
+    def test_two_pano_config_and_warmup_stage_preserve_other_hyperparameters(self):
+        import yaml
+        from training.train_pano_omega import parse_args
+        path = ROOT / "configs" / TWO_PANO_CONFIG
+        args = parse_args(["--config", str(path)])
+        self.assertEqual((args.pano_min_count, args.pano_max_count), (2, 2))
+        self.assertEqual(args.dataset_pano_max_counts,
+                         "panocity:2,matterport3d:2,structured3d:2,stanford2d3ds:2")
+        self.assertEqual((args.num_yaw, args.pitch_degrees, args.window_size), (6, "-25,25", 384))
+        self.assertEqual((args.pano_height, args.pano_width), (512, 1024))
+        for stage in args.training_stages:
+            self.assertEqual((stage["pano_min_count"], stage["pano_max_count"]), (2, 2))
+        new = yaml.safe_load(path.read_text())
+        old = yaml.safe_load((ROOT / "configs/multipano_rtx5000x4_mixed4_belt60_6pano_panocity.yaml").read_text())
+        for key in ("pano_min_count", "pano_max_count", "dataset_pano_max_counts"):
+            old["data"][key] = new["data"][key]
+        for stage in old["optimization"]["training_stages"]:
+            stage.update(pano_min_count=2, pano_max_count=2)
+        old["runtime"]["tensorboard_dir"] = new["runtime"]["tensorboard_dir"]
+        old["output"] = new["output"]
+        self.assertEqual(new, old)  # No unrelated learning-rate/loss/sampler changes.
 
     def test_evaluator_failure_is_nonzero_and_traceback_is_visible(self):
         self.checkpoint("omega_warmup_2h")

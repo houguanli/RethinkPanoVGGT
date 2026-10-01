@@ -12,13 +12,13 @@ from scripts.evaluate_mixed4_depth_checkpoint import (
 
 class EvalPanoCountPolicyTest(unittest.TestCase):
     def test_exact_eval_policy_overrides_training_dataset_cap(self) -> None:
-        args = SimpleNamespace(pano_min_count=3, pano_max_count=6,
-                               dataset_pano_max_counts="panocity:6,matterport3d:3")
-        apply_exact_eval_pano_count(args, 10, "panocity")
-        self.assertEqual((args.pano_min_count, args.pano_max_count), (10, 10))
-        self.assertEqual(args.dataset_pano_max_counts, "panocity:10")
-        apply_exact_eval_pano_count(args, 3, "matterport3d")
-        self.assertEqual(args.dataset_pano_max_counts, "matterport3d:3")
+        for training_count in (2, 6):
+            args = SimpleNamespace(pano_min_count=2, pano_max_count=training_count,
+                                   dataset_pano_max_counts=f"panocity:{training_count},matterport3d:2")
+            for dataset, count in PANOVGGT_DATASET_PANO_COUNTS.items():
+                apply_exact_eval_pano_count(args, count, dataset)
+                self.assertEqual((args.pano_min_count, args.pano_max_count), (count, count))
+                self.assertEqual(args.dataset_pano_max_counts, f"{dataset}:{count}")
 
     def test_rejects_silent_clamping_and_incompatible_resume_rows(self) -> None:
         validate_evaluated_pano_counts(

@@ -3,16 +3,22 @@
 ## Current four-GPU server entry point
 
 The server launcher now uses B geometry (pitch `-25,25`, yaw6 per ring,
-FoV75x75, 12 windows/pano) from the start of warm-up. Training uses Panocity=6
-panos and indoor=3, ERP input 1024x512. The original canonical v1 design below
-is historical, not the current server sampler configuration.
+FoV75x75, 12 windows/pano) from the start of warm-up. Training now uses exactly
+2 panos for every dataset, ERP input 1024x512, and a trusted completion core of
+`|latitude| <= 60` in both main and refinement. Four GPUs and the 2h+8h+2h
+schedule are unchanged. The default config is
+`configs/multipano_rtx5000x4_mixed4_belt60_2pano.yaml`; the previous 3/6-pano
+config is retained for reference. The original canonical v1 design below is
+historical, not the current server sampler configuration.
 
 From an activated training environment:
 
 ```bash
 cd /whitehole/AOKI/RethinkPanoVGGT_omega_multipano_work_pro/Rethink_pano_new_exp_omega
 git pull --ff-only origin codex/multipano-work-pro
-bash scripts/run_full_erp_completion_v1_4xrtx5000.sh
+RUN_NAME=full_erp_completion_v1_4xrtx5000_2pano_core60_2h8h2h \
+CONFIG=configs/multipano_rtx5000x4_mixed4_belt60_2pano.yaml \
+  bash scripts/run_full_erp_completion_v1_4xrtx5000.sh
 ```
 
 Default paths are built in. Logs are created automatically. The pipeline runs
@@ -21,13 +27,20 @@ formal full evaluation, then optional preview. Evaluation and preview inherit
 the saved crop geometry; they must not force the legacy yaw4/pitch=-15 sampler.
 Plot/preview errors are warned about but do not block the formal evaluation.
 Evaluator failures remain fatal and their shard log tails appear in the console.
+The new default run name contains `2pano_core60`, keeping previous checkpoints
+and results separate. The command pins RUN_NAME and CONFIG so old exported
+values cannot accidentally reuse the 3/6-pano run. It starts a fresh foundation
+warm-up; do not set WARMUP_INIT_CHECKPOINT to an adapted checkpoint.
+Save each stage's status.json when comparing results: four-card batch size and
+optimizer-step counts still differ from the local one-card 2-pano experiment.
 
 ### Recover evaluation after training has finished
 
 Use the **same RUN_NAME as the completed training** (below is the default):
 
 ```bash
-EVAL_ONLY=1 RUN_NAME=full_erp_completion_v1_4xrtx5000_2h8h2h \
+EVAL_ONLY=1 RUN_NAME=full_erp_completion_v1_4xrtx5000_2pano_core60_2h8h2h \
+CONFIG=configs/multipano_rtx5000x4_mixed4_belt60_2pano.yaml \
   bash scripts/run_full_erp_completion_v1_4xrtx5000.sh
 ```
 
@@ -42,7 +55,7 @@ Panocity=6 from the old training-cap bug cannot be resumed as Panocity=10.
 Formal evaluation remains `anchor`, `panovggt`, limit=0:
 Stanford2D3DS=216, Matterport3D=891, Structured3D=1662, Panocity=6064
 (8,833 sets). Evaluation pano counts remain Panocity=10 and indoor=3,
-independent of the training cap of 6. An OOM must be reported, not worked
+independent of the training cap of 2. An OOM must be reported, not worked
 around by silently reducing inputs.
 
 The result is
@@ -85,7 +98,7 @@ To regenerate artifacts directly from an already merged result:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/summarize_mixed4_eval.py \
-  --eval-dir logs/full_erp_completion_v1_4xrtx5000_2h8h2h_eval_full8833_anchor_full_erp_4gpu \
+  --eval-dir logs/full_erp_completion_v1_4xrtx5000_2pano_core60_2h8h2h_eval_full8833_anchor_full_erp_4gpu \
   --export-examples
 ```
 
